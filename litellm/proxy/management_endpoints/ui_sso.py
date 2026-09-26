@@ -3666,6 +3666,7 @@ class SSOAuthenticationHandler:
             disabled_non_admin_personal_key_creation=disabled_non_admin_personal_key_creation,
             server_root_path=get_server_root_path(),
             password_reset_required=False,
+            password_change_allowed=False,
         )
 
         from litellm.proxy.auth.login_utils import encode_ui_session_jwt

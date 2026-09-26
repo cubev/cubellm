@@ -18,6 +18,7 @@ class ReturnedUITokenObject(TypedDict):
     disabled_non_admin_personal_key_creation: bool
     server_root_path: str  # e.g. `/litellm`
     password_reset_required: ReadOnly[bool]
+    password_change_allowed: ReadOnly[bool]
 
 
 class ParsedOpenIDResult(TypedDict, total=False):

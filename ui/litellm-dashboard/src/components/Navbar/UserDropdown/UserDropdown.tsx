@@ -74,7 +74,7 @@ const UserDropdown: React.FC<UserDropdownProps> = ({ onLogout, variant = "navbar
     userRoleLabel: userRole,
     isViewOnly,
     premiumUser,
-    loginMethod,
+    passwordChangeAllowed,
   } = useAuthorized();
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -285,7 +285,7 @@ const UserDropdown: React.FC<UserDropdownProps> = ({ onLogout, variant = "navbar
       >
         {renderUserInfoSection()}
         <Separator />
-        {loginMethod === "username_password" && (
+        {passwordChangeAllowed && (
           <button
             type="button"
             onClick={() => {

@@ -9,7 +9,7 @@ interface AuthMock {
   userRoleLabel: string;
   premiumUser: boolean;
   accessToken: string;
-  loginMethod?: string | null;
+  passwordChangeAllowed?: boolean;
 }
 
 let mockUseAuthorizedImpl: () => AuthMock = () => ({
@@ -208,14 +208,14 @@ describe("SidebarAccountMenu", () => {
     expect(mockOnLogout).toHaveBeenCalledTimes(1);
   });
 
-  it("should navigate to the change-password page for username/password sessions", async () => {
+  it("should navigate to the change-password page for sessions allowed to change their password", async () => {
     mockUseAuthorizedImpl = () => ({
       userId: "test-user-id",
       userEmail: "test@example.com",
       userRoleLabel: "Admin",
       premiumUser: false,
       accessToken: "test-token",
-      loginMethod: "username_password",
+      passwordChangeAllowed: true,
     });
     const user = userEvent.setup();
     renderWithProviders(<SidebarAccountMenu onLogout={mockOnLogout} />);
@@ -227,14 +227,14 @@ describe("SidebarAccountMenu", () => {
     expect(mockRouterPush).toHaveBeenCalledWith(expect.stringContaining("change-password"));
   });
 
-  it("should hide the change-password entry for SSO sessions", async () => {
+  it("should hide the change-password entry for sessions without a changeable password", async () => {
     mockUseAuthorizedImpl = () => ({
       userId: "test-user-id",
       userEmail: "test@example.com",
       userRoleLabel: "Admin",
       premiumUser: false,
       accessToken: "test-token",
-      loginMethod: "sso",
+      passwordChangeAllowed: false,
     });
     const user = userEvent.setup();
     renderWithProviders(<SidebarAccountMenu onLogout={mockOnLogout} />);
