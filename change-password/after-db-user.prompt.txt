@@ -1,0 +1,1 @@
+capture: Admin UI screenshot from the QA stack for the change-password menu fix
