@@ -53,6 +53,7 @@ const useAuthorized = () => {
     loginMethod: decoded?.login_method ?? null,
     showSSOBanner: decoded?.login_method === "username_password",
     passwordResetRequired: decoded?.password_reset_required === true,
+    passwordChangeAllowed: decoded?.password_change_allowed === true,
   };
 };
 

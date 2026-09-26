@@ -93,7 +93,7 @@ const SidebarAccountMenu: React.FC<SidebarAccountMenuProps> = ({ onLogout, colla
     isViewOnly,
     premiumUser,
     accessToken,
-    loginMethod,
+    passwordChangeAllowed,
   } = useAuthorized();
   const router = useRouter();
   const [open, setOpen] = React.useState(false);
@@ -263,7 +263,7 @@ const SidebarAccountMenu: React.FC<SidebarAccountMenuProps> = ({ onLogout, colla
 
         <Separator />
 
-        {loginMethod === "username_password" && (
+        {passwordChangeAllowed && (
           <Button
             variant="ghost"
             onClick={() => {

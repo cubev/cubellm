@@ -192,6 +192,7 @@ class LoginResult:
     user_role: str
     login_method: Literal["sso", "username_password"]
     password_reset_required: bool
+    password_change_allowed: bool
 
     def __init__(
         self,
@@ -201,6 +202,7 @@ class LoginResult:
         user_role: str,
         login_method: Literal["sso", "username_password"] = "username_password",
         password_reset_required: bool = False,
+        password_change_allowed: bool = False,
     ):
         self.user_id = user_id
         self.key = key
@@ -208,6 +210,7 @@ class LoginResult:
         self.user_role = user_role
         self.login_method = login_method
         self.password_reset_required = password_reset_required
+        self.password_change_allowed = password_change_allowed
 
 
 async def authenticate_user(
@@ -456,6 +459,7 @@ async def _sign_in(
                 user_role=cast(str, user_role),
                 login_method="username_password",
                 password_reset_required=password_reset_required,
+                password_change_allowed=True,
             )
         else:
             await attempt.failed()
@@ -527,4 +531,5 @@ def create_ui_token_object(
         disabled_non_admin_personal_key_creation=disabled_non_admin_personal_key_creation,
         server_root_path=get_server_root_path(),
         password_reset_required=login_result.password_reset_required,
+        password_change_allowed=login_result.password_change_allowed,
     )

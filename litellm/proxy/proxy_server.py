@@ -16982,6 +16982,7 @@ async def onboarding(invite_link: str, request: Request):
         disabled_non_admin_personal_key_creation=disabled_non_admin_personal_key_creation,
         server_root_path=get_server_root_path(),
         password_reset_required=False,
+        password_change_allowed=False,
     )
     jwt_token: Final = jwt.encode(
         cast(dict, returned_ui_token_object),
@@ -17093,6 +17094,7 @@ async def _generate_onboarding_ui_session_token(user_obj: _UserTableRow) -> str:
         disabled_non_admin_personal_key_creation=disabled_non_admin_personal_key_creation,
         server_root_path=get_server_root_path(),
         password_reset_required=False,
+        password_change_allowed=False,
     )
     assert master_key is not None
     return jwt.encode(

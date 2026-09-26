@@ -161,6 +161,41 @@ describe("useAuthorized", () => {
     expect(clearTokenCookiesMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { claim: true, expected: true },
+    { claim: false, expected: false },
+    { claim: undefined, expected: false },
+  ])(
+    "should allow a password change only when the session carries password_change_allowed=$claim",
+    async ({ claim, expected }) => {
+      const uiConfig = {
+        server_root_path: "/",
+        proxy_base_url: null,
+        auto_redirect_to_sso: false,
+        admin_ui_disabled: false,
+        sso_configured: false,
+      };
+      getUiConfigMock.mockResolvedValue(uiConfig);
+      const decodedPayload = {
+        key: "api-key-789",
+        user_id: "default_user_id",
+        user_role: "proxy_admin",
+        login_method: "username_password",
+        password_change_allowed: claim,
+      };
+      decodeTokenMock.mockReturnValue(decodedPayload);
+      checkTokenValidityMock.mockReturnValue(true);
+      document.cookie = `token=${createJwt(decodedPayload)}; path=/;`;
+
+      const { result } = renderHook(() => useAuthorized(), { wrapper });
+
+      await waitFor(() => {
+        expect(result.current.token).not.toBeNull();
+      });
+      expect(result.current.passwordChangeAllowed).toBe(expected);
+    },
+  );
+
   it("should present proxy_admin_viewer as Admin while flagging it view-only", async () => {
     getUiConfigMock.mockResolvedValue({
       server_root_path: "/",

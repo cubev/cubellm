@@ -48,6 +48,7 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.login_utils import (
     LoginResult,
     authenticate_user,
+    create_ui_token_object,
     get_ui_credentials,
     is_env_credential_login_enabled,
     screen_login_password_for_breach,
@@ -2343,3 +2344,42 @@ class TestScreenLoginPasswordForBreach:
             )
             is True
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("username", "password", "db_row", "expected"),
+    [
+        pytest.param("admin", "admin-password", None, False, id="env-admin-has-no-db-password"),
+        pytest.param(
+            "reset@example.com",
+            "Str0ng!Passw0rd",
+            _db_user_row(password="Str0ng!Passw0rd"),
+            True,
+            id="db-user-password-login",
+        ),
+    ],
+)
+async def test_ui_token_allows_password_change_only_for_db_password_logins(username, password, db_row, expected):
+    with patch.dict(os.environ, _DB_LOGIN_ENV):
+        with (
+            patch(
+                "litellm.proxy.auth.login_utils.generate_key_helper_fn",
+                new_callable=AsyncMock,
+                return_value={"token": "session-token"},
+            ),
+            patch("litellm.proxy.auth.login_utils.user_update", new_callable=AsyncMock, return_value=None),
+        ):
+            login_result = await authenticate_user(
+                username=username,
+                password=password,
+                master_key="sk-1234",
+                prisma_client=_prisma_with_user(db_row),
+                throttle=_unlimited_throttle(),
+                general_settings=_POLICY_NO_BREACH_CHECK,
+            )
+
+    token_object = create_ui_token_object(login_result, general_settings={}, premium_user=False)
+
+    assert token_object["login_method"] == "username_password"
+    assert token_object["password_change_allowed"] is expected
