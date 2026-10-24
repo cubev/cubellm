@@ -93,10 +93,16 @@ function gatewayAccount(card, gateway) {
  }
  card.append(details,element("p","explanation","Gateway-Werte sind separat erfasst und werden nicht zum Anbieterbericht addiert."));
 }
+function inventorySummary(host) {
+ if(host.kind==="router")return "Netzwerkdiagnose";
+ if(host.kind==="proxmox")return `${host.services.length} VM-/LXC-Einträge`;
+ if(host.kind==="application")return `${host.services.length} Container-/Dienst-Einträge`;
+ return `${host.repositories.length} erfasste Projekte · ${host.services.length} geladene Dienste`;
+}
 function renderFleet(fleet) {
  $("fleet").replaceChildren();if(!fleet){$("fleet").append(element("div","empty","Noch kein zentraler Systembericht"));return;}
  $("fleet-age").textContent=age(fleet.checked_at);
- for(const host of fleet.hosts){const stale=Date.now()-Date.parse(host.checked_at)>900000;const card=element("article","host"),title=element("h3","",host.id.toUpperCase());title.append(element("span","badge "+(host.status==="ok"&&!stale?"active":"warning"),stale?"Veraltet":host.status==="ok"?"Erreichbar":host.status==="snapshot_only"?"Snapshot":"Nicht erreichbar"));card.append(title,element("p","host-detail",host.hostname||host.address),element("p","",`${host.repositories.length} Projekte · ${host.services.length} geladene Dienste`),element("p","",age(host.checked_at)));
+ for(const host of fleet.hosts){const stale=Date.now()-Date.parse(host.checked_at)>900000;const card=element("article","host"),title=element("h3","",host.id.toUpperCase());title.append(element("span","badge "+(host.status==="ok"&&!stale?"active":"warning"),stale?"Veraltet":host.status==="ok"?"Erreichbar":host.status==="snapshot_only"?"Snapshot":host.kind==="router"?"API-Fehler":"Nicht erreichbar"));card.append(title,element("p","host-detail",host.hostname||host.address),element("p","",inventorySummary(host)),element("p","",age(host.checked_at)));
   if(host.message)card.append(element("p","",host.message));if(host.repositories.length){const details=element("details"),summary=element("summary","","Projekte anzeigen");details.append(summary);for(const repo of host.repositories){const row=element("div","repo");row.append(element("b","",repo.name),element("div","",`${repo.branch||"Branch unbekannt"} · ${repo.commit||"Commit unbekannt"}${repo.tracked_changes?" · "+repo.tracked_changes+" Änderungen":""}`));details.append(row);}card.append(details);}$("fleet").append(card);
  }
 }
