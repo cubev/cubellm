@@ -3,7 +3,7 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import Annotated, Final, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
 
 from cube_control.models import GatewayBatch, GatewayMetrics, GatewayRecord, GatewayScan, Identifier, Provider
 
@@ -23,6 +23,13 @@ class GatewayProjection(BaseModel):
     output_tokens: Annotated[int, Field(ge=0)] | None
     cache_read_tokens: Annotated[int, Field(ge=0)] | None
     cache_write_tokens: Annotated[int, Field(ge=0)] | None
+
+    @field_validator("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", mode="before")
+    @staticmethod
+    def reject_boolean_counter(value: JsonValue) -> JsonValue:
+        if isinstance(value, bool):
+            raise ValueError("Boolean values are not token counts")  # noqa: TRY004  # Pydantic converts ValueError into ValidationError
+        return value
 
 
 def attributed_provider(row: GatewayProjection) -> Provider | None:

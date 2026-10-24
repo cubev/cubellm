@@ -68,7 +68,7 @@ function renderGateway(data) {
   const stale=!Number.isFinite(delta)||delta< -60000||delta>900000;
   const state=stale?"veraltet":scan.state==="ok"?"Import erfolgreich":scan.state==="partial"?"Teilimport":"Quelle nicht erreichbar";
   const row=element("div");
-  row.append(element("p","",`${state} · ${age(scan.checked_at)} · ${scan.available_rows===null?"Anzahl unbekannt":scan.available_rows+" Einträge in der Quelldatenbank"}`));
+  row.append(element("p","",`${state} · ${age(scan.checked_at)} · ${scan.available_rows===null?"Anzahl unbekannt":scan.available_rows+" Einträge im gesamten Quellbestand"}`));
   if(scan.unassigned_rows)row.append(element("p","explanation",`${scan.unassigned_rows} gescannte Einträge ohne Anbieterzuordnung`));
   if(scan.rejected_rows)row.append(element("p","explanation error",`${scan.rejected_rows} Einträge konnten nicht übernommen werden`));
   if(scan.message)row.append(element("p","explanation",scan.message));

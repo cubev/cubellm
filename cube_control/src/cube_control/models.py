@@ -265,10 +265,10 @@ class GatewayRecord(FrozenModel):
     source_updated_at: AwareDatetime | None = None
     status: Literal["succeeded", "failed", "unknown"]
     amount_usd: Annotated[Decimal, Field(ge=0, allow_inf_nan=False)] | None = None
-    input_tokens: Annotated[int, Field(ge=0)] | None = None
-    output_tokens: Annotated[int, Field(ge=0)] | None = None
-    cache_read_tokens: Annotated[int, Field(ge=0)] | None = None
-    cache_write_tokens: Annotated[int, Field(ge=0)] | None = None
+    input_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
+    output_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
+    cache_read_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
+    cache_write_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
 
 
 class GatewayScan(FrozenModel):

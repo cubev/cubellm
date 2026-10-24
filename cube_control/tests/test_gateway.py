@@ -6,6 +6,8 @@ from decimal import Decimal
 from typing import Final
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from cube_control.gateway import (
     GatewayProjection,
     GatewayProjectionBatch,
@@ -58,6 +60,12 @@ class GatewayTests(unittest.TestCase):
         zero: Final = record.model_copy(update={"amount_usd": Decimal(0), "input_tokens": 0})
         known: Final = gateway_metrics((zero,), Provider.OPENROUTER, NOW.strftime("%Y-%m"))
         self.assertEqual((known.unknown_cost_calls, known.unknown_input_calls), (0, 0))
+
+    def test_boolean_is_not_a_measured_token_count(self) -> None:
+        with self.assertRaises(ValidationError):
+            GatewayProjection.model_validate(projection().model_dump() | {"input_tokens": True})
+        with self.assertRaises(ValidationError):
+            GatewayRecord.model_validate(projected_record(projection(), "source").model_dump() | {"input_tokens": True})
 
     def test_source_namespace_and_hashed_primary_key(self) -> None:
         first: Final = projected_record(projection(), "instance-a")
