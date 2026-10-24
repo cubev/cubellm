@@ -5281,3 +5281,83 @@ def test_baseline_estimate_metadata_comes_from_the_logging_stamp() -> None:
     assert result["autorouter_savings_estimate"] == recorded
     absent: Final = _get_spend_logs_metadata({"autorouter_savings_estimate": supplied})  # mutable-ok: legacy metadata helper accepts dicts
     assert absent["autorouter_savings_estimate"] is None
+
+
+def test_request_credentials_are_removed_at_every_depth_without_changing_provider_input() -> None:
+    marker: Final = "public-canary-not-a-credential"
+    for key in (
+        "api_key",
+        "apiKey",
+        "API-KEY",
+        "Authorization",
+        "X-API-KEY",
+        "x-goog-api-key",
+        "azure_ad_token",
+        "access_token",
+        "api_token",
+        "client_secret",
+        "SECRET_FIELDS",
+    ):
+        original: Final[dict[str, object]] = {
+            "model": "fixture-model",
+            key: marker,
+            "nested": [{key: marker, "keep": 1}, {"headers": {key: marker, "content-type": "application/json"}}],
+        }
+        sanitized: Final = _sanitize_request_body_for_spend_logs_payload(original)
+        assert sanitized == {
+            "model": "fixture-model",
+            "nested": [{"keep": 1}, {"headers": {"content-type": "application/json"}}],
+        }
+        assert original[key] == marker
+        assert original["nested"] == [
+            {key: marker, "keep": 1},
+            {"headers": {key: marker, "content-type": "application/json"}},
+        ]
+
+
+def test_stored_success_request_excludes_credentials_even_when_body_logging_is_enabled() -> None:
+    marker: Final = "public-canary-not-a-credential"
+    original: Final = {
+        "model": "fixture-model",
+        "api_key": marker,
+        "messages": [{"role": "user", "content": "public message"}],
+    }
+    with patch(
+        "litellm.proxy.spend_tracking.spend_tracking_utils.should_store_prompts_and_responses_in_spend_logs",
+        return_value=True,
+    ):
+        payload: Final = _get_proxy_server_request_for_spend_logs_payload(
+            metadata={}, litellm_params={"proxy_server_request": {"body": original}}, kwargs={}
+        )
+    assert json.loads(payload) == {"model": "fixture-model", "messages": original["messages"]}
+    assert original["api_key"] == marker
+
+
+def test_stored_provider_errors_never_echo_credentials_with_either_prompt_policy() -> None:
+    marker: Final = "public-canary-not-a-credential"
+    for store_prompts in (False, True):
+        error: Final[StandardLoggingPayloadErrorInformation] = {
+            "error_code": "401",
+            "error_class": "ProviderError",
+            "llm_provider": "openai",
+            "error_message": json.dumps({"apiKey": marker, "prompt": "public message"}),
+            "traceback": "api_key=" + marker + "\npublic trace",
+        }
+        with patch(
+            "litellm.proxy.spend_tracking.spend_tracking_utils.should_store_prompts_and_responses_in_spend_logs",
+            return_value=store_prompts,
+        ):
+            sanitized: Final = _sanitize_error_information_for_spend_logs(error)
+        assert sanitized == {
+            "error_code": "401",
+            "error_class": "ProviderError",
+            "llm_provider": "openai",
+            "error_message": json.dumps(
+                {
+                    "apiKey": REDACTED_BY_LITELM_STRING,
+                    "prompt": "public message" if store_prompts else REDACTED_BY_LITELM_STRING,
+                }
+            ),
+            "traceback": 'api_key="' + REDACTED_BY_LITELM_STRING + '"\npublic trace',
+        }
+        assert error["traceback"] == "api_key=" + marker + "\npublic trace"

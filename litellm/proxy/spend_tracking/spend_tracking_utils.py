@@ -1082,7 +1082,29 @@ def _get_messages_for_spend_logs_payload(
     return "{}"
 
 
-_SENSITIVE_REQUEST_BODY_KEYS: Final = frozenset({"secret_fields"})
+_SENSITIVE_REQUEST_BODY_KEYS: Final = frozenset(
+    {
+        "secret_fields",
+        "api_key",
+        "apikey",
+        "api-key",
+        "authorization",
+        "x-api-key",
+        "x-goog-api-key",
+        "azure_ad_token",
+        "access_token",
+        "api_token",
+        "client_secret",
+    }
+)
+_CREDENTIAL_KEY_START_PATTERN: Final = re.compile(
+    r"(?:['\"](?:"
+    + "|".join(re.escape(key) for key in sorted(_SENSITIVE_REQUEST_BODY_KEYS))
+    + r")[\"']\s*:\s*|\b(?:"
+    + "|".join(re.escape(key) for key in sorted(_SENSITIVE_REQUEST_BODY_KEYS))
+    + r")\s*=\s*)",
+    re.IGNORECASE,
+)
 
 
 def _sanitize_request_body_for_spend_logs_payload(
@@ -1152,7 +1174,11 @@ def _sanitize_request_body_for_spend_logs_payload(
             return value
         return value
 
-    return {k: _sanitize_value(v) for k, v in request_body.items() if k not in _SENSITIVE_REQUEST_BODY_KEYS}
+    return {
+        k: _sanitize_value(v)
+        for k, v in request_body.items()
+        if k.casefold() not in _SENSITIVE_REQUEST_BODY_KEYS
+    }
 
 
 # Quoted-key form: ``"input"`` / ``'messages'`` / ``"prompt"`` followed by
@@ -1242,7 +1268,9 @@ def _scan_balanced_value_end(text: str, start: int) -> int:
     return -1
 
 
-def _redact_prompt_leaks_in_error_string(text: str) -> str:
+def _redact_prompt_leaks_in_error_string(
+    text: str, key_pattern: re.Pattern[str] = _SENSITIVE_KEY_START_PATTERN, redact_scalars: bool = False
+) -> str:
     """
     Strip echoed request input from provider error strings.
 
@@ -1271,7 +1299,7 @@ def _redact_prompt_leaks_in_error_string(text: str) -> str:
     n: Final = len(text)
     pos = 0
     while pos < n:
-        m = _SENSITIVE_KEY_START_PATTERN.search(text, pos)
+        m = key_pattern.search(text, pos)
         if not m:
             out.append(text[pos:])
             break
@@ -1290,6 +1318,10 @@ def _redact_prompt_leaks_in_error_string(text: str) -> str:
                 break
             out.append(redaction)
             pos = v_end
+        elif redact_scalars:
+            scalar_end: Final = re.search(r"[,}\]\r\n]", text[v_start:])
+            out.append(redaction)
+            pos = v_start + scalar_end.start() if scalar_end else n
         else:
             # Unquoted scalar (number, null, bare identifier) — not a leak
             # carrier, leave intact and resume after the key match.
@@ -1395,7 +1427,13 @@ def _sanitize_error_information_for_spend_logs(
         if isinstance(original_exception, ProxyModelNotFoundError)
         else error_information
     )
-    sanitized = cast(dict, {**persisted})
+    credential_safe: Final[dict[str, object]] = {
+        key: _redact_prompt_leaks_in_error_string(value, _CREDENTIAL_KEY_START_PATTERN, redact_scalars=True)
+        if key in ("error_message", "traceback") and isinstance(value, str)
+        else value
+        for key, value in persisted.items()
+    }
+    sanitized = cast(dict, credential_safe)
 
     if not should_store_prompts_and_responses_in_spend_logs():
         for field in ("error_message", "traceback"):
