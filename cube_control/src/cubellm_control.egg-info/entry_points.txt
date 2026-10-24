@@ -1,0 +1,2 @@
+[console_scripts]
+cubellm-control = cube_control.cli:main

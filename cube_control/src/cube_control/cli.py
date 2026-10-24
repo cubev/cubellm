@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 
 from cube_control.api import create_app
 from cube_control.models import ImportBatch
+from cube_control.openrouter import collect_openrouter
 from cube_control.store import PostgresRepository
 
 
@@ -17,12 +19,18 @@ def main() -> int:
     parser: Final[argparse.ArgumentParser] = argparse.ArgumentParser(prog="cubellm-control")
     sub: Final = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init")
+    collect_parser: Final = sub.add_parser("collect-openrouter")
+    collect_parser.add_argument("--config", required=True, type=Path)
     import_parser: Final = sub.add_parser("import")
     import_parser.add_argument("path", nargs="?", default="-")
     serve_parser: Final = sub.add_parser("serve")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=4001)
     args: Final = parser.parse_args()
+    if args.command == "collect-openrouter":
+        batch: Final = collect_openrouter(args.config, datetime.now(UTC))
+        print(batch.model_dump_json())
+        return 0
     dsn: Final[str] = os.environ.get("CUBE_CONTROL_DATABASE_URL", "")
     if not dsn:
         print("CUBE_CONTROL_DATABASE_URL is not configured", file=sys.stderr)
@@ -38,11 +46,11 @@ def main() -> int:
             print("Import exceeds size limit", file=sys.stderr)
             return 2
         try:
-            batch: Final[ImportBatch] = ImportBatch.model_validate_json(raw)
+            import_batch: Final[ImportBatch] = ImportBatch.model_validate_json(raw)
         except ValidationError:
             print("Import rejected: invalid data; input values are not logged", file=sys.stderr)
             return 2
-        result: Final = repository.import_batch(batch)
+        result: Final = repository.import_batch(import_batch)
         print(json.dumps({"ok": result.ok, "inserted": result.inserted, "message": result.message}))
         return 0 if result.ok else 1
     repository.initialize()

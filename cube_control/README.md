@@ -59,3 +59,23 @@ PostgreSQL integration tests additionally require `CUBE_CONTROL_TEST_DATABASE_UR
 The initial service consumes existing collectors through an authenticated management bridge. Native provider connectors, account-editing authentication, gateway-event ingestion, deployment-job execution and persistent mobile agents remain separate implementation work. Unknown provider balances and subscription states stay unknown until a real source or explicit manual entry is imported
 
 This service uses a separate PostgreSQL instance to keep the live gateway fully isolated and to avoid copying or generating database passwords. No provider API key or new remote access credential is created by this stack
+
+## OpenRouter account collector
+
+`cubellm-control collect-openrouter --config /path/to/private.env` emits an
+ImportBatch on stdout, without requiring a database connection. Pipe or import
+this metadata through the same trusted management path as other collectors.
+The env file stays on the collector host, belongs to its user and has mode 0600.
+It contains an existing OPENROUTER_MANAGEMENT_KEY. The collector never creates
+keys, changes account settings or forwards credentials across redirects
+
+The read-only /api/v1/credits endpoint requires a management key. Its purchased
+credits and cumulative usage are denominated in USD. Remaining balance is their
+difference, including a negative balance when overdrawn. Cumulative usage is
+labelled as lifetime usage, never as current-month spending. Missing credentials,
+permission failures and malformed responses become unavailable observations,
+never measured zero values. Invalid response bodies are not logged
+
+Contract checked against the official [credits API](https://openrouter.ai/docs/api/api-reference/credits/get-credits)
+and [billing explanation](https://openrouter.ai/support) on 2026-10-24.
+Live account verification requires an existing authorized management credential
