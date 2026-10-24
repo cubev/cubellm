@@ -1,0 +1,62 @@
+services:
+  control-db:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.postgres
+    image: cubellm-control-db:${CONTROL_RELEASE:-dev}
+    restart: unless-stopped
+    network_mode: none
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - listen_addresses=
+      - -c
+      - unix_socket_directories=/run/postgresql
+      - -c
+      - hba_file=/etc/cubecontrol/pg_hba.conf
+      - -c
+      - max_connections=20
+    volumes:
+      - control_data:/var/lib/postgresql/data
+      - control_socket:/run/postgresql
+    healthcheck:
+      test: [CMD, gosu, postgres, pg_isready, -h, /run/postgresql, -U, postgres, -d, postgres]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    security_opt: [no-new-privileges:true]
+    mem_limit: 384m
+
+  control:
+    build:
+      context: .
+      args:
+        PYTHON_BASE: ${CONTROL_PYTHON_BASE:-python:3.13-slim-bookworm}
+    image: cubellm-control:${CONTROL_RELEASE:-dev}
+    restart: unless-stopped
+    ports:
+      - "${CONTROL_BIND_ADDRESS:-127.0.0.1}:4001:4001"
+    environment:
+      CUBE_CONTROL_DATABASE_URL: dbname=cubecontrol user=cubecontrol host=/run/postgresql application_name=cubellm-control
+    volumes:
+      - control_socket:/run/postgresql
+    depends_on:
+      control-db:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4001/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 384m
+
+volumes:
+  control_data:
+  control_socket:

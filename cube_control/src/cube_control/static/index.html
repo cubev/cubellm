@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="de">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CubeLLM · Übersicht</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><a class="brand" href="/" aria-label="CubeLLM Übersicht"><span class="mark">C</span><span>CubeLLM<small>Deine AI-Dienste im Blick</small></span></a><div class="live"><i></i><span id="connection">Verbinde …</span><button id="refresh" type="button">Aktualisieren</button></div></header>
+<main>
+<section class="intro"><div><p class="eyebrow">KONTEN & VERBRAUCH</p><h1>Ein klarer Blick auf deine AI.</h1><p class="subtitle">Abos, API-Kosten und Guthaben. Mit Quelle, Zeitpunkt und klaren Grenzen.</p></div><div class="period"><span>Aktueller Kostenzeitraum</span><strong id="period">Wird geladen</strong><small>Kalendermonat · UTC</small></div></section>
+<div id="notice" role="status" hidden></div>
+<nav class="filters" aria-label="Konten filtern"><button data-filter="all" class="selected">Alle Konten</button><button data-filter="subscription">Subscriptions</button><button data-filter="api">API-Zugänge</button><span id="count"></span></nav>
+<section id="accounts" class="grid" aria-label="Anbieterkonten"><div class="empty">Kontodaten werden geladen …</div></section>
+<section class="fleet-section"><div class="section-heading"><div><p class="eyebrow">ENTWICKLUNG & BETRIEB</p><h2>Deine Systeme</h2></div><span id="fleet-age"></span></div><div id="fleet" class="fleet-grid"><div class="empty">Noch kein zentraler Systembericht</div></div></section>
+<footer>Provider-Kosten und beobachteter Proxy-Verbrauch werden getrennt geführt. Credits sind kein Geldbetrag. Nicht angebundene Konten bleiben sichtbar.</footer>
+</main>
+</body></html>

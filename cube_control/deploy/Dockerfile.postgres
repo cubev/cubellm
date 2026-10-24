@@ -1,0 +1,5 @@
+ARG POSTGRES_BASE=postgres@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+FROM ${POSTGRES_BASE}
+RUN useradd --uid 10001 --no-create-home cubecontrol
+COPY deploy/pg_hba.conf /etc/cubecontrol/pg_hba.conf
+COPY deploy/init.sql /docker-entrypoint-initdb.d/10-cubecontrol.sql

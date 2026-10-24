@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cubellm-control"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi", "psycopg[binary]", "uvicorn"]
+
+[project.scripts]
+cubellm-control = "cube_control.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cube_control = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120

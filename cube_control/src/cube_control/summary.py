@@ -1,0 +1,64 @@
+from datetime import datetime
+from decimal import Decimal
+from itertools import groupby
+from typing import Final
+
+from cube_control.models import Account, AccountView, MediaJob, Observation, UsageEvent
+from cube_control.store import StoredState
+
+
+def measurement_key(observation: Observation) -> tuple[str, str, str, str]:
+    return observation.metric, observation.window, observation.period, observation.source
+
+
+def latest_measurements(account_id: str, observations: tuple[Observation, ...]) -> tuple[Observation, ...]:
+    matching: Final[tuple[Observation, ...]] = tuple(o for o in observations if o.account_id == account_id)
+    return tuple(
+        max(group, key=lambda o: (o.observed_at, o.collected_at))
+        for _, group in groupby(sorted(matching, key=measurement_key), key=measurement_key)
+    )
+
+
+def selected_spend(observations: tuple[Observation, ...], now: datetime, period: str) -> Observation | None:
+    candidates: Final[tuple[Observation, ...]] = tuple(
+        o for o in observations if o.metric == "spend" and o.period == period
+    )
+    priority: Final[dict[str, int]] = {"provider_api": 0, "import": 1, "manual": 2, "local_collector": 3}
+    ordered: Final[list[Observation]] = sorted(
+        candidates, key=lambda o: (priority[o.source], -o.observed_at.timestamp())
+    )
+    return next(
+        (o for o in ordered if o.status in ("known", "manual", "estimated") and o.freshness(now) == "fresh"), None
+    )
+
+
+def proxy_amounts(events: tuple[UsageEvent, ...]) -> dict[str, Decimal]:
+    return {
+        currency: sum((e.amount for e in events if e.currency == currency and e.amount is not None), Decimal(0))
+        for currency in sorted({e.currency for e in events if e.amount is not None})
+    }
+
+
+def reservations(jobs: tuple[MediaJob, ...], account_id: str, now: datetime) -> dict[str, Decimal]:
+    pending: Final[tuple[MediaJob, ...]] = tuple(
+        j for j in jobs if j.account_id == account_id and j.state in ("reserved", "submitted") and j.expires_at > now
+    )
+    return {
+        unit: sum((j.reserved_amount for j in pending if j.unit == unit), Decimal(0))
+        for unit in sorted({j.unit for j in pending})
+    }
+
+
+def account_view(account: Account, state: StoredState, now: datetime, period: str) -> AccountView:
+    latest: Final[tuple[Observation, ...]] = latest_measurements(account.id, state.observations)
+    events: Final[tuple[UsageEvent, ...]] = tuple(
+        e for e in state.events if e.account_id == account.id and e.period == period
+    )
+    return AccountView(
+        account=account,
+        observations=latest,
+        proxy_events=len(events),
+        proxy_amounts=proxy_amounts(events),
+        selected_spend=selected_spend(latest, now, period),
+        open_reservations=reservations(state.jobs, account.id, now),
+    )
