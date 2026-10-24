@@ -48,8 +48,10 @@ def current_records(connection: Connection[tuple[str, ...]]) -> tuple[GatewayRec
         GatewayRecord.model_validate_json(row[0])
         for row in connection.execute(
             "SELECT payload::text FROM cube_control.gateway_records "
-            "WHERE (payload->>'occurred_at')::timestamptz >= date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' "
-            "AND (payload->>'occurred_at')::timestamptz < (date_trunc('month',now() AT TIME ZONE 'UTC') + interval '1 month') AT TIME ZONE 'UTC'"
+            "WHERE (payload->>'occurred_at')::timestamptz >= "
+            "date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' "
+            "AND (payload->>'occurred_at')::timestamptz < "
+            "(date_trunc('month',now() AT TIME ZONE 'UTC') + interval '1 month') AT TIME ZONE 'UTC'"
         )
     )
 
@@ -83,7 +85,8 @@ class GatewayRepository:
                     return GatewayResult("conflict", sequence, message="Refresh source before another scan")
                 next_sequence: Final = sequence + 1
                 connection.execute(
-                    "INSERT INTO cube_control.gateway_scans(id,source_id,sequence,fingerprint,payload) VALUES (%s,%s,%s,%s,%s::jsonb)",
+                    "INSERT INTO cube_control.gateway_scans(id,source_id,sequence,fingerprint,payload) "
+                    "VALUES (%s,%s,%s,%s,%s::jsonb)",
                     (
                         batch.scan.scan_id,
                         batch.scan.source_id,
@@ -115,12 +118,14 @@ class GatewayRepository:
             )
             return 0
         connection.execute(
-            "INSERT INTO cube_control.gateway_changes(source_id,source_key,sequence,previous_hash,content_hash,payload) "
+            "INSERT INTO cube_control.gateway_changes"
+            "(source_id,source_key,sequence,previous_hash,content_hash,payload) "
             "VALUES (%s,%s,%s,%s,%s,%s::jsonb)",
             (source_id, record.source_key, sequence, previous[0] if previous else None, content_hash, payload),
         )
         connection.execute(
-            "INSERT INTO cube_control.gateway_records(source_id,source_key,content_hash,payload,first_sequence,last_sequence) "
+            "INSERT INTO cube_control.gateway_records"
+            "(source_id,source_key,content_hash,payload,first_sequence,last_sequence) "
             "VALUES (%s,%s,%s,%s::jsonb,%s,%s) ON CONFLICT(source_id,source_key) DO UPDATE "
             "SET content_hash=EXCLUDED.content_hash,payload=EXCLUDED.payload,last_sequence=EXCLUDED.last_sequence",
             (source_id, record.source_key, content_hash, payload, sequence, sequence),

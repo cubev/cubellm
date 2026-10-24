@@ -255,7 +255,8 @@ class PostgresRepository:
                     return ManualResult("conflict", version, "Account was edited; refresh before applying changes")
                 entry: Final = ManualEntry(command=command, revision=version + 1, actor=actor, received_at=now)
                 connection.execute(
-                    "INSERT INTO cube_control.manual_commands(command_id,account_id,revision,payload) VALUES (%s,%s,%s,%s::jsonb)",
+                    "INSERT INTO cube_control.manual_commands(command_id,account_id,revision,payload) "
+                    "VALUES (%s,%s,%s,%s::jsonb)",
                     (command.command_id, command.account_id, entry.revision, entry.model_dump_json()),
                 )
                 return ManualResult("applied", entry.revision)
