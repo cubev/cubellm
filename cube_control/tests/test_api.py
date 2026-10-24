@@ -6,16 +6,17 @@ from typing import Final
 from fastapi.testclient import TestClient
 
 from cube_control.api import create_app
-from cube_control.models import CATALOG, ImportBatch
+from cube_control.models import CATALOG, Account, GatewayRecord, GatewayScan, GatewayScanView, ImportBatch, Provider
 from cube_control.store import ImportResult, StoredState
 
 
 @dataclass(frozen=True)
 class FixedRepository:
     available: bool = True
+    snapshot: StoredState | None = None
 
     def state(self) -> StoredState:
-        return StoredState(CATALOG, (), (), ())
+        return self.snapshot if self.snapshot is not None else StoredState(CATALOG, (), (), ())
 
     def healthy(self) -> bool:
         return self.available
@@ -25,6 +26,37 @@ class FixedRepository:
 
 
 class ApiTests(unittest.TestCase):
+    def test_gateway_totals_never_imply_billing_account_identity(self) -> None:
+        now: Final = datetime(2026, 1, 5, tzinfo=UTC)
+        record: Final = GatewayRecord(
+            source_key="request", provider=Provider.OPENROUTER, model="test", occurred_at=now, status="succeeded"
+        )
+        scan: Final = GatewayScanView(
+            sequence=1,
+            scan=GatewayScan(
+                scan_id="scan",
+                source_id="source",
+                expected_sequence=0,
+                checked_at=now,
+                state="ok",
+                available_rows=1,
+                scanned_rows=1,
+            ),
+        )
+        for count in (1, 2):
+            accounts: Final = tuple(
+                Account(id=f"account-{index}", provider=Provider.OPENROUTER, name=f"Account {index}", kind="api")
+                for index in range(count)
+            )
+            state: Final = StoredState(accounts, (), (), (), gateway_records=(record,), gateway_scans=(scan,))
+            client: Final = TestClient(create_app(FixedRepository(snapshot=state), clock=lambda: now))
+            data: Final = client.get("/api/v1/summary").json()
+            self.assertTrue(all(row["data"]["gateway"] is None for row in data["accounts"]))
+            self.assertEqual(len(data["gateway_providers"]), 1)
+            self.assertEqual(data["gateway_providers"][0]["provider"], record.provider)
+            self.assertEqual(data["gateway_providers"][0]["metrics"]["calls"], 1)
+            self.assertTrue(all(row["data"]["selected_spend"] is None for row in data["accounts"]))
+
     def test_all_provider_accounts_are_present_without_fabricated_values(self) -> None:
         client: Final[TestClient] = TestClient(create_app(FixedRepository()))
         response: Final = client.get("/api/v1/summary")

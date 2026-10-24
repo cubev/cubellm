@@ -6,7 +6,18 @@ from cube_control.models import Account, ManualChange, ManualEntry, ManualFieldV
 
 
 def entry_changes(entry: ManualEntry) -> tuple[tuple[ManualEntry, ManualChange], ...]:
-    return tuple((entry, change) for change in entry.command.changes)
+    account: Final = entry.command.create_account
+    changes: Final = (
+        (
+            ManualChange(field="name", action="set", value=account.name),
+            ManualChange(field="state", action="set", value=account.state),
+            ManualChange(field="plan", action="set", value=account.plan),
+            ManualChange(field="note", action="set", value=account.note),
+        )
+        if account is not None
+        else entry.command.changes
+    )
+    return tuple((entry, change) for change in changes)
 
 
 def active_fields(account_id: str, entries: tuple[ManualEntry, ...]) -> tuple[ManualFieldView, ...]:

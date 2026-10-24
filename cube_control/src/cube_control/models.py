@@ -7,6 +7,7 @@ from typing import Annotated, Final, Literal, Self
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
+ProviderId = Annotated[str, Field(pattern=r"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$")]
 
 
 class FrozenModel(BaseModel):
@@ -25,7 +26,7 @@ class Provider(StrEnum):
 
 class Account(FrozenModel):
     id: Identifier
-    provider: Provider
+    provider: Provider | ProviderId
     name: Annotated[str, Field(min_length=1, max_length=100)]
     kind: Literal["api", "subscription"]
     state: Literal["active", "paused", "cancelled", "unknown", "not_configured"] = "unknown"
@@ -233,10 +234,16 @@ class ManualCommand(FrozenModel):
     command_id: Identifier
     account_id: Identifier
     expected_version: Annotated[int, Field(ge=0)]
-    changes: Annotated[tuple[ManualChange, ...], Field(min_length=1, max_length=8)]
+    changes: Annotated[tuple[ManualChange, ...], Field(max_length=8)] = ()
+    create_account: Account | None = None
 
     @model_validator(mode="after")
     def unique_fields(self) -> Self:
+        if self.create_account is not None:
+            if self.create_account.id != self.account_id or self.expected_version != 0 or self.changes:
+                raise ValueError("Creation requires a matching new account, version zero and no field edits")
+        elif not self.changes:
+            raise ValueError("An edit requires at least one change")
         if len({(change.field, change.period) for change in self.changes}) != len(self.changes):
             raise ValueError("Each field and period can only be changed once per command")
         return self
@@ -328,6 +335,7 @@ class AccountView(FrozenModel):
     automatic_account: Account | None = None
     manual_fields: tuple[ManualFieldView, ...] = ()
     manual_version: int = 0
+    manually_created: bool = False
     gateway: GatewayMetrics | None = None
     proxy_events: int
     proxy_amounts: dict[str, Decimal]

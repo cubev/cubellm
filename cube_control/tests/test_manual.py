@@ -27,6 +27,53 @@ def entry(revision: int, changes: tuple[ManualChange, ...]) -> ManualEntry:
 
 
 class ManualTests(unittest.TestCase):
+    def test_custom_account_creation_replays_initial_manual_fields(self) -> None:
+        account: Final = Account(id="custom-1", provider="custom-provider", name="Custom", kind="subscription")
+        command: Final = ManualCommand(
+            command_id="create-custom", account_id=account.id, expected_version=0, create_account=account
+        )
+        recorded: Final = ManualEntry(command=command, revision=1, actor="owner", received_at=NOW)
+        replayed: Final = ManualEntry.model_validate_json(recorded.model_dump_json())
+        observed: Final = account.model_copy(update={"name": "Collected", "state": "active"})
+        fields: Final = active_fields(account.id, (replayed,))
+        self.assertEqual(effective_account(observed, fields), account)
+        self.assertTrue(
+            account_view(
+                account, StoredState((account,), (), (), (), manual_entries=(replayed,)), NOW, "2026-01"
+            ).manually_created
+        )
+        self.assertEqual({field.field for field in fields}, {"name", "state", "plan", "note"})
+        released: Final = ManualEntry(
+            command=ManualCommand(
+                command_id="release-state",
+                account_id=account.id,
+                expected_version=1,
+                changes=(ManualChange(field="state", action="automatic"),),
+            ),
+            revision=2,
+            actor="owner",
+            received_at=NOW,
+        )
+        self.assertEqual(effective_account(observed, active_fields(account.id, (replayed, released))).state, "active")
+
+    def test_creation_rejects_identity_mismatch_and_edit_combinations(self) -> None:
+        account: Final = Account(id="new", provider="custom-provider", name="New", kind="api")
+        for changes in (
+            {"account_id": "other"},
+            {"expected_version": 1},
+            {"changes": (ManualChange(field="plan", action="set", value="x"),)},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                ManualCommand.model_validate(
+                    {"command_id": "create", "account_id": account.id, "expected_version": 0, "create_account": account}
+                    | changes
+                )
+        with self.assertRaises(ValidationError):
+            ManualCommand(command_id="empty", account_id=account.id, expected_version=0)
+        for provider in ("Upper", "has space", "invalid/endpoint", "a" * 65, "trailing-"):
+            with self.subTest(provider=provider), self.assertRaises(ValidationError):
+                Account(id="new", provider=provider, name="New", kind="api")
+
     def test_per_field_override_preserves_collector_and_can_return_to_automatic(self) -> None:
         first: Final = entry(1, (ManualChange(field="plan", action="set", value="Manual plan"),))
         second: Final = entry(2, (ManualChange(field="state", action="set", value="paused"),))

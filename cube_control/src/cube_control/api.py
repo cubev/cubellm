@@ -10,7 +10,15 @@ from pydantic import BaseModel, ConfigDict
 from starlette.middleware.base import RequestResponseEndpoint
 
 from cube_control.gateway import gateway_metrics
-from cube_control.models import AccountView, FleetSnapshot, GatewayMetrics, GatewayScanView, Observation, utc_now
+from cube_control.models import (
+    AccountView,
+    FleetSnapshot,
+    GatewayMetrics,
+    GatewayScanView,
+    Observation,
+    ProviderId,
+    utc_now,
+)
 from cube_control.store import Repository
 from cube_control.summary import account_view
 
@@ -28,6 +36,12 @@ class SummaryAccount(BaseModel):
     readings: tuple[ReadingView, ...]
 
 
+class ProviderGatewayView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    provider: ProviderId
+    metrics: GatewayMetrics
+
+
 class SummaryResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
     schema_version: Literal[1] = 1
@@ -36,6 +50,7 @@ class SummaryResponse(BaseModel):
     accounts: tuple[SummaryAccount, ...]
     gateway_sources: tuple[GatewayScanView, ...] = ()
     gateway_unassigned: GatewayMetrics | None = None
+    gateway_providers: tuple[ProviderGatewayView, ...] = ()
 
 
 def reading_view(reading: Observation, observations: tuple[Observation, ...], now: datetime) -> ReadingView:
@@ -92,6 +107,12 @@ def create_app(repository: Repository, clock: Callable[[], datetime] = utc_now) 
             period=period,
             gateway_sources=state.gateway_scans,
             gateway_unassigned=gateway_metrics(state.gateway_records, None, period) if state.gateway_scans else None,
+            gateway_providers=tuple(
+                ProviderGatewayView(provider=provider, metrics=gateway_metrics(state.gateway_records, provider, period))
+                for provider in sorted(
+                    {record.provider for record in state.gateway_records if record.provider is not None}
+                )
+            ),
             accounts=tuple(
                 SummaryAccount(
                     data=view, readings=tuple(reading_view(o, view.observations, now) for o in view.observations)

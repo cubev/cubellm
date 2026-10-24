@@ -20,8 +20,9 @@ function renderAccounts() {
  const visible=accounts.filter(a=>filter==="all"||a.data.account.kind===filter);$("accounts").replaceChildren();$("count").textContent=`${visible.length} Konten · ${new Set(visible.map(a=>a.data.account.provider)).size} Anbieter`;
  for(const item of visible) {
   const data=item.data, account=data.account, card=element("article","card"), head=element("div","card-head"), title=element("div");
-  title.append(element("div","provider",`${names[account.provider]} · ${account.kind==="api"?"API":"Subscription"}`),element("h3","",account.name));
+  title.append(element("div","provider",`${names[account.provider]||account.provider} · ${account.kind==="api"?"API":"Subscription"}`),element("h3","",account.name));
   head.append(title,element("span","badge "+(account.state==="active"?"active":""),((data.manual_fields||[]).some(field=>field.field==="state")?"Manuell: ":"")+labels[account.state]));card.append(head);
+  if(data.manually_created)card.append(element("p","explanation","Manuell angelegtes Konto"));
   if(account.plan)metric(card,"Tarif",account.plan,true);
   const manual=data.manual_fields||[];
   if(manual.length){
@@ -31,7 +32,7 @@ function renderAccounts() {
     const value=field.field.endsWith("usd")?number(field.value,"USD"):field.field==="state"?labels[field.value]:field.value;
     details.append(element("p","",`${fieldNames[field.field]}${field.period?" · "+field.period:""}: ${value} · ${age(field.changed_at)}`));
     const automatic=data.automatic_account&&data.automatic_account[field.field];
-    if(automatic!==undefined&&automatic!==field.value)details.append(element("p","",`Automatische Quelle: ${field.field==="state"?labels[automatic]:automatic||"keine Angabe"}`));
+    if(automatic!==undefined&&automatic!==field.value)details.append(element("p","",`Zuletzt erfasster Basiswert: ${field.field==="state"?labels[automatic]:automatic||"keine Angabe"}`));
    }
    details.append(element("p","",`Bearbeitungsstand ${data.manual_version} · Manuelle Angaben bleiben bis zur Rückkehr zur Automatik erhalten.`));card.append(details);
   }
@@ -48,8 +49,7 @@ function renderAccounts() {
    }
   }
   for(const v of current.filter(v=>["balance","recurring_cost","usage"].includes(v.reading.metric))) {const r=v.reading;metric(card,`${r.metric==="balance"?"Guthaben":r.metric==="recurring_cost"?"Abokosten":"Nutzung"}${r.window?" · "+r.window:""}`,number(r.value,r.unit));}
-  if(!current.length&&!spend&&!(data.gateway&&data.gateway.calls))card.append(element("p","empty","Noch keine verifizierten aktuellen Werte"));
-  gatewayAccount(card,data.gateway);
+  if(!current.length&&!spend)card.append(element("p","empty","Noch keine verifizierten aktuellen Werte"));
   for(const [currency,value] of Object.entries(data.proxy_amounts)) {metric(card,"Beobachteter Proxy-Verbrauch",number(value,currency),true);card.append(element("p","explanation","Separat erfasst. Wird nicht zum Anbieterbericht addiert."));}
   for(const [unit,value] of Object.entries(data.open_reservations))metric(card,"Für laufende Aufträge reserviert",number(value,unit),true);
   const errors=item.readings.filter(v=>v.reading.status==="error"||v.reading.status==="not_configured");
@@ -73,6 +73,12 @@ function renderGateway(data) {
   if(scan.rejected_rows)row.append(element("p","explanation error",`${scan.rejected_rows} Einträge konnten nicht übernommen werden`));
   if(scan.message)row.append(element("p","explanation",scan.message));
   $("gateway-sources").append(row);
+ }
+ for(const provider of data.gateway_providers||[]){
+  if(!provider.metrics.calls)continue;
+  const row=element("div","provider-gateway");
+  row.append(element("h3","",names[provider.provider]||provider.provider),element("p","explanation","Anbieter gesamt. Keinem einzelnen Konto zugeordnet."));
+  gatewayAccount(row,provider.metrics);$("gateway-sources").append(row);
  }
  const unknown=data.gateway_unassigned;
  $("gateway-unassigned").textContent=unknown&&unknown.calls?`${unknown.calls} bisher erfasste Aufrufe im aktuellen Monat noch nicht zugeordnet. ${unknown.unknown_cost_calls===unknown.calls?"Kosten unbekannt":"Gemeldete Kosten: "+number(unknown.reported_usd,"USD")}${unknown.unknown_cost_calls?" · "+unknown.unknown_cost_calls+" ohne Kostenangabe":""}`:"";

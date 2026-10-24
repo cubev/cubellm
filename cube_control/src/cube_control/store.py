@@ -244,7 +244,9 @@ class PostgresRepository:
                 account: Final = connection.execute(
                     "SELECT id FROM cube_control.accounts WHERE id=%s", (command.account_id,)
                 ).fetchone()
-                if account is None:
+                if command.create_account is not None and account is not None:
+                    return ManualResult("rejected", message="Account ID already registered; nothing changed")
+                if command.create_account is None and account is None:
                     return ManualResult("rejected", message="Account is not registered")
                 row: Final = connection.execute(
                     "SELECT COALESCE(max(revision),0)::text FROM cube_control.manual_commands WHERE account_id=%s",
@@ -254,10 +256,15 @@ class PostgresRepository:
                 if version != command.expected_version:
                     return ManualResult("conflict", version, "Account was edited; refresh before applying changes")
                 entry: Final = ManualEntry(command=command, revision=version + 1, actor=actor, received_at=now)
+                if command.create_account is not None:
+                    connection.execute(
+                        "INSERT INTO cube_control.accounts(id,payload) VALUES (%s,%s::jsonb)",
+                        (command.account_id, command.create_account.model_dump_json()),
+                    )
                 connection.execute(
                     "INSERT INTO cube_control.manual_commands(command_id,account_id,revision,payload) "
                     "VALUES (%s,%s,%s,%s::jsonb)",
-                    (command.command_id, command.account_id, entry.revision, entry.model_dump_json()),
+                    (command.command_id, command.account_id, entry.revision, entry.model_dump_json(exclude_none=True)),
                 )
                 return ManualResult("applied", entry.revision)
         except ValidationError:

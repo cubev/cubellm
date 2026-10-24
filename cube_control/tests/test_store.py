@@ -93,6 +93,50 @@ class StoreTests(unittest.TestCase):
         stored: Final = next(a for a in self.repository.state().accounts if a.id == self.account.id)
         self.assertEqual(stored.provider, self.account.provider)
 
+    def test_creation_is_atomic_idempotent_and_never_replaces_existing_identity(self) -> None:
+        account: Final = Account(id=self.account.id + "-new", provider="custom-provider", name="Custom", kind="api")
+        command: Final = ManualCommand(
+            command_id=account.id + "-create", account_id=account.id, expected_version=0, create_account=account
+        )
+        self.assertEqual(self.repository.manage(command, "owner", self.now).status, "applied")
+        self.assertEqual(self.repository.manage(command, "owner", self.now).status, "duplicate")
+        self.assertEqual(self.repository.manage(command, "different-owner", self.now).status, "rejected")
+        replacement: Final = command.model_copy(update={"command_id": account.id + "-other"})
+        self.assertEqual(self.repository.manage(replacement, "owner", self.now).status, "rejected")
+        incoming: Final = account.model_copy(update={"name": "Automatic name", "state": "active"})
+        self.assertTrue(self.repository.import_batch(ImportBatch(accounts=(incoming,))).ok)
+        state: Final = self.repository.state()
+        view: Final = account_view(incoming, state, self.now, self.now.strftime("%Y-%m"))
+        self.assertEqual(view.account, account)
+        self.assertEqual(view.manual_version, 1)
+        self.assertEqual(len(tuple(e for e in state.manual_entries if e.command.account_id == account.id)), 1)
+
+    def test_failed_creation_does_not_leave_an_account_without_journal(self) -> None:
+        account: Final = Account(id=self.account.id + "-invalid", provider="custom-provider", name="New", kind="api")
+        command: Final = ManualCommand(
+            command_id=account.id + "-create", account_id=account.id, expected_version=0, create_account=account
+        )
+        self.assertEqual(self.repository.manage(command, "", self.now).status, "rejected")
+        self.assertFalse(any(a.id == account.id for a in self.repository.state().accounts))
+        self.assertEqual(self.repository.manage(command, "owner", self.now).status, "applied")
+
+    def test_concurrent_creations_have_one_winner_and_one_history_entry(self) -> None:
+        account: Final = Account(id=self.account.id + "-concurrent", provider="custom-provider", name="New", kind="api")
+        commands: Final = tuple(
+            ManualCommand(
+                command_id=account.id + str(index), account_id=account.id, expected_version=0, create_account=account
+            )
+            for index in range(2)
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results: Final = tuple(
+                pool.map(lambda command: self.repository.manage(command, "owner", self.now), commands)
+            )
+        self.assertEqual(sorted(result.status for result in results), ["applied", "rejected"])
+        self.assertEqual(
+            len(tuple(e for e in self.repository.state().manual_entries if e.command.account_id == account.id)), 1
+        )
+
     def command(self, identity: str = "manual-1", version: int = 0) -> ManualCommand:
         return ManualCommand(
             command_id=self.account.id + identity,
