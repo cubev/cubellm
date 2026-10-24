@@ -56,7 +56,7 @@ function renderAccounts() {
   if(errors.length)card.append(element("p","explanation error",errors[0].reading.message||"Datenquelle nicht verfügbar"));
   if(account.note)card.append(element("p","explanation",account.note));
   const latest=[...item.readings].sort((a,b)=>Date.parse(b.reading.observed_at)-Date.parse(a.reading.observed_at))[0];
-  const foot=element("div","source");foot.append(element("span","",latest?sources[latest.reading.source]:"Keine Datenquelle verbunden"),element("span","",latest?`${isFresh(latest.reading)?"":"Veraltet · "}${age(latest.reading.observed_at)}`:""));card.append(foot);$("accounts").append(card);
+  const foot=element("div","source");foot.append(element("span","",latest?sources[latest.reading.source]:"Keine Datenquelle verbunden"),element("span","",latest?`${isFresh(latest.reading)?"":"Veraltet · "}${age(latest.reading.observed_at)}`:""));card.append(foot);const actions=element("div","account-actions"),edit=element("a","manage-link","Lokal bearbeiten");edit.href="cubellm-control://manage/"+encodeURIComponent(account.id);edit.title="Öffnet die lokale CubeLLM-Kontoverwaltung; speichert keine Änderung";actions.append(edit);card.append(actions);$("accounts").append(card);
  }
 }
 function renderGateway(data) {
