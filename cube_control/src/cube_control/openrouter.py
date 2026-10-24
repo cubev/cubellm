@@ -39,15 +39,17 @@ def read_management_key(path: Path) -> SecretStr | Unavailable:
         if path.is_symlink() or path.stat().st_uid != os.getuid() or stat.S_IMODE(path.stat().st_mode) & 0o077:
             return Unavailable("error", "Zugangsdatei muss privat sein und dem Benutzer gehören")
         lines: Final[tuple[str, ...]] = tuple(path.read_text().splitlines())
-    except OSError:
+    except (OSError, UnicodeError):
         return Unavailable("error", "Zugangsdatei nicht lesbar")
     values: Final[tuple[str, ...]] = tuple(
-        line.split("=", 1)[1].strip() for line in lines if line.partition("=")[0].strip() == "OPENROUTER_MANAGEMENT_KEY"
+        line.partition("=")[2].strip()
+        for line in lines
+        if line.partition("=")[0].strip() == "OPENROUTER_MANAGEMENT_KEY"
     )
+    if len(values) > 1:
+        return Unavailable("error", "OpenRouter-Zugang mehrfach konfiguriert")
     if not values or not values[0]:
         return Unavailable("not_configured", "OpenRouter-Management-Zugang fehlt")
-    if len(values) != 1:
-        return Unavailable("error", "OpenRouter-Zugang mehrfach konfiguriert")
     raw: Final[str] = values[0]
     value: Final[str] = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'" else raw
     if not value:

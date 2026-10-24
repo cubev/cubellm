@@ -8,7 +8,7 @@ from typing import Final
 import httpx
 from pydantic import SecretStr
 
-from cube_control.openrouter import Credits, Unavailable, collect_openrouter, fetch_credits
+from cube_control.openrouter import Credits, Unavailable, collect_openrouter, fetch_credits, read_management_key
 
 NOW: Final = datetime(2026, 1, 4, tzinfo=UTC)
 
@@ -80,3 +80,16 @@ class OpenRouterTests(unittest.TestCase):
         self.assertIsInstance(result, Credits)
         if isinstance(result, Credits):
             self.assertEqual(result.total_credits - result.total_usage, Decimal(-2))
+
+    def test_incomplete_assignment_and_duplicate_key_are_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path: Final = Path(directory) / "provider.env"
+            path.write_text("OPENROUTER_MANAGEMENT_KEY\n")
+            path.chmod(0o600)
+            missing: Final = read_management_key(path)
+            self.assertIsInstance(missing, Unavailable)
+            path.write_text("OPENROUTER_MANAGEMENT_KEY=\nOPENROUTER_MANAGEMENT_KEY=test\n")
+            duplicate: Final = read_management_key(path)
+            self.assertIsInstance(duplicate, Unavailable)
+            if isinstance(duplicate, Unavailable):
+                self.assertEqual(duplicate.status, "error")
