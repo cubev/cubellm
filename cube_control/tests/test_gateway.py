@@ -148,6 +148,17 @@ class GatewayStoreTests(unittest.TestCase):
         self.assertEqual((result.status, result.changed), ("applied", 0))
         self.assertEqual(self.changes(), 1)
 
+    def test_latest_scan_keeps_advancing_past_single_digit_sequences(self) -> None:
+        scan_count: Final = 12
+        for sequence in range(scan_count):
+            self.assertEqual(self.repository.import_batch(self.batch(sequence)).status, "applied")
+        latest: Final = next(
+            item for item in self.general.state().gateway_scans if item.scan.source_id == self.source
+        )
+        self.assertEqual(latest.sequence, scan_count)
+        following: Final = self.repository.import_batch(self.batch(latest.sequence))
+        self.assertEqual((following.status, following.sequence), ("applied", scan_count + 1))
+
     def test_correction_and_revert_work_with_identical_source_timestamp(self) -> None:
         for sequence, amount in enumerate(("0.10", "0.20", "0.10")):
             result: Final = self.repository.import_batch(

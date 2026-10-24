@@ -37,8 +37,8 @@ def latest_scans(connection: Connection[tuple[str, ...]]) -> tuple[GatewayScanVi
     return tuple(
         GatewayScanView(scan=GatewayScan.model_validate_json(row[0]), sequence=int(row[1]))
         for row in connection.execute(
-            "SELECT DISTINCT ON (source_id) payload::text,sequence::text FROM cube_control.gateway_scans "
-            "ORDER BY source_id,sequence DESC"
+            "SELECT DISTINCT ON (s.source_id) s.payload::text,s.sequence::text FROM cube_control.gateway_scans s "
+            "ORDER BY s.source_id,s.sequence DESC"
         )
     )
 
