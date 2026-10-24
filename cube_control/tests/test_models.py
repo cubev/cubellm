@@ -31,6 +31,19 @@ def observation(**changes: object) -> Observation:
 
 
 class ModelTests(unittest.TestCase):
+    def test_provider_character_usage_is_not_money_and_expires_at_reset(self) -> None:
+        account: Final = Account(id="elevenlabs-api", provider=Provider.ELEVENLABS, name="ElevenLabs", kind="api")
+        reading: Final = observation(
+            account_id=account.id, metric="usage", unit="characters", value="13", period="",
+            resets_at=NOW + timedelta(seconds=60), expires_at=NOW + timedelta(seconds=60),
+        )
+        restored: Final = Observation.model_validate_json(reading.model_dump_json())
+        self.assertEqual(restored.value, Decimal(13))
+        self.assertEqual(restored.unit, "characters")
+        self.assertEqual(restored.freshness(NOW + timedelta(seconds=60)), "expired")
+        with self.assertRaises(ValidationError):
+            observation(unit="characters", value="13")
+
     def test_unavailable_cannot_look_like_zero_spend(self) -> None:
         with self.assertRaises(ValidationError):
             observation(status="error", value="0")

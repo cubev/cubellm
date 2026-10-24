@@ -20,6 +20,7 @@ class Provider(StrEnum):
     XAI = "xai"
     HEYGEN = "heygen"
     SUNO = "suno"
+    ELEVENLABS = "elevenlabs"
 
 
 class Account(FrozenModel):
@@ -42,7 +43,7 @@ class Observation(FrozenModel):
     observed_at: AwareDatetime
     collected_at: AwareDatetime
     value: Decimal | None = None
-    unit: Literal["USD", "EUR", "credits", "tokens", "minutes", "ratio"] | None = None
+    unit: Literal["USD", "EUR", "credits", "tokens", "minutes", "ratio", "characters"] | None = None
     period: Annotated[str, Field(max_length=80)] = ""
     resets_at: AwareDatetime | None = None
     expires_at: AwareDatetime | None = None

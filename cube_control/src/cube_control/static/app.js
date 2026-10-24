@@ -2,11 +2,11 @@
 const $ = (id) => document.getElementById(id);
 const labels = {active:"Aktiv",paused:"Pausiert",cancelled:"Beendet",unknown:"Status offen",not_configured:"Nicht angebunden"};
 const sources = {provider_api:"Anbieterbericht",local_collector:"Subscription-Collector",manual:"Manuell erfasst",import:"Import"};
-const names = {openai:"OpenAI",anthropic:"Anthropic",openrouter:"OpenRouter",xai:"xAI",heygen:"HeyGen",suno:"Suno"};
+const names = {openai:"OpenAI",anthropic:"Anthropic",openrouter:"OpenRouter",xai:"xAI",heygen:"HeyGen",suno:"Suno",elevenlabs:"ElevenLabs"};
 let accounts = [], filter = "all";
 function element(tag, cls, text) { const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e; }
 function age(value) { const seconds=(Date.now()-Date.parse(value))/1000; if(!Number.isFinite(seconds))return "Zeit unbekannt"; if(seconds< -60)return "Uhrzeit prüfen"; if(seconds<60)return "gerade eben"; if(seconds<3600)return `vor ${Math.floor(seconds/60)} Min`; if(seconds<86400)return `vor ${Math.floor(seconds/3600)} Std`; return `vor ${Math.floor(seconds/86400)} Tagen`; }
-function number(value, unit) { if(unit==="USD"||unit==="EUR")return new Intl.NumberFormat("de-DE",{style:"currency",currency:unit}).format(Number(value));return new Intl.NumberFormat("de-DE",{maximumFractionDigits:2}).format(Number(value))+" "+unit; }
+function number(value, unit) { if(unit==="USD"||unit==="EUR")return new Intl.NumberFormat("de-DE",{style:"currency",currency:unit}).format(Number(value));return new Intl.NumberFormat("de-DE",{maximumFractionDigits:2}).format(Number(value))+" "+(unit==="characters"?"Zeichen (Anbieter-Zähler)":unit); }
 function metric(card,label,value,small=false) { const row=element("div","metric");row.append(element("span","",label),element("strong",small?"small":"",value));card.append(row); }
 function isFresh(reading) {
  const delta=(Date.now()-Date.parse(reading.observed_at))/1000;
