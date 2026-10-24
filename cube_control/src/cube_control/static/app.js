@@ -21,7 +21,20 @@ function renderAccounts() {
  for(const item of visible) {
   const data=item.data, account=data.account, card=element("article","card"), head=element("div","card-head"), title=element("div");
   title.append(element("div","provider",`${names[account.provider]} · ${account.kind==="api"?"API":"Subscription"}`),element("h3","",account.name));
-  head.append(title,element("span","badge "+(account.state==="active"?"active":""),labels[account.state]));card.append(head);
+  head.append(title,element("span","badge "+(account.state==="active"?"active":""),((data.manual_fields||[]).some(field=>field.field==="state")?"Manuell: ":"")+labels[account.state]));card.append(head);
+  if(account.plan)metric(card,"Tarif",account.plan,true);
+  const manual=data.manual_fields||[];
+  if(manual.length){
+   const details=element("details","explanation"),summary=element("summary","","Manuell gepflegte Angaben");details.append(summary);
+   const fieldNames={name:"Name",state:"Status",plan:"Tarif",note:"Notiz",budget_usd:"Monatsbudget",recurring_usd:"Abopreis / Monat",balance_usd:"Guthaben",balance_credits:"Credits"};
+   for(const field of manual){
+    const value=field.field.endsWith("usd")?number(field.value,"USD"):field.field==="state"?labels[field.value]:field.value;
+    details.append(element("p","",`${fieldNames[field.field]}${field.period?" · "+field.period:""}: ${value} · ${age(field.changed_at)}`));
+    const automatic=data.automatic_account&&data.automatic_account[field.field];
+    if(automatic!==undefined&&automatic!==field.value)details.append(element("p","",`Automatische Quelle: ${field.field==="state"?labels[automatic]:automatic||"keine Angabe"}`));
+   }
+   details.append(element("p","",`Bearbeitungsstand ${data.manual_version} · Manuelle Angaben bleiben bis zur Rückkehr zur Automatik erhalten.`));card.append(details);
+  }
   const current=item.readings.filter(v=>v.current&&isFresh(v.reading)), limits=current.filter(v=>v.reading.metric==="limit");
   for(const v of limits) {const r=v.reading;metric(card,r.window,`${Math.round(Number(r.value)*100)} % genutzt`);const track=element("div","track"),fill=element("div","fill");fill.style.width=`${Math.min(100,Math.max(0,Number(r.value)*100))}%`;track.append(fill);card.append(track);}
   const spend=data.selected_spend&&isFresh(data.selected_spend)?data.selected_spend:null;

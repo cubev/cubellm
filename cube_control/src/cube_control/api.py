@@ -47,7 +47,10 @@ def reading_view(reading: Observation, observations: tuple[Observation, ...], no
     return ReadingView(
         reading=reading,
         freshness=reading.freshness(now),
-        current=not outage and reading.freshness(now) == "fresh" and reading.status in ("known", "manual", "estimated"),
+        current=not outage
+        and reading.freshness(now) == "fresh"
+        and reading.status in ("known", "manual", "estimated")
+        and (reading.metric not in ("spend", "budget") or reading.period == now.strftime("%Y-%m")),
     )
 
 

@@ -3,6 +3,7 @@ from decimal import Decimal
 from itertools import groupby
 from typing import Final
 
+from cube_control.manual import active_fields, effective_account, effective_readings
 from cube_control.models import Account, AccountView, MediaJob, Observation, UsageEvent
 from cube_control.store import StoredState
 
@@ -50,12 +51,20 @@ def reservations(jobs: tuple[MediaJob, ...], account_id: str, now: datetime) -> 
 
 
 def account_view(account: Account, state: StoredState, now: datetime, period: str) -> AccountView:
-    latest: Final[tuple[Observation, ...]] = latest_measurements(account.id, state.observations)
+    fields: Final = active_fields(account.id, state.manual_entries)
+    latest: Final[tuple[Observation, ...]] = effective_readings(
+        account.id, latest_measurements(account.id, state.observations), fields
+    )
     events: Final[tuple[UsageEvent, ...]] = tuple(
         e for e in state.events if e.account_id == account.id and e.period == period
     )
     return AccountView(
-        account=account,
+        account=effective_account(account, fields),
+        automatic_account=account,
+        manual_fields=fields,
+        manual_version=max(
+            (entry.revision for entry in state.manual_entries if entry.command.account_id == account.id), default=0
+        ),
         observations=latest,
         proxy_events=len(events),
         proxy_amounts=proxy_amounts(events),

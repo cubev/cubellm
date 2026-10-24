@@ -190,9 +190,79 @@ class ImportBatch(FrozenModel):
     fleet: FleetSnapshot | None = None
 
 
+ManualField = Literal["name", "state", "plan", "note", "budget_usd", "recurring_usd", "balance_usd", "balance_credits"]
+
+
+class ManualChange(FrozenModel):
+    field: ManualField
+    action: Literal["set", "automatic"]
+    value: Annotated[str, Field(max_length=300)] | None = None
+    period: Annotated[str, Field(pattern=r"^(?:|[0-9]{4}-(?:0[1-9]|1[0-2]))$")] = ""
+
+    @model_validator(mode="after")
+    def validate_change(self) -> Self:
+        if (self.action == "set") != (self.value is not None):
+            raise ValueError("Set requires a value; automatic cannot carry a value")
+        if (self.field == "budget_usd") != bool(self.period):
+            raise ValueError("Only monthly budgets require a period")
+        if self.value is None:
+            return self
+        if self.field in ("name", "state", "plan", "note"):
+            Account.model_validate(
+                {"id": "validation", "provider": "openai", "kind": "api", "name": "validation", self.field: self.value}
+            )
+            return self
+        try:
+            amount: Final[Decimal] = Decimal(self.value)
+        except ArithmeticError:
+            raise ValueError("Money and credit values must be decimals") from None
+        if (
+            not amount.is_finite()
+            or abs(amount) > Decimal("1e15")
+            or (self.field in ("budget_usd", "recurring_usd") and amount < 0)
+        ):
+            raise ValueError("Invalid manual amount")
+        if self.field.endswith("usd") and amount != amount.quantize(Decimal("0.01")):
+            raise ValueError("Monetary values require at most two decimal places")
+        return self
+
+
+class ManualCommand(FrozenModel):
+    schema_version: Literal[1] = 1
+    command_id: Identifier
+    account_id: Identifier
+    expected_version: Annotated[int, Field(ge=0)]
+    changes: Annotated[tuple[ManualChange, ...], Field(min_length=1, max_length=8)]
+
+    @model_validator(mode="after")
+    def unique_fields(self) -> Self:
+        if len({(change.field, change.period) for change in self.changes}) != len(self.changes):
+            raise ValueError("Each field and period can only be changed once per command")
+        return self
+
+
+class ManualEntry(FrozenModel):
+    command: ManualCommand
+    revision: Annotated[int, Field(ge=1)]
+    actor: Annotated[str, Field(min_length=1, max_length=100)]
+    received_at: AwareDatetime
+
+
+class ManualFieldView(FrozenModel):
+    field: ManualField
+    period: str
+    value: str
+    revision: int
+    actor: str
+    changed_at: AwareDatetime
+
+
 class AccountView(FrozenModel):
     account: Account
     observations: tuple[Observation, ...]
+    automatic_account: Account | None = None
+    manual_fields: tuple[ManualFieldView, ...] = ()
+    manual_version: int = 0
     proxy_events: int
     proxy_amounts: dict[str, Decimal]
     selected_spend: Observation | None

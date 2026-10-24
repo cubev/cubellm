@@ -1,4 +1,5 @@
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -10,7 +11,7 @@ import uvicorn
 from pydantic import ValidationError
 
 from cube_control.api import create_app
-from cube_control.models import ImportBatch
+from cube_control.models import ImportBatch, ManualCommand
 from cube_control.openrouter import collect_openrouter
 from cube_control.store import PostgresRepository
 
@@ -19,6 +20,9 @@ def main() -> int:
     parser: Final[argparse.ArgumentParser] = argparse.ArgumentParser(prog="cubellm-control")
     sub: Final = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init")
+    manage_parser: Final = sub.add_parser("manage")
+    manage_parser.add_argument("path", nargs="?", default="-")
+    manage_parser.add_argument("--actor", default=getpass.getuser())
     collect_parser: Final = sub.add_parser("collect-openrouter")
     collect_parser.add_argument("--config", required=True, type=Path)
     import_parser: Final = sub.add_parser("import")
@@ -40,6 +44,19 @@ def main() -> int:
         repository.initialize()
         print("CubeLLM Control schema ready")
         return 0
+    if args.command == "manage":
+        raw_command: Final[str] = sys.stdin.read(65537) if args.path == "-" else Path(args.path).read_text()
+        if len(raw_command) > 65536:
+            print("Management command exceeds size limit", file=sys.stderr)
+            return 2
+        try:
+            command: Final = ManualCommand.model_validate_json(raw_command)
+        except ValidationError:
+            print("Management command rejected: invalid data; input values are not logged", file=sys.stderr)
+            return 2
+        managed: Final = repository.manage(command, args.actor, datetime.now(UTC))
+        print(json.dumps({"status": managed.status, "version": managed.version, "message": managed.message}))
+        return 0 if managed.status in ("applied", "duplicate") else 1
     if args.command == "import":
         raw: Final[str] = sys.stdin.read(8_000_001) if args.path == "-" else Path(args.path).read_text()
         if len(raw) > 8_000_000:

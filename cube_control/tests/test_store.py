@@ -6,8 +6,9 @@ from decimal import Decimal
 from typing import Final
 from uuid import uuid4
 
-from cube_control.models import Account, ImportBatch, Observation, Provider, UsageEvent
+from cube_control.models import Account, ImportBatch, ManualChange, ManualCommand, Observation, Provider, UsageEvent
 from cube_control.store import PostgresRepository
+from cube_control.summary import account_view
 
 DSN: Final[str] = os.environ.get("CUBE_CONTROL_TEST_DATABASE_URL", "")
 
@@ -91,3 +92,66 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(result.ok)
         stored: Final = next(a for a in self.repository.state().accounts if a.id == self.account.id)
         self.assertEqual(stored.provider, self.account.provider)
+
+    def command(self, identity: str = "manual-1", version: int = 0) -> ManualCommand:
+        return ManualCommand(
+            command_id=self.account.id + identity,
+            account_id=self.account.id,
+            expected_version=version,
+            changes=(ManualChange(field="plan", action="set", value="Manual plan"),),
+        )
+
+    def test_manual_retries_are_idempotent_but_changed_identity_is_rejected(self) -> None:
+        command: Final = self.command()
+        first: Final = self.repository.manage(command, "owner", self.now)
+        second: Final = self.repository.manage(command, "owner", self.now)
+        self.assertEqual((first.status, second.status), ("applied", "duplicate"))
+        self.assertEqual((first.version, second.version), (1, 1))
+        changed: Final = command.model_copy(
+            update={"changes": (ManualChange(field="plan", action="set", value="Different"),)}
+        )
+        self.assertEqual(self.repository.manage(changed, "owner", self.now).status, "rejected")
+        entries: Final = tuple(
+            e for e in self.repository.state().manual_entries if e.command.account_id == self.account.id
+        )
+        self.assertEqual(len(entries), 1)
+
+    def test_manual_conflict_does_not_apply_any_field(self) -> None:
+        self.assertEqual(self.repository.manage(self.command(), "owner", self.now).status, "applied")
+        conflict: Final = ManualCommand(
+            command_id=self.account.id + "conflict",
+            account_id=self.account.id,
+            expected_version=0,
+            changes=(
+                ManualChange(field="name", action="set", value="Changed"),
+                ManualChange(field="state", action="set", value="paused"),
+            ),
+        )
+        result: Final = self.repository.manage(conflict, "owner", self.now)
+        self.assertEqual((result.status, result.version), ("conflict", 1))
+        view: Final = account_view(self.account, self.repository.state(), self.now, self.now.strftime("%Y-%m"))
+        self.assertEqual((view.account.name, view.account.state), (self.account.name, self.account.state))
+
+    def test_collector_update_preserves_manual_field_and_release_reveals_latest(self) -> None:
+        self.assertEqual(self.repository.manage(self.command(), "owner", self.now).status, "applied")
+        incoming: Final = self.account.model_copy(update={"plan": "Collector plan", "state": "active"})
+        self.assertTrue(self.repository.import_batch(ImportBatch(accounts=(incoming,))).ok)
+        view: Final = account_view(incoming, self.repository.state(), self.now, self.now.strftime("%Y-%m"))
+        self.assertEqual((view.account.plan, view.account.state), ("Manual plan", "active"))
+        release: Final = ManualCommand(
+            command_id=self.account.id + "release",
+            account_id=self.account.id,
+            expected_version=1,
+            changes=(ManualChange(field="plan", action="automatic"),),
+        )
+        self.assertEqual(self.repository.manage(release, "owner", self.now).status, "applied")
+        released: Final = account_view(incoming, self.repository.state(), self.now, self.now.strftime("%Y-%m"))
+        self.assertEqual(released.account.plan, "Collector plan")
+
+    def test_concurrent_edit_has_one_winner(self) -> None:
+        commands: Final = (self.command("a"), self.command("b"))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results: Final = tuple(
+                pool.map(lambda command: self.repository.manage(command, "owner", self.now), commands)
+            )
+        self.assertEqual(sorted(result.status for result in results), ["applied", "conflict"])

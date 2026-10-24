@@ -1,10 +1,22 @@
 from dataclasses import dataclass
-from typing import Final, Protocol
+from datetime import datetime
+from typing import Final, Literal, Protocol
 
 import psycopg
 from psycopg import Connection
+from pydantic import ValidationError
 
-from cube_control.models import CATALOG, Account, FleetSnapshot, ImportBatch, MediaJob, Observation, UsageEvent
+from cube_control.models import (
+    CATALOG,
+    Account,
+    FleetSnapshot,
+    ImportBatch,
+    ManualCommand,
+    ManualEntry,
+    MediaJob,
+    Observation,
+    UsageEvent,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,18 +27,27 @@ class ImportResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualResult:
+    status: Literal["applied", "duplicate", "conflict", "rejected", "unavailable"]
+    version: int = 0
+    message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class StoredState:
     accounts: tuple[Account, ...]
     observations: tuple[Observation, ...]
     events: tuple[UsageEvent, ...]
     jobs: tuple[MediaJob, ...]
     fleet: FleetSnapshot | None = None
+    manual_entries: tuple[ManualEntry, ...] = ()
 
 
 class Repository(Protocol):
     def state(self) -> StoredState: ...
     def healthy(self) -> bool: ...
     def import_batch(self, batch: ImportBatch) -> ImportResult: ...
+    def manage(self, command: ManualCommand, actor: str, now: datetime) -> ManualResult: ...
 
 
 SCHEMA: Final[str] = """
@@ -42,6 +63,10 @@ CREATE TABLE IF NOT EXISTS cube_control.events (
 );
 CREATE TABLE IF NOT EXISTS cube_control.jobs (
     id text PRIMARY KEY, account_id text NOT NULL REFERENCES cube_control.accounts(id), payload jsonb NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cube_control.manual_commands (
+    command_id text PRIMARY KEY, account_id text NOT NULL REFERENCES cube_control.accounts(id),
+    revision bigint NOT NULL, payload jsonb NOT NULL, UNIQUE(account_id, revision)
 );
 CREATE TABLE IF NOT EXISTS cube_control.fleet (id text PRIMARY KEY CHECK (id = 'current'), payload jsonb NOT NULL);
 """
@@ -93,12 +118,19 @@ class PostgresRepository:
             fleet_row: Final[tuple[str, ...] | None] = connection.execute(
                 "SELECT payload::text FROM cube_control.fleet WHERE id='current'"
             ).fetchone()
+            manual_entries: Final[tuple[ManualEntry, ...]] = tuple(
+                ManualEntry.model_validate_json(row[0])
+                for row in connection.execute(
+                    "SELECT payload::text FROM cube_control.manual_commands ORDER BY account_id, revision"
+                )
+            )
             return StoredState(
                 accounts,
                 observations,
                 events,
                 jobs,
                 FleetSnapshot.model_validate_json(fleet_row[0]) if fleet_row else None,
+                manual_entries,
             )
 
     def import_batch(self, batch: ImportBatch) -> ImportResult:
@@ -187,3 +219,38 @@ class PostgresRepository:
                 return ImportResult(True, after - before)
         except psycopg.Error:
             return ImportResult(False, message="Database rejected the import; nothing was changed")
+
+    def manage(self, command: ManualCommand, actor: str, now: datetime) -> ManualResult:
+        try:
+            with self.connect() as connection:
+                connection.execute("SELECT pg_advisory_xact_lock(hashtext('cube-control-import'))")
+                stored: Final = connection.execute(
+                    "SELECT payload::text FROM cube_control.manual_commands WHERE command_id=%s", (command.command_id,)
+                ).fetchone()
+                if stored:
+                    previous: Final = ManualEntry.model_validate_json(stored[0])
+                    if previous.command == command and previous.actor == actor:
+                        return ManualResult("duplicate", previous.revision)
+                    return ManualResult("rejected", message="Command identity conflict; nothing changed")
+                account: Final = connection.execute(
+                    "SELECT id FROM cube_control.accounts WHERE id=%s", (command.account_id,)
+                ).fetchone()
+                if account is None:
+                    return ManualResult("rejected", message="Account is not registered")
+                row: Final = connection.execute(
+                    "SELECT COALESCE(max(revision),0)::text FROM cube_control.manual_commands WHERE account_id=%s",
+                    (command.account_id,),
+                ).fetchone()
+                version: Final[int] = int(row[0]) if row else 0
+                if version != command.expected_version:
+                    return ManualResult("conflict", version, "Account was edited; refresh before applying changes")
+                entry: Final = ManualEntry(command=command, revision=version + 1, actor=actor, received_at=now)
+                connection.execute(
+                    "INSERT INTO cube_control.manual_commands(command_id,account_id,revision,payload) VALUES (%s,%s,%s,%s::jsonb)",
+                    (command.command_id, command.account_id, entry.revision, entry.model_dump_json()),
+                )
+                return ManualResult("applied", entry.revision)
+        except ValidationError:
+            return ManualResult("rejected", message="Invalid management actor or clock")
+        except psycopg.Error:
+            return ManualResult("unavailable", message="Management database unavailable; retry the same command ID")

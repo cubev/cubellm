@@ -79,3 +79,52 @@ never measured zero values. Invalid response bodies are not logged
 Contract checked against the official [credits API](https://openrouter.ai/docs/api/api-reference/credits/get-credits)
 and [billing explanation](https://openrouter.ai/support) on 2026-10-24.
 Live account verification requires an existing authorized management credential
+
+## Manual account management
+
+The management CLI changes the local account registry, never the vendor's plan,
+billing settings or subscription. It uses the existing authenticated management
+transport. HTTP remains read-only
+
+Read `data.manual_version` from the account summary before preparing a command.
+Send a versioned command to `cubellm-control manage command.json --actor local-owner`:
+
+```json
+{
+  "schema_version": 1,
+  "command_id": "example-user-action-1",
+  "account_id": "suno-subscription",
+  "expected_version": 0,
+  "changes": [
+    {"field": "plan", "action": "set", "value": "Existing plan"},
+    {"field": "budget_usd", "action": "set", "value": "20.00", "period": "2026-10"}
+  ]
+}
+```
+
+Use a new globally unique command ID for each intended edit. A retry must reuse
+the exact command and actor. `duplicate` confirms the original edit without
+writing again. `conflict` returns the current version and applies nothing.
+A management transport timeout leaves the result unknown, so retry that same
+saved command instead of creating a new action
+
+Fields are name, state, plan, note, budget_usd, recurring_usd, balance_usd and
+balance_credits. Budgets require a YYYY-MM period; other fields have no period.
+USD values use decimal strings with at most two significant decimal places.
+Manual financial amounts are limited to an absolute value of 10^15. These
+metadata fields must never contain credentials
+
+Each field keeps separate manual provenance and a central account revision.
+Collector updates continue and remain available as the automatic account.
+Use `{"field":"plan","action":"automatic"}` to release an override. Releasing
+a budget also requires its period. The next view uses the latest automatic
+value without deleting the manual history. The dashboard shows manual field
+age and divergence from the automatic account. Balances expire after 15 minutes,
+prices and budgets after 31 days; a stale override remains explicit and does not
+silently fall back to a collector value. Previous and future month budgets are
+never presented as this month's budget
+
+The immutable command journal lives only in the companion database. New tables
+are additive; no gateway schema or data is changed. Commands validate all their
+fields before a single transaction, and concurrent editors cannot both apply
+the same expected account revision
