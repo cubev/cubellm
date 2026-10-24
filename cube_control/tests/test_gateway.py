@@ -152,9 +152,7 @@ class GatewayStoreTests(unittest.TestCase):
         scan_count: Final = 12
         for sequence in range(scan_count):
             self.assertEqual(self.repository.import_batch(self.batch(sequence)).status, "applied")
-        latest: Final = next(
-            item for item in self.general.state().gateway_scans if item.scan.source_id == self.source
-        )
+        latest: Final = next(item for item in self.general.state().gateway_scans if item.scan.source_id == self.source)
         self.assertEqual(latest.sequence, scan_count)
         following: Final = self.repository.import_batch(self.batch(latest.sequence))
         self.assertEqual((following.status, following.sequence), ("applied", scan_count + 1))
