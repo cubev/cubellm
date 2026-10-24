@@ -3,6 +3,7 @@ from decimal import Decimal
 from itertools import groupby
 from typing import Final
 
+from cube_control.gateway import gateway_metrics
 from cube_control.manual import active_fields, effective_account, effective_readings
 from cube_control.models import Account, AccountView, MediaJob, Observation, UsageEvent
 from cube_control.store import StoredState
@@ -60,6 +61,9 @@ def account_view(account: Account, state: StoredState, now: datetime, period: st
     )
     return AccountView(
         account=effective_account(account, fields),
+        gateway=gateway_metrics(state.gateway_records, account.provider, period)
+        if state.gateway_scans and account.kind == "api"
+        else None,
         automatic_account=account,
         manual_fields=fields,
         manual_version=max(

@@ -48,7 +48,8 @@ function renderAccounts() {
    }
   }
   for(const v of current.filter(v=>["balance","recurring_cost","usage"].includes(v.reading.metric))) {const r=v.reading;metric(card,`${r.metric==="balance"?"Guthaben":r.metric==="recurring_cost"?"Abokosten":"Nutzung"}${r.window?" · "+r.window:""}`,number(r.value,r.unit));}
-  if(!current.length&&!spend)card.append(element("p","empty","Noch keine verifizierten aktuellen Werte"));
+  if(!current.length&&!spend&&!(data.gateway&&data.gateway.calls))card.append(element("p","empty","Noch keine verifizierten aktuellen Werte"));
+  gatewayAccount(card,data.gateway);
   for(const [currency,value] of Object.entries(data.proxy_amounts)) {metric(card,"Beobachteter Proxy-Verbrauch",number(value,currency),true);card.append(element("p","explanation","Separat erfasst. Wird nicht zum Anbieterbericht addiert."));}
   for(const [unit,value] of Object.entries(data.open_reservations))metric(card,"Für laufende Aufträge reserviert",number(value,unit),true);
   const errors=item.readings.filter(v=>v.reading.status==="error"||v.reading.status==="not_configured");
@@ -58,6 +59,40 @@ function renderAccounts() {
   const foot=element("div","source");foot.append(element("span","",latest?sources[latest.reading.source]:"Keine Datenquelle verbunden"),element("span","",latest?`${isFresh(latest.reading)?"":"Veraltet · "}${age(latest.reading.observed_at)}`:""));card.append(foot);$("accounts").append(card);
  }
 }
+function renderGateway(data) {
+ const sources=data.gateway_sources||[];
+ $("gateway-section").hidden=!sources.length;
+ $("gateway-sources").replaceChildren();
+ for(const source of sources){
+  const scan=source.scan,delta=Date.now()-Date.parse(scan.checked_at);
+  const stale=!Number.isFinite(delta)||delta< -60000||delta>900000;
+  const state=stale?"veraltet":scan.state==="ok"?"Import erfolgreich":scan.state==="partial"?"Teilimport":"Quelle nicht erreichbar";
+  const row=element("div");
+  row.append(element("p","",`${state} · ${age(scan.checked_at)} · ${scan.available_rows===null?"Anzahl unbekannt":scan.available_rows+" Einträge in der Quelldatenbank"}`));
+  if(scan.unassigned_rows)row.append(element("p","explanation",`${scan.unassigned_rows} gescannte Einträge ohne Anbieterzuordnung`));
+  if(scan.rejected_rows)row.append(element("p","explanation error",`${scan.rejected_rows} Einträge konnten nicht übernommen werden`));
+  if(scan.message)row.append(element("p","explanation",scan.message));
+  $("gateway-sources").append(row);
+ }
+ const unknown=data.gateway_unassigned;
+ $("gateway-unassigned").textContent=unknown&&unknown.calls?`${unknown.calls} bisher erfasste Aufrufe im aktuellen Monat noch nicht zugeordnet. ${unknown.unknown_cost_calls===unknown.calls?"Kosten unbekannt":"Gemeldete Kosten: "+number(unknown.reported_usd,"USD")}${unknown.unknown_cost_calls?" · "+unknown.unknown_cost_calls+" ohne Kostenangabe":""}`:"";
+}
+function gatewayAccount(card, gateway) {
+ if(!gateway||!gateway.calls)return;
+ metric(card,"Bisher erfasste Gateway-Aufrufe",gateway.calls);
+ const missing=gateway.unknown_cost_calls;
+ metric(card,"Gateway-Kosten (separat)",missing===gateway.calls?"unbekannt":number(gateway.reported_usd,"USD")+(missing?" (Teilbetrag)":""));
+ if(missing)card.append(element("p","explanation",`${missing} Aufrufe ohne Kostenangabe`));
+ if(gateway.failures)metric(card,"Fehlgeschlagene Gateway-Aufrufe",gateway.failures,true);
+ if(gateway.unknown_status)metric(card,"Aufrufe mit unbekanntem Status",gateway.unknown_status,true);
+ const details=element("details","explanation");details.append(element("summary","","Gateway-Tokens anzeigen"));
+ const counters=[["Input, einschließlich Cache","input_tokens","unknown_input_calls"],["Output","output_tokens","unknown_output_calls"],["Cache gelesen","cache_read_tokens","unknown_cache_read_calls"],["Cache geschrieben","cache_write_tokens","unknown_cache_write_calls"]];
+ for(const [label,field,missingField] of counters){
+  const absent=gateway[missingField];
+  metric(details,label,absent===gateway.calls?"unbekannt":new Intl.NumberFormat("de-DE").format(gateway[field])+(absent?" · teilweise unbekannt":""),true);
+ }
+ card.append(details,element("p","explanation","Gateway-Werte sind separat erfasst und werden nicht zum Anbieterbericht addiert."));
+}
 function renderFleet(fleet) {
  $("fleet").replaceChildren();if(!fleet){$("fleet").append(element("div","empty","Noch kein zentraler Systembericht"));return;}
  $("fleet-age").textContent=age(fleet.checked_at);
@@ -65,5 +100,5 @@ function renderFleet(fleet) {
   if(host.message)card.append(element("p","",host.message));if(host.repositories.length){const details=element("details"),summary=element("summary","","Projekte anzeigen");details.append(summary);for(const repo of host.repositories){const row=element("div","repo");row.append(element("b","",repo.name),element("div","",`${repo.branch||"Branch unbekannt"} · ${repo.commit||"Commit unbekannt"}${repo.tracked_changes?" · "+repo.tracked_changes+" Änderungen":""}`));details.append(row);}card.append(details);}$("fleet").append(card);
  }
 }
-async function refresh() { $("refresh").disabled=true;try{const [s,f]=await Promise.all([fetch("/api/v1/summary",{cache:"no-store"}),fetch("/api/v1/fleet",{cache:"no-store"})]);if(!s.ok||!f.ok)throw new Error("unavailable");const data=await s.json();accounts=data.accounts;$("period").textContent=new Date(data.period+"-01T12:00:00Z").toLocaleDateString("de-DE",{month:"long",year:"numeric"});$("connection").textContent="Aktualisiert "+new Date(data.generated_at).toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"});const stale=Date.now()-Date.parse(data.generated_at)>900000||(data.transport_status&&data.transport_status!=="ok");$("notice").hidden=!stale;if(stale)$("notice").textContent="Verbindung zur Zentrale unterbrochen. Die Übersicht zeigt den letzten erfolgreichen Stand; veraltete Messwerte werden ausgeblendet.";renderAccounts();renderFleet(await f.json());}catch{$("connection").textContent="Verbindung unterbrochen";$("notice").hidden=false;$("notice").textContent="Die zentrale Übersicht ist gerade nicht erreichbar. Bereits angezeigte Werte stammen vom letzten erfolgreichen Abruf.";renderAccounts();}finally{$("refresh").disabled=false;}}
+async function refresh() { $("refresh").disabled=true;try{const [s,f]=await Promise.all([fetch("/api/v1/summary",{cache:"no-store"}),fetch("/api/v1/fleet",{cache:"no-store"})]);if(!s.ok||!f.ok)throw new Error("unavailable");const data=await s.json();accounts=data.accounts;$("period").textContent=new Date(data.period+"-01T12:00:00Z").toLocaleDateString("de-DE",{month:"long",year:"numeric"});$("connection").textContent="Aktualisiert "+new Date(data.generated_at).toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"});const stale=Date.now()-Date.parse(data.generated_at)>900000||(data.transport_status&&data.transport_status!=="ok");$("notice").hidden=!stale;if(stale)$("notice").textContent="Verbindung zur Zentrale unterbrochen. Die Übersicht zeigt den letzten erfolgreichen Stand; veraltete Messwerte werden ausgeblendet.";renderAccounts();renderGateway(data);renderFleet(await f.json());}catch{$("connection").textContent="Verbindung unterbrochen";$("notice").hidden=false;$("notice").textContent="Die zentrale Übersicht ist gerade nicht erreichbar. Bereits angezeigte Werte stammen vom letzten erfolgreichen Abruf.";renderAccounts();}finally{$("refresh").disabled=false;}}
 $("refresh").addEventListener("click",refresh);document.querySelectorAll("[data-filter]").forEach(button=>button.addEventListener("click",()=>{filter=button.dataset.filter;document.querySelectorAll("[data-filter]").forEach(b=>b.classList.toggle("selected",b===button));renderAccounts();}));refresh();setInterval(refresh,60000);

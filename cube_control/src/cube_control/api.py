@@ -9,7 +9,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 from starlette.middleware.base import RequestResponseEndpoint
 
-from cube_control.models import AccountView, FleetSnapshot, Observation, utc_now
+from cube_control.gateway import gateway_metrics
+from cube_control.models import AccountView, FleetSnapshot, GatewayMetrics, GatewayScanView, Observation, utc_now
 from cube_control.store import Repository
 from cube_control.summary import account_view
 
@@ -33,6 +34,8 @@ class SummaryResponse(BaseModel):
     generated_at: datetime
     period: str
     accounts: tuple[SummaryAccount, ...]
+    gateway_sources: tuple[GatewayScanView, ...] = ()
+    gateway_unassigned: GatewayMetrics | None = None
 
 
 def reading_view(reading: Observation, observations: tuple[Observation, ...], now: datetime) -> ReadingView:
@@ -87,6 +90,8 @@ def create_app(repository: Repository, clock: Callable[[], datetime] = utc_now) 
         return SummaryResponse(
             generated_at=now,
             period=period,
+            gateway_sources=state.gateway_scans,
+            gateway_unassigned=gateway_metrics(state.gateway_records, None, period) if state.gateway_scans else None,
             accounts=tuple(
                 SummaryAccount(
                     data=view, readings=tuple(reading_view(o, view.observations, now) for o in view.observations)

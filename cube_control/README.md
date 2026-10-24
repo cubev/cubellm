@@ -128,3 +128,35 @@ The immutable command journal lives only in the companion database. New tables
 are additive; no gateway schema or data is changed. Commands validate all their
 fields before a single transaction, and concurrent editors cannot both apply
 the same expected account revision
+
+## Passive gateway import
+
+`project-gateway` validates a whitelist projection and hashes source primary keys
+before emitting a GatewayBatch. `import-gateway` updates the current mirror and
+records changed projections in a separate append-only history. Neither command
+calls a model or changes gateway configuration. The resident producer uses a
+read-only PostgreSQL transaction in the existing gateway database; no database
+password or provider credential is copied to this application
+
+Only explicit routing provider information or a known API endpoint assigns a
+provider. An OpenAI-compatible custom endpoint is not sufficient evidence of
+OpenAI billing. Model names never determine attribution. Unassigned calls stay
+in the mirror and are reported separately. Cost and token counters are nullable,
+and their summaries carry unknown counts alongside known sums. Gateway-reported
+zero spend is not verified free usage. Provider reports remain separate
+
+Each source scan has an idempotent ID and expected central sequence. A pending
+scan must be retried identically before observing another source snapshot.
+Changed content updates one mirror row and appends a history row. A revert A to
+B to A therefore works even when source update timestamps tie. No timestamp
+selects the winning version; source observations are centrally serialized.
+Unchanged scans do not append duplicate changes. Missing rows are not deleted,
+because source retention is not evidence of a refunded or cancelled request
+
+The collector pins database instance and table identity. A changed instance
+requires explicit operator reconciliation. It pages stored completed rows with
+a fixed horizon and rescans the whole stored source on subsequent cycles. Long
+scans continue on the next scheduled run. Its status describes stored source
+coverage only, never all vendor usage. Direct calls, pruned logs and unavailable
+rows cannot be reconstructed from this gateway. Partial and failed imports are
+visible. Readers must be deployed and healthy before enabling a new producer

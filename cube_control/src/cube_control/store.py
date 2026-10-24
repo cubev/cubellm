@@ -6,10 +6,14 @@ import psycopg
 from psycopg import Connection
 from pydantic import ValidationError
 
+from cube_control.gateway_store import SCHEMA as GATEWAY_SCHEMA
+from cube_control.gateway_store import current_records, latest_scans
 from cube_control.models import (
     CATALOG,
     Account,
     FleetSnapshot,
+    GatewayRecord,
+    GatewayScanView,
     ImportBatch,
     ManualCommand,
     ManualEntry,
@@ -41,6 +45,8 @@ class StoredState:
     jobs: tuple[MediaJob, ...]
     fleet: FleetSnapshot | None = None
     manual_entries: tuple[ManualEntry, ...] = ()
+    gateway_records: tuple[GatewayRecord, ...] = ()
+    gateway_scans: tuple[GatewayScanView, ...] = ()
 
 
 class Repository(Protocol):
@@ -82,6 +88,7 @@ class PostgresRepository:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.execute(SCHEMA)
+            connection.execute(GATEWAY_SCHEMA)
             for account in CATALOG:
                 connection.execute(
                     "INSERT INTO cube_control.accounts (id, payload) VALUES (%s, %s::jsonb) ON CONFLICT DO NOTHING",
@@ -131,6 +138,8 @@ class PostgresRepository:
                 jobs,
                 FleetSnapshot.model_validate_json(fleet_row[0]) if fleet_row else None,
                 manual_entries,
+                current_records(connection),
+                latest_scans(connection),
             )
 
     def import_batch(self, batch: ImportBatch) -> ImportResult:

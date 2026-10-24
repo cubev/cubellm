@@ -257,12 +257,77 @@ class ManualFieldView(FrozenModel):
     changed_at: AwareDatetime
 
 
+class GatewayRecord(FrozenModel):
+    source_key: Identifier
+    provider: Provider | None = None
+    model: Annotated[str, Field(min_length=1, max_length=150)]
+    occurred_at: AwareDatetime
+    source_updated_at: AwareDatetime | None = None
+    status: Literal["succeeded", "failed", "unknown"]
+    amount_usd: Annotated[Decimal, Field(ge=0, allow_inf_nan=False)] | None = None
+    input_tokens: Annotated[int, Field(ge=0)] | None = None
+    output_tokens: Annotated[int, Field(ge=0)] | None = None
+    cache_read_tokens: Annotated[int, Field(ge=0)] | None = None
+    cache_write_tokens: Annotated[int, Field(ge=0)] | None = None
+
+
+class GatewayScan(FrozenModel):
+    scan_id: Identifier
+    source_id: Identifier
+    expected_sequence: Annotated[int, Field(ge=0)]
+    checked_at: AwareDatetime
+    state: Literal["ok", "partial", "error"]
+    scope: Literal["stored_gateway_rows"] = "stored_gateway_rows"
+    available_rows: Annotated[int, Field(ge=0)] | None = None
+    scanned_rows: Annotated[int, Field(ge=0)] = 0
+    unassigned_rows: Annotated[int, Field(ge=0)] = 0
+    rejected_rows: Annotated[int, Field(ge=0)] = 0
+    message: Annotated[str, Field(max_length=300)] = ""
+
+
+class GatewayBatch(FrozenModel):
+    scan: GatewayScan
+    records: Annotated[tuple[GatewayRecord, ...], Field(max_length=1000)] = ()
+
+    @model_validator(mode="after")
+    def validate_scan(self) -> Self:
+        if self.scan.state == "error" and self.records:
+            raise ValueError("Failed scans cannot update records")
+        if len({record.source_key for record in self.records}) != len(self.records):
+            raise ValueError("Duplicate source row in scan")
+        if self.scan.state == "ok" and (self.scan.available_rows is None or self.scan.rejected_rows):
+            raise ValueError("Successful scans require a row count and no rejected rows")
+        return self
+
+
+class GatewayScanView(FrozenModel):
+    scan: GatewayScan
+    sequence: int
+
+
+class GatewayMetrics(FrozenModel):
+    calls: int
+    failures: int
+    unknown_status: int
+    reported_usd: Decimal
+    unknown_cost_calls: int
+    input_tokens: int
+    unknown_input_calls: int
+    output_tokens: int
+    unknown_output_calls: int
+    cache_read_tokens: int
+    unknown_cache_read_calls: int
+    cache_write_tokens: int
+    unknown_cache_write_calls: int
+
+
 class AccountView(FrozenModel):
     account: Account
     observations: tuple[Observation, ...]
     automatic_account: Account | None = None
     manual_fields: tuple[ManualFieldView, ...] = ()
     manual_version: int = 0
+    gateway: GatewayMetrics | None = None
     proxy_events: int
     proxy_amounts: dict[str, Decimal]
     selected_spend: Observation | None
