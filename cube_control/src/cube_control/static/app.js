@@ -55,10 +55,11 @@ function renderAccounts() {
   if(spend)metric(card,spend.status==="manual"?"Monatskosten (manuell)":spend.status==="estimated"?"Monatskosten (geschätzt)":"Gemeldete Monatskosten",number(spend.value,spend.unit));
   for(const v of current.filter(v=>v.reading.metric==="budget")) {
    const r=v.reading;
-   metric(card,"Selbst gesetztes Monatsbudget",number(r.value,r.unit));
+   const organization=r.source==="provider_api"&&r.window==="Org-Limit";
+   metric(card,organization?"Organisationslimit / Monat":"Selbst gesetztes Monatsbudget",number(r.value,r.unit));
    if(spend&&spend.unit===r.unit&&spend.period===r.period) {
     const remaining=Number(r.value)-Number(spend.value);
-    metric(card,remaining<0?"Budget überschritten um":"Verbleibendes Monatsbudget",number(Math.abs(remaining),r.unit));
+    metric(card,organization?(remaining<0?"Organisationslimit überschritten um":"Bis zum Organisationslimit"):(remaining<0?"Budget überschritten um":"Verbleibendes Monatsbudget"),number(Math.abs(remaining),r.unit));
    }
   }
   for(const v of current.filter(v=>["balance","recurring_cost","usage"].includes(v.reading.metric))) {const r=v.reading;metric(card,`${r.metric==="balance"?"Guthaben":r.metric==="recurring_cost"?"Abokosten":"Nutzung"}${r.window?" · "+r.window:""}`,number(r.value,r.unit));}
