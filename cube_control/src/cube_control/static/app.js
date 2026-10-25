@@ -16,6 +16,19 @@ function isFresh(reading) {
  if(["spend","budget"].includes(reading.metric)&&reading.period!==new Date().toISOString().slice(0,7))return false;
  return true;
 }
+const goodStatuses = new Set(["known", "manual", "estimated"]);
+function unresolvedError(view, readings, now = Date.now()) {
+ const error = view.reading;
+ if (!["error", "not_configured"].includes(error.status)) return false;
+ if (error.window !== "all") return true;
+ const since = Date.parse(error.observed_at);
+ return !readings.some(other => {
+  const good = other.reading;
+  const observed = Date.parse(good.observed_at);
+  return good.metric === error.metric && good.source === error.source
+   && goodStatuses.has(good.status) && observed > since && observed <= now + 60000;
+ });
+}
 function renderAccounts() {
  const visible=accounts.filter(a=>filter==="all"||a.data.account.kind===filter);$("accounts").replaceChildren();$("count").textContent=`${visible.length} Konten · ${new Set(visible.map(a=>a.data.account.provider)).size} Anbieter`;
  for(const item of visible) {
@@ -52,7 +65,7 @@ function renderAccounts() {
   if(!current.length&&!spend)card.append(element("p","empty","Noch keine verifizierten aktuellen Werte"));
   for(const [currency,value] of Object.entries(data.proxy_amounts)) {metric(card,"Beobachteter Proxy-Verbrauch",number(value,currency),true);card.append(element("p","explanation","Separat erfasst. Wird nicht zum Anbieterbericht addiert."));}
   for(const [unit,value] of Object.entries(data.open_reservations))metric(card,"Für laufende Aufträge reserviert",number(value,unit),true);
-  const errors=item.readings.filter(v=>v.reading.status==="error"||v.reading.status==="not_configured");
+  const errors=item.readings.filter(v=>unresolvedError(v,item.readings));
   if(errors.length)card.append(element("p","explanation error",errors[0].reading.message||"Datenquelle nicht verfügbar"));
   if(account.note)card.append(element("p","explanation",account.note));
   const latest=[...item.readings].sort((a,b)=>Date.parse(b.reading.observed_at)-Date.parse(a.reading.observed_at))[0];
