@@ -18,6 +18,8 @@ class CubeControlCapabilities(BaseModel):
     application_identity: Literal["authenticated_object_v1"] = "authenticated_object_v1"
     passthrough_application_identity: Literal["authenticated_object_v1"] = "authenticated_object_v1"
     passthrough_header_isolation: Literal[True] = True
+    passthrough_account_binding: Literal["configured_credential_v1"] = "configured_credential_v1"
+    credential_values_full_masking: Literal[True] = True
     virtual_key_log_redaction: Literal[True] = True
     custom_keys_allowed: bool
     client_side_credentials_allowed: bool

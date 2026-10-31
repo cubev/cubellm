@@ -2817,6 +2817,10 @@ class AdapterCompletionStreamWrapper:
 
 
 class StandardLoggingUserAPIKeyMetadata(TypedDict):
+    provider_origin: NotRequired[ReadOnly[str | None]]
+    provider_account_id: NotRequired[ReadOnly[str | None]]
+    provider_account_source: NotRequired[ReadOnly[Literal["configured_credential"] | None]]
+    provider_cost_status: NotRequired[ReadOnly[Literal["unverified"] | None]]
     user_api_key_application_id: NotRequired[ReadOnly[str | None]]
     user_api_key_hash: str | None  # hash of the litellm virtual key used
     user_api_key_alias: str | None

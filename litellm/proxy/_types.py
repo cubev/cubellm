@@ -27,6 +27,7 @@ from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
     validate_langfuse_span_scope_value,
     validate_no_callback_env_reference,
 )
+from litellm.proxy.pass_through_endpoints.account_credentials import AccountHeaderCredential, validate_account_route
 from litellm.types.agents import AgentCaller
 from litellm.types.integrations.compression_interception import (
     CompressionSavingsMetadata,
@@ -2436,6 +2437,22 @@ PassThroughGuardrailsConfig = dict[str, PassThroughGuardrailSettings | None]
 
 
 class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
+    account_credential: AccountHeaderCredential | None = None
+
+    @model_validator(mode="after")
+    def require_authenticated_account_route(self) -> "PassThroughGenericEndpoint":
+        if self.account_credential is not None:
+            validate_account_route(
+                self.target,
+                self.auth,
+                False,
+                self.headers,
+                self.default_query_params,
+                self.account_credential,
+                self.methods,
+            )
+        return self
+
     id: str | None = Field(
         default=None,
         description="Optional unique identifier for the pass-through endpoint. If not provided, endpoints will be identified by path for backwards compatibility.",
@@ -4053,6 +4070,10 @@ class SpendLogsRouterMetadata(TypedDict):
 
 
 class SpendLogsMetadata(TypedDict):
+    provider_origin: NotRequired[ReadOnly[str | None]]
+    provider_account_id: NotRequired[ReadOnly[str | None]]
+    provider_account_source: NotRequired[ReadOnly[Literal["configured_credential"] | None]]
+    provider_cost_status: NotRequired[ReadOnly[Literal["unverified"] | None]]
     user_api_key_application_id: NotRequired[ReadOnly[str | None]]
     autorouter_baseline_observation: ReadOnly[str | None]
     """

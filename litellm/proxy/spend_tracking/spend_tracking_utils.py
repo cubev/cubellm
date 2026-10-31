@@ -46,6 +46,7 @@ from litellm.litellm_core_utils.ptu_pricing import azure_spillover
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps, strip_null_bytes
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload, SpendLogsRouterMetadata, UserAPIKeyAuth
 from litellm.proxy.common_utils.application_identity import application_id_from_key_metadata
+from litellm.proxy.pass_through_endpoints.account_credentials import AccountRouteBinding
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
 from litellm.proxy.utils import PrismaClient, hash_token
@@ -156,6 +157,10 @@ _STAMPED_METADATA_KEYS: Final = frozenset(
         "autorouter_savings_estimate",
         "autorouter_baseline_observation",
         "user_api_key_application_id",
+        "provider_origin",
+        "provider_account_id",
+        "provider_account_source",
+        "provider_cost_status",
     )
 )
 
@@ -181,12 +186,21 @@ def _get_spend_logs_metadata(
     router_metadata: SpendLogsRouterMetadata | None = None,
     azure_spillover: AzureSpillover | None = None,
     user_api_key_auth: UserAPIKeyAuth | None = None,
+    account_binding: AccountRouteBinding | None = None,
 ) -> SpendLogsMetadata:
+    account_id: Final = account_binding.account_id if account_binding is not None else None
+    account_source: Final[Literal["configured_credential"] | None] = (
+        "configured_credential" if account_binding is not None else None
+    )
     application_id: Final = application_id_from_key_metadata(
         user_api_key_auth.metadata if user_api_key_auth is not None else None
     )
     if metadata is None:
         return SpendLogsMetadata(
+            provider_origin=account_binding.origin if account_binding is not None else None,
+            provider_account_id=account_id,
+            provider_account_source=account_source,
+            provider_cost_status="unverified" if account_binding is not None else None,
             user_api_key_application_id=application_id,
             user_api_key=None,
             user_api_key_alias=None,
@@ -240,6 +254,10 @@ def _get_spend_logs_metadata(
             {key: metadata.get(key) for key in SpendLogsMetadata.__annotations__ if key not in _STAMPED_METADATA_KEYS}
         ),
         user_api_key_application_id=application_id,
+        provider_origin=account_binding.origin if account_binding is not None else None,
+        provider_account_id=account_id,
+        provider_account_source=account_source,
+        provider_cost_status="unverified" if account_binding is not None else None,
         autorouter_savings=autorouter_savings,
         autorouter_savings_estimate=autorouter_savings_estimate,
         autorouter_baseline_observation=autorouter_baseline_observation,
@@ -649,9 +667,11 @@ def get_logging_payload(
     # clean up litellm metadata
     metadata_snapshot: Final[Mapping[str, object]] = metadata
     auth_object: Final = metadata_snapshot.get("user_api_key_auth")
+    account_object: Final = metadata_snapshot.get("_cube_account_binding")
     clean_metadata = _get_spend_logs_metadata(
         persisted_metadata,
-        user_api_key_auth=auth_object if isinstance(auth_object,UserAPIKeyAuth) else None,
+        user_api_key_auth=auth_object if isinstance(auth_object, UserAPIKeyAuth) else None,
+        account_binding=account_object if isinstance(account_object, AccountRouteBinding) else None,
         applied_guardrails=(
             standard_logging_payload["metadata"].get("applied_guardrails", None)
             if standard_logging_payload is not None

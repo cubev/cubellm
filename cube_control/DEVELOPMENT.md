@@ -260,3 +260,73 @@ No companion code, database schema, production gateway, route, credential or
 application was changed. Provider-account selection and actual non-LLM application
 wiring remain open. Native gateway rollout and live protocol verification are
 required before these protections can be relied on in production
+
+
+## Native named account binding acceptance
+
+Generic HTTP routes now reference the existing native named credential store and
+require matching account metadata and an explicit allowed-origin list. Requests
+resolve the selected credential once; an immutable server-held snapshot supplies
+the account, origin and provenance to the native spend writer. Client metadata
+cannot assert those fields or mark provider cost as verified. Application identity
+continues to come from the actual authenticated key snapshot. Credential names,
+values and the internal binding object do not enter stored spend metadata.
+
+Before the privacy prerequisite, four masking regressions reproduced disclosure
+through arbitrary field names, nested/nonstring values and zero visible-character
+settings. The masking helper now honors its all-values switch. Credential list,
+name and model reads mask every value with zero visible characters. ASGI checks
+cover list/name reads, retention of nonsecret account metadata and unchanged
+underlying values.
+
+The final focused account/privacy/transport selection passes 44 tests (925 deselected).
+It covers missing/mismatched credentials, SecretStr and environment rotation,
+origin allowlists/default-port normalization, immutable per-request selection,
+route retargeting, unsafe configuration, client overrides, a JSON-envelope query
+credential bypass, and the actual native HTTP relay plus asynchronous spend
+callback. A combined native security/capability/provenance selection passes 111
+tests (1153 deselected), including six redirect/isolation cases for GET, JSON,
+raw, multipart, streaming JSON and streaming multipart. These cases deliberately
+use a pooled client carrying another account's authentication, cookies, default
+headers and query credentials. Bound requests inherit none of them and do not
+follow the response redirect. Removing request isolation deliberately makes all six
+regressions fail; restoring it makes all six pass. Another 37 adjacent native
+route, multipart, raw-body and existing application snapshot tests pass (482
+deselected).
+
+One initial combined run exposed an observer counting a revived callback from
+an unrelated earlier test. The observer now selects its fixture application's
+records, and the combined rerun passes. Existing mocked-worker unawaited-coroutine
+warnings and an unrelated Langfuse fixture's export retries remain visible;
+no real telemetry destination or complete native suite is claimed. Repository
+conftests and network sockets are disabled for unit acceptance. The combined
+selection excludes the previously identified synchronous Transcribe fixture and
+external httpbin tests.
+
+The new account module, its complete mapped tests, native capabilities and mapped
+capability tests pass strict typing. The new relay fixture and function bodies
+also pass isolated strict checking; the entire older relay test module was not
+claimed type-clean. Pure tests for the new account module mirror it under
+`tests/unit/proxy/pass_through_endpoints`; relay regressions extend the existing
+mapped pass-through test file. Changed source and focused tests pass Ruff;
+an exact diagnostic comparison finds no additions in modified legacy files.
+The older logging test module retains its 11 baseline diagnostics. No lint/type
+budget was changed. The native package now requires a Rust/maturin build with its
+workspace and toolchain, which are absent from this checkout/environment; no
+native wheel/image build or production compatibility is claimed. Companion code,
+schema and browser code did not change, and their suites were not rerun here.
+
+A separate authorized read-only proof sends two actual GitHub GETs, /user and
+/rate_limit, through the native relay and asynchronous spend callback. The first
+observes the token owner's identity; the second captures quota resources with the
+owner-based account identifier. Both retain application/account/origin metadata
+and explicitly unverified provider cost. The existing CLI token remains only in
+memory; the private report contains minimal identity, quota and request metadata.
+Gateway authentication is a development fixture, not native database-backed key
+authentication. No provider token, private inventory identity or report is
+committed. This is not central enrollment, invoice reconciliation or deployment.
+
+Production native/companion services, credentials, routes and applications are
+unchanged. Production artifact compatibility, account-by-account enrollment,
+non-LLM application grants, provider-specific usage/billing reconciliation and
+actual LAN/Tailscale activation remain open under the full project goal.

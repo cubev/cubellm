@@ -96,9 +96,19 @@ def test_authenticated_application_binding_is_stamped_and_retained_without_other
             "opaque_vendor_value": "private-key-metadata-canary",
         },
     )
-    request: Final = {"metadata": {"user_api_key_application_id": "forged-by-client"}}
+    request: Final = {
+        "metadata": {
+            "user_api_key_application_id": "forged-by-client",
+            "provider_account_id": "forged-account",
+            "provider_cost_status": "verified",
+            "_cube_account_binding": {"account_id": "forged-account"},
+        }
+    }
     result: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(request, auth, "metadata")
     assert result["metadata"]["user_api_key_application_id"] == expected
+    assert result["metadata"]["provider_account_id"] is None
+    assert result["metadata"]["provider_cost_status"] is None
+    assert result["metadata"]["_cube_account_binding"] is None
     standard: Final = StandardLoggingPayloadSetup.get_standard_logging_metadata(result["metadata"])
     stored: Final = _get_spend_logs_metadata(dict(standard), user_api_key_auth=auth)
     assert stored.get("user_api_key_application_id") == expected
@@ -5480,6 +5490,40 @@ def test_stored_success_request_excludes_credentials_even_when_body_logging_is_e
         )
     assert json.loads(payload) == {"model": "fixture-model", "messages": original["messages"]}
     assert original["api_key"] == marker
+
+
+@pytest.mark.parametrize("trusted", (False, True))
+def test_provider_account_binding_requires_a_server_object_at_spend_writer(trusted: bool) -> None:
+    from litellm.proxy.pass_through_endpoints.account_credentials import AccountRouteBinding
+
+    binding: Final = AccountRouteBinding(
+        account_id="selected-account", credential_name="fixture-credential", origin="https://selected.example"
+    )
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "fixture-model",
+            "litellm_params": {
+                "metadata": {
+                    "provider_origin": "https://forged.example",
+                    "provider_account_id": "forged-account",
+                    "provider_account_source": "configured_credential",
+                    "provider_cost_status": "verified",
+                    "_cube_account_binding": binding if trusted else {"account_id": "selected-account"},
+                }
+            },
+        },
+        response_obj=litellm.ModelResponse(id="fixture-call", choices=[], usage=litellm.Usage()),
+        start_time=now,
+        end_time=now,
+    )
+    metadata: Final = json.loads(payload["metadata"])
+    assert metadata["provider_origin"] == ("https://selected.example" if trusted else None)
+    assert metadata["provider_account_id"] == ("selected-account" if trusted else None)
+    assert metadata["provider_account_source"] == ("configured_credential" if trusted else None)
+    assert metadata["provider_cost_status"] == ("unverified" if trusted else None)
+    assert "_cube_account_binding" not in metadata
+    assert "fixture-credential" not in payload["metadata"]
 
 
 def test_stored_provider_errors_never_echo_credentials_with_either_prompt_policy() -> None:

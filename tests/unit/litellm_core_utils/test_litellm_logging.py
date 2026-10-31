@@ -3045,6 +3045,19 @@ def test_sentry_send_default_pii_opt_in(monkeypatch):
     assert not {name.lower() for name in SENTRY_PII_DENYLIST} & {name.lower() for name in call_args["event_scrubber"].denylist}
 
 
+@pytest.mark.parametrize(
+    "value", ("inert-opaque-canary", {"nested": "inert-opaque-canary"}, ["inert-opaque-canary"], 912345678)
+)
+def test_get_masked_values_masks_every_credential_value_with_zero_visible_characters(value: object) -> None:
+    from litellm.litellm_core_utils.litellm_logging import _get_masked_values
+
+    original: Final = {"opaque_vendor_field": value}
+    masked: Final = _get_masked_values(original, mask_all_values=True, unmasked_length=0)
+    assert "inert-opaque-canary" not in json.dumps(masked)
+    assert "912345678" not in json.dumps(masked)
+    assert original["opaque_vendor_field"] == value
+
+
 def test_get_masked_values():
     from litellm.litellm_core_utils.litellm_logging import _get_masked_values
 

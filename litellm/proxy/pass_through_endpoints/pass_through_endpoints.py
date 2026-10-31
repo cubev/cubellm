@@ -53,6 +53,7 @@ from litellm.litellm_core_utils.core_helpers import (
     get_metadata_variable_name_from_kwargs,
     get_or_create_metadata_bucket,
 )
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import validate_no_callback_env_reference
 from litellm.litellm_core_utils.internal_call_metadata import MODEL_ACCESS_GROUP_METADATA_KEY
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -118,6 +119,13 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 )
 from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, Usage
 
+from .account_credentials import (
+    AccountHeaderCredential,
+    AccountRouteBinding,
+    resolve_account_credential,
+    validate_account_request,
+    validate_account_route,
+)
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
@@ -438,6 +446,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         requested_query_params: dict | None = None,
         _parsed_body: dict | None = None,
         forward_multipart: bool = False,
+        follow_redirects: bool | None = None,
+        isolate_client: bool = False,
     ) -> httpx.Response:
         """
         Handle non-SSE HTTP requests
@@ -449,14 +459,20 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         logging/guardrails) or relay it to the client without materializing it in memory
         (LIT-4009: large batch results files must not be buffered in proxy RSS).
         """
+        build_request: Final = httpx.Request if isolate_client else async_client.build_request
         if request.method == "GET":
-            get_request: Final = async_client.build_request(
+            get_request: Final = build_request(
                 request.method,
                 url,
                 headers=headers,
                 params=requested_query_params,
             )
-            return await async_client.send(get_request, stream=True)
+            return await async_client.send(
+                get_request,
+                stream=True,
+                **({"auth": None} if isolate_client else {}),
+                **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
+            )
         if HttpPassThroughEndpointHelpers.is_multipart(request) is True and forward_multipart:
             # Forward multipart via make_multipart_http_request even when _parsed_body is
             # non-empty (pass_through_request always injects litellm_logging_obj, etc.).
@@ -468,15 +484,22 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 url=url,
                 headers=headers,
                 requested_query_params=requested_query_params,
+                **({"isolate_client": True} if isolate_client else {}),
+                **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
             )
-        generic_request: Final = async_client.build_request(
+        generic_request: Final = build_request(
             request.method,
             url,
             headers=headers,
             params=requested_query_params,
             json=_parsed_body,
         )
-        return await async_client.send(generic_request, stream=True)
+        return await async_client.send(
+            generic_request,
+            stream=True,
+            **({"auth": None} if isolate_client else {}),
+            **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
+        )
 
     @staticmethod
     def is_multipart(request: Request) -> bool:
@@ -499,6 +522,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: dict | None = None,
         stream: bool = False,
+        follow_redirects: bool | None = None,
+        isolate_client: bool = False,
     ) -> httpx.Response:
         """Process multipart/form-data requests, handling both files and form fields.
 
@@ -551,8 +576,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers_copy.pop("content-type", None)
 
         # httpx.AsyncClient.request() does not accept stream=; use send() for streaming.
-        if stream:
-            req: Final = async_client.build_request(
+        if stream or isolate_client:
+            build_request: Final = httpx.Request if isolate_client else async_client.build_request
+            req: Final = build_request(
                 request.method,
                 url,
                 headers=headers_copy,
@@ -560,7 +586,12 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 files=multipart_files,
                 data=multipart_data,
             )
-            return await async_client.send(req, stream=True)
+            return await async_client.send(
+                req,
+                stream=stream,
+                **({"auth": None} if isolate_client else {}),
+                **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
+            )
 
         return await async_client.request(
             method=request.method,
@@ -569,6 +600,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             params=requested_query_params,
             files=multipart_files,
             data=multipart_data,
+            **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
         )
 
     @staticmethod
@@ -579,6 +611,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         logging_obj: LiteLLMLoggingObj,
         _parsed_body: dict | None = None,
         litellm_call_id: str | None = None,
+        account_binding: AccountRouteBinding | None = None,
     ) -> dict:
         """
         Filter out litellm params from the request body
@@ -644,6 +677,12 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         )
         if isinstance(deployment_model_info, Mapping):
             _metadata["model_info"] = dict(deployment_model_info)
+
+        _metadata["_cube_account_binding"] = account_binding
+        _metadata["provider_origin"] = account_binding.origin if account_binding is not None else None
+        _metadata["provider_account_id"] = account_binding.account_id if account_binding is not None else None
+        _metadata["provider_account_source"] = "configured_credential" if account_binding is not None else None
+        _metadata["provider_cost_status"] = "unverified" if account_binding is not None else None
 
         kwargs: Final = {
             "litellm_params": {
@@ -1039,6 +1078,7 @@ async def pass_through_request(
     custom_llm_provider: str | None = None,
     guardrails_config: dict | None = None,
     timeout: float | None = None,
+    account_binding: AccountRouteBinding | None = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -1091,7 +1131,13 @@ async def pass_through_request(
             headers=headers,
             forward_headers=forward_headers,
         )
-        upstream_headers: Final = _with_trace_context(headers, parent_span=user_api_key_dict.parent_otel_span)
+        outbound_headers: Final = httpx.Headers(headers)
+        if account_binding is not None and "user-agent" not in outbound_headers:
+            outbound_headers["User-Agent"] = "CubeLLM-account-gateway"
+        upstream_headers: Final = _with_trace_context(
+            dict(outbound_headers) if account_binding is not None else headers,
+            parent_span=user_api_key_dict.parent_otel_span,
+        )
 
         requested_query_params: dict | None = query_params or dict(request.query_params) or None
 
@@ -1125,7 +1171,9 @@ async def pass_through_request(
         verbose_proxy_logger.debug(
             "Pass through endpoint sending request to \nURL %s\nheaders: %s\nbody: %s\n",
             url,
-            _get_masked_values(upstream_headers),
+            _get_masked_values(upstream_headers, mask_all_values=True, unmasked_length=0)
+            if account_binding is not None
+            else _get_masked_values(upstream_headers),
             _parsed_body,
         )
 
@@ -1186,9 +1234,10 @@ async def pass_through_request(
         resolved_timeout: Final = resolve_pass_through_request_timeout(timeout)
         async_client_obj: Final = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
-            params={"timeout": resolved_timeout},
+            params={"timeout": resolved_timeout, **({"follow_redirects": False} if account_binding else {})},
         )
         async_client: Final = async_client_obj.client
+        build_request: Final = httpx.Request if account_binding is not None else async_client.build_request
         passthrough_logging_payload: Final = PassthroughStandardLoggingPayload(
             url=str(url),
             request_body=_parsed_body,
@@ -1202,6 +1251,7 @@ async def pass_through_request(
             litellm_call_id=litellm_call_id,
             request=request,
             logging_obj=logging_obj,
+            account_binding=account_binding,
         )
 
         # Store custom_llm_provider in kwargs and logging object if provided
@@ -1386,12 +1436,13 @@ async def pass_through_request(
                     headers=upstream_headers,
                     requested_query_params=requested_query_params,
                     stream=True,
+                    **({"isolate_client": True, "follow_redirects": False} if account_binding else {}),
                 )
             else:
                 # SigV4-signed callers (Bedrock) supply the exact pre-signed bytes;
                 # otherwise httpx encodes the parsed JSON dict as before.
                 req: Final = (
-                    async_client.build_request(
+                    build_request(
                         request.method,
                         url,
                         params=requested_query_params,
@@ -1399,7 +1450,7 @@ async def pass_through_request(
                         content=state_raw_body,
                     )
                     if state_raw_body is not None
-                    else async_client.build_request(
+                    else build_request(
                         request.method,
                         url,
                         params=requested_query_params,
@@ -1408,7 +1459,9 @@ async def pass_through_request(
                     )
                 )
 
-                response = await async_client.send(req, stream=stream)
+                response = await async_client.send(
+                    req, stream=stream, **({"follow_redirects": False, "auth": None} if account_binding else {})
+                )
 
             upstream_usage = apply_upstream_reported_usage(
                 logging_obj=logging_obj,
@@ -1478,14 +1531,16 @@ async def pass_through_request(
         if state_raw_body is not None:
             # SigV4-signed callers (Bedrock) require the exact pre-signed bytes
             # to be forwarded so the signature/Content-Length stay valid.
-            raw_body_request: Final = async_client.build_request(
+            raw_body_request: Final = build_request(
                 request.method,
                 url,
                 headers=upstream_headers,
                 params=requested_query_params,
                 content=state_raw_body,
             )
-            response = await async_client.send(raw_body_request, stream=True)
+            response = await async_client.send(
+                raw_body_request, stream=True, **({"follow_redirects": False, "auth": None} if account_binding else {})
+            )
         else:
             response = await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
                 request=request,
@@ -1495,6 +1550,7 @@ async def pass_through_request(
                 requested_query_params=requested_query_params,
                 _parsed_body=_parsed_body,
                 forward_multipart=is_multipart,
+                **({"follow_redirects": False, "isolate_client": True} if account_binding else {}),
             )
         verbose_proxy_logger.debug("response.headers= %s", response.headers)
 
@@ -2093,11 +2149,50 @@ def create_pass_through_route(
             # Ensure custom_headers is a dict. Botocore returns a HeadersDict
             # for SigV4-prepared requests, which is a Mapping but not a dict.
             headers_dict: Final = dict(param_custom_headers) if isinstance(param_custom_headers, Mapping) else {}
+            account_policy_raw: Final = target_params.get("account_credential")
+            account_policy: Final = (
+                AccountHeaderCredential.model_validate(account_policy_raw) if account_policy_raw is not None else None
+            )
+            if account_policy is not None:
+                try:
+                    validate_account_request(account_policy, request.headers, tuple(request.query_params.keys()))
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
+            try:
+                if account_policy is not None:
+                    validate_account_route(
+                        full_target,
+                        True,
+                        cast(bool | None, param_forward_headers),
+                        headers_dict,
+                        cast(Mapping[str, object] | None, param_default_query_params),
+                        account_policy,
+                        (request.method,),
+                    )
+                resolved_account: Final = (
+                    resolve_account_credential(
+                        account_policy, CredentialAccessor.find_credential(account_policy.credential_name), full_target
+                    )
+                    if account_policy is not None
+                    else None
+                )
+            except ValueError:
+                raise HTTPException(
+                    status_code=503, detail="Account route credential or request policy is unavailable"
+                ) from None
+            outbound_headers: Final = (
+                {**headers_dict, **resolved_account.headers} if resolved_account is not None else headers_dict
+            )
 
             # Ensure query_params and custom_body are dicts or None
             final_query_params: Final = query_params_data if isinstance(query_params_data, dict) else {}
             if query_params:
                 final_query_params.update(query_params)
+            if account_policy is not None:
+                try:
+                    validate_account_request(account_policy, {}, tuple(final_query_params.keys()))
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
             # Programmatic callers set LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY on
             # request.state (see Bedrock proxy). Parsed JSON envelope otherwise.
             state_custom_body: Final[dict | None] = getattr(
@@ -2118,7 +2213,7 @@ def create_pass_through_route(
                     return await pass_through_request(
                         request=request,
                         target=full_target,
-                        custom_headers=headers_dict,
+                        custom_headers=outbound_headers,
                         user_api_key_dict=user_api_key_dict,
                         forward_headers=cast(bool | None, param_forward_headers),
                         merge_query_params=cast(bool | None, param_merge_query_params),
@@ -2130,6 +2225,7 @@ def create_pass_through_route(
                         custom_llm_provider=custom_llm_provider,
                         guardrails_config=cast(dict | None, param_guardrails),
                         timeout=cast(float | None, param_timeout),
+                        **({"account_binding": resolved_account.binding} if resolved_account is not None else {}),
                     )
                 finally:
                     if hasattr(request.state, LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY):
@@ -2961,8 +3057,13 @@ class InitPassThroughEndpointHelpers:
         config_file_path: str | None = None,
         auth: bool = False,
         timeout: float | None = None,
+        account_credential: AccountHeaderCredential | None = None,
     ):
         """Add exact path route for pass-through endpoint"""
+        if account_credential is not None:
+            validate_account_route(
+                target, auth, forward_headers, custom_headers or {}, default_query_params, account_credential, methods
+            )
         # Default to all methods if none specified (backward compatibility)
         if methods is None or len(methods) == 0:
             methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -3024,6 +3125,7 @@ class InitPassThroughEndpointHelpers:
                 "cost_per_request": cost_per_request,
                 "guardrails": guardrails,
                 "timeout": timeout,
+                **({"account_credential": account_credential} if account_credential is not None else {}),
             },
         }
 
@@ -3044,8 +3146,13 @@ class InitPassThroughEndpointHelpers:
         config_file_path: str | None = None,
         auth: bool = False,
         timeout: float | None = None,
+        account_credential: AccountHeaderCredential | None = None,
     ):
         """Add wildcard route for sub-paths"""
+        if account_credential is not None:
+            validate_account_route(
+                target, auth, forward_headers, custom_headers or {}, default_query_params, account_credential, methods
+            )
         # Default to all methods if none specified (backward compatibility)
         if methods is None or len(methods) == 0:
             methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -3108,6 +3215,7 @@ class InitPassThroughEndpointHelpers:
                 "cost_per_request": cost_per_request,
                 "guardrails": guardrails,
                 "timeout": timeout,
+                **({"account_credential": account_credential} if account_credential is not None else {}),
             },
         }
 
@@ -3300,6 +3408,11 @@ async def _register_pass_through_endpoint(
         config_file_path=config_file_path,
         auth=auth_enforced,
         timeout=timeout,
+        **(
+            {"account_credential": AccountHeaderCredential.model_validate(endpoint_data["account_credential"])}
+            if endpoint_data.get("account_credential") is not None
+            else {}
+        ),
     )
 
     methods_for_key: Final = methods if methods else ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -3327,6 +3440,11 @@ async def _register_pass_through_endpoint(
             config_file_path=config_file_path,
             auth=auth_enforced,
             timeout=timeout,
+            **(
+                {"account_credential": AccountHeaderCredential.model_validate(endpoint_data["account_credential"])}
+                if endpoint_data.get("account_credential") is not None
+                else {}
+            ),
         )
         visited_endpoints.add(f"{endpoint_id}:subpath:{path}:{methods_str}")
 
@@ -3712,6 +3830,11 @@ async def update_pass_through_endpoints(
             default_query_params=updated_endpoint.default_query_params,
             auth=updated_endpoint.auth,
             timeout=updated_endpoint.timeout,
+            **(
+                {"account_credential": updated_endpoint.account_credential}
+                if updated_endpoint.account_credential is not None
+                else {}
+            ),
         )
     else:
         InitPassThroughEndpointHelpers.add_exact_path_route(
@@ -3729,6 +3852,11 @@ async def update_pass_through_endpoints(
             default_query_params=updated_endpoint.default_query_params,
             auth=updated_endpoint.auth,
             timeout=updated_endpoint.timeout,
+            **(
+                {"account_credential": updated_endpoint.account_credential}
+                if updated_endpoint.account_credential is not None
+                else {}
+            ),
         )
 
     return PassThroughEndpointResponse(endpoints=[updated_endpoint] if updated_endpoint else [])
@@ -3804,6 +3932,11 @@ async def create_pass_through_endpoints(
             default_query_params=created_endpoint.default_query_params,
             auth=created_endpoint.auth,
             timeout=created_endpoint.timeout,
+            **(
+                {"account_credential": created_endpoint.account_credential}
+                if created_endpoint.account_credential is not None
+                else {}
+            ),
         )
     else:
         InitPassThroughEndpointHelpers.add_exact_path_route(
@@ -3821,6 +3954,11 @@ async def create_pass_through_endpoints(
             default_query_params=created_endpoint.default_query_params,
             auth=created_endpoint.auth,
             timeout=created_endpoint.timeout,
+            **(
+                {"account_credential": created_endpoint.account_credential}
+                if created_endpoint.account_credential is not None
+                else {}
+            ),
         )
 
     return PassThroughEndpointResponse(endpoints=[created_endpoint])

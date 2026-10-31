@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 import zlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,9 +16,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from fastapi import HTTPException, Request, Response, UploadFile
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import TypeAdapter, ValidationError
+from pydantic import SecretStr, TypeAdapter, ValidationError
 from starlette.datastructures import FormData, Headers, QueryParams
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -27,7 +27,16 @@ from litellm._logging import verbose_proxy_logger
 from litellm.constants import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
-from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.models.credentials import CredentialItem
+from litellm.proxy._types import LiteLLMRoutes, PassThroughGenericEndpoint, ProxyException, UserAPIKeyAuth
+from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.pass_through_endpoints import pass_through_endpoints as relay
+from litellm.proxy.pass_through_endpoints.account_credentials import (
+    AccountHeaderCredential,
+    AccountRouteBinding,
+    CredentialHeader,
+)
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     DEFAULT_PASS_THROUGH_REQUEST_TIMEOUT_SECONDS,
     LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY,
@@ -44,10 +53,16 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     resolve_pass_through_request_timeout,
     websocket_passthrough_request,
 )
+from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+    _register_pass_through_endpoint as register_route,  # pyright: ignore[reportPrivateUsage]  # native registration boundary
+)
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
+from litellm.proxy.spend_tracking.spend_tracking_utils import (
+    _get_spend_logs_metadata as stored_metadata,  # pyright: ignore[reportPrivateUsage, reportUnknownVariableType]
+)
 from litellm.proxy.spend_tracking.spend_tracking_utils import (
     get_logging_payload,  # pyright: ignore[reportUnknownVariableType]  # legacy writer accepts unparameterized dicts
 )
@@ -5212,7 +5227,7 @@ class _FakeUpstreamTransport(httpx.AsyncBaseTransport):
         )
 
 
-def _inject_fake_passthrough_client(transport, timeout):
+def _inject_fake_passthrough_client(transport, timeout, account_bound=False):
     """Dependency-inject a fake upstream via the client cache that
     get_async_httpx_client resolves passthrough clients from (no monkeypatching
     of the HTTP layer). The cache entry is located by calling the production
@@ -5226,7 +5241,10 @@ def _inject_fake_passthrough_client(transport, timeout):
 
     real_handler = get_async_httpx_client(
         httpxSpecialProvider.PassThroughEndpoint,
-        params={"timeout": resolve_pass_through_request_timeout(timeout)},
+        params={
+            "timeout": resolve_pass_through_request_timeout(timeout),
+            **({"follow_redirects": False} if account_bound else {}),
+        },
     )
     cache = litellm.in_memory_llm_clients_cache
     cache_key = next(
@@ -5237,7 +5255,7 @@ def _inject_fake_passthrough_client(transport, timeout):
         "PassThroughEndpoint client not found in in_memory_llm_clients_cache; "
         "get_async_httpx_client may not be caching this provider."
     )
-    fake_client = httpx.AsyncClient(transport=transport)
+    fake_client = httpx.AsyncClient(transport=transport, follow_redirects=account_bound)
     cache.cache_dict[cache_key] = SimpleNamespace(client=fake_client)
 
     def _cleanup():
@@ -5271,6 +5289,55 @@ def _relay_client_request(method="GET"):
     mock_request.headers = Headers({})
     mock_request.query_params = QueryParams({})
     return mock_request
+
+
+@pytest.mark.parametrize("mode", ("get", "json", "raw", "multipart", "stream", "multipart-stream"))
+async def test_account_bound_passthrough_never_replays_provider_credentials_on_redirect(
+    mode: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from litellm.proxy.pass_through_endpoints.account_credentials import AccountRouteBinding
+
+    requests: Final[list[str]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        assert request.url.host == "vendor.example", "Provider credentials followed an upstream redirect"
+        assert request.headers["VendorAccess"] == "inert-provider-secret-canary"
+        assert "authorization" not in request.headers
+        assert "cookie" not in request.headers
+        assert "x-other-account" not in request.headers
+        assert not request.url.query
+        return httpx.Response(307, headers={"location": "https://sink.example/stolen"}, json={})
+
+    fake_client, cleanup = _inject_fake_passthrough_client(httpx.MockTransport(transport), None, account_bound=True)
+    fake_client.auth = httpx.BasicAuth("other-account", "unrelated-secret")
+    fake_client.headers["X-Other-Account"] = "unrelated-secret"
+    fake_client.cookies.set("session", "other-account-session")
+    fake_client.params = httpx.QueryParams({"api_key": "other-account-query-secret"})
+    request: Final = _relay_client_request("GET" if mode == "get" else "POST")
+    if mode == "raw":
+        request.state = SimpleNamespace(**{LITELLM_PASS_THROUGH_RAW_BODY_STATE_KEY: b'{"public":"value"}'})
+    if mode in {"multipart", "multipart-stream"}:
+        request.headers = Headers({"content-type": "multipart/form-data; boundary=fixture"})
+        request.form = AsyncMock(return_value=FormData({"public": "value"}))
+    caplog.set_level(logging.DEBUG, logger="LiteLLM Proxy")
+    try:
+        with ExitStack() as stack:
+            _enter_relay_logging_mocks(stack, {})
+            response: Final = await pass_through_request(
+                request=request,
+                target="https://vendor.example/check",
+                custom_headers={"VendorAccess": "inert-provider-secret-canary"},
+                user_api_key_dict=UserAPIKeyAuth(api_key="inert-app-key"),
+                stream=mode in {"stream", "multipart-stream"},
+                account_binding=AccountRouteBinding(account_id="fixture-account", credential_name="fixture-credential"),
+            )
+        assert response.status_code == 307
+        assert len(requests) == 1
+        assert "inert-provider-secret-canary" not in caplog.text
+    finally:
+        cleanup()
+        await fake_client.aclose()
 
 
 @pytest.mark.asyncio
@@ -7677,3 +7744,213 @@ def test_passthrough_attributes_a_cli_session_to_its_alias_not_the_login_token()
     metadata = kwargs["litellm_params"]["metadata"]
     assert metadata["user_api_key"] == "cli-session-alice"
     assert _get_spend_logs_metadata(metadata)["user_api_key"] == "cli-session-alice"
+
+
+POLICY: Final = AccountHeaderCredential(
+    account_id="fixture-account",
+    credential_name="fixture credential",
+    headers=(CredentialHeader(name="X-Vendor-Credential", field="access value", prefix="Bearer "),),
+    allowed_query_parameters=("page",),
+)
+
+
+def credential(
+    value: str | SecretStr = "inert-provider-canary",
+    account_id: str = "fixture-account",
+    origin: str = "https://vendor.example",
+) -> CredentialItem:
+    return CredentialItem(
+        credential_name=POLICY.credential_name,
+        credential_values={"access value": value},
+        credential_info={"cube_account_id": account_id, "cube_allowed_origins": [origin]},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Relayed:
+    target: str
+    secret: str
+    binding: AccountRouteBinding
+
+
+@dataclass(frozen=True, slots=True)
+class ClientFixture:
+    client: httpx.AsyncClient
+
+
+class SpendObserver(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]  # legacy callback constructor
+        self.records: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+
+    async def async_log_success_event(
+        self,
+        kwargs: dict[str, object],
+        response_obj: object,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> None:
+        payload: Final = get_logging_payload(
+            kwargs=kwargs, response_obj=response_obj, start_time=start_time, end_time=end_time
+        )
+        metadata: Final = TypeAdapter(dict[str, object]).validate_json(payload["metadata"])
+        if metadata.get("user_api_key_application_id") == "fixture-app":
+            self.records.put_nowait(metadata)
+
+
+@pytest.fixture
+def isolated_routes(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    original: Final = tuple(LiteLLMRoutes.openai_routes.value)
+    monkeypatch.setattr(relay, "_registered_pass_through_routes", {})
+    try:
+        yield
+    finally:
+        LiteLLMRoutes.openai_routes.value[:] = original
+
+
+@pytest.mark.usefixtures("isolated_routes")
+async def test_registered_routes_capture_the_selected_native_credential_and_follow_rotations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app: Final = FastAPI()
+    seen: Final[list[Relayed]] = []
+
+    async def auth() -> UserAPIKeyAuth:
+        return UserAPIKeyAuth(api_key="inert-app-key", metadata={"cube_application_id": "fixture-app"})
+
+    async def upstream(
+        request: Request,
+        target: str,
+        custom_headers: Mapping[str, str],
+        user_api_key_dict: UserAPIKeyAuth,
+        account_binding: AccountRouteBinding,
+        **kwargs: object,
+    ) -> Response:
+        seen.append(Relayed(target, custom_headers["X-Vendor-Credential"], account_binding))
+        stored: Final = stored_metadata({}, account_binding=account_binding)
+        assert "provider_account_id" in stored
+        assert "provider_account_source" in stored
+        assert "provider_cost_status" in stored
+        assert stored["provider_account_id"] == account_binding.account_id
+        assert stored["provider_account_source"] == "configured_credential"
+        assert stored["provider_cost_status"] == "unverified"
+        return Response(content="{}", media_type="application/json")
+
+    app.dependency_overrides[user_api_key_auth] = auth
+    monkeypatch.setattr(relay, "pass_through_request", upstream)
+    monkeypatch.setattr(litellm, "credential_list", [credential()])
+    endpoint: Final = PassThroughGenericEndpoint(
+        id="fixture-route",
+        path="/account-fixture",
+        target="https://vendor.example/check",
+        account_credential=POLICY,
+        methods=["GET"],
+    )
+    await register_route(endpoint, app, False, set())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+        first: Final = await client.get("/account-fixture?page=1")
+        assert first.status_code == 200
+        monkeypatch.setattr(litellm, "credential_list", [credential("rotated-provider-canary")])
+        second: Final = await client.get("/account-fixture?page=2")
+        assert second.status_code == 200
+        monkeypatch.setattr(litellm, "credential_list", [credential(account_id="wrong-account")])
+        wrong: Final = await client.get("/account-fixture")
+        assert wrong.status_code == 503
+        assert "wrong-account" not in wrong.text
+        override: Final = await client.get("/account-fixture", headers={"x-pass-vendor-account": "forged"})
+        assert override.status_code == 400
+        unknown_query: Final = await client.get("/account-fixture?api_key=forged")
+        assert unknown_query.status_code == 400
+        monkeypatch.setattr(litellm, "credential_list", [credential("rotated-provider-canary")])
+        envelope_query: Final = await client.request(
+            "GET", "/account-fixture", json={"query_params": {"api_key": "forged"}}
+        )
+        assert envelope_query.status_code == 400
+        changed_policy: Final = AccountHeaderCredential.model_validate(
+            POLICY.model_dump() | {"account_id": "second-account"}
+        )
+        changed_endpoint: Final = PassThroughGenericEndpoint(
+            id="fixture-route",
+            path="/account-fixture",
+            target="https://second-vendor.example/check",
+            account_credential=changed_policy,
+            methods=["GET"],
+        )
+        monkeypatch.setattr(
+            litellm,
+            "credential_list",
+            [credential("second-account-canary", "second-account", "https://second-vendor.example")],
+        )
+        await register_route(changed_endpoint, app, False, set())
+        retargeted: Final = await client.get("/account-fixture")
+        assert retargeted.status_code == 200
+    assert len(seen) == 3
+    assert seen[0].secret == "Bearer inert-provider-canary"
+    assert seen[1].secret == "Bearer rotated-provider-canary"
+    assert seen[0].binding == seen[1].binding
+    assert seen[2].binding.account_id == "second-account"
+    assert seen[2].target == "https://second-vendor.example/check"
+    assert seen[2].secret == "Bearer second-account-canary"
+    assert seen[0].binding.account_id == "fixture-account"
+
+
+@pytest.mark.usefixtures("isolated_routes")
+async def test_native_relay_and_async_spend_callback_retain_both_identities(monkeypatch: pytest.MonkeyPatch) -> None:
+    app: Final = FastAPI()
+    observer: Final = SpendObserver()
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "success_callback", [])
+    monkeypatch.setattr(litellm, "_async_success_callback", [observer])
+    monkeypatch.setattr(litellm, "credential_list", [credential()])
+
+    async def auth() -> UserAPIKeyAuth:
+        return UserAPIKeyAuth(api_key="inert-app-key", metadata={"cube_application_id": "fixture-app"})
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Vendor-Credential"] == "Bearer inert-provider-canary"
+        assert request.url.params["page"] == "first"
+        assert set(request.url.params) == {"page"}
+        assert "cookie" not in request.headers
+        assert "authorization" not in request.headers
+        assert "x-other-account" not in request.headers
+        return httpx.Response(200, json={"remaining": 7})
+
+    app.dependency_overrides[user_api_key_auth] = auth
+    endpoint: Final = PassThroughGenericEndpoint(
+        id="fixture-wire-route",
+        path="/account-wire-fixture",
+        target="https://vendor.example/quota",
+        account_credential=POLICY,
+        methods=["GET"],
+        default_query_params={"page": "first"},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream),
+        follow_redirects=True,
+        auth=("other-account", "other-secret"),
+        headers={"X-Other-Account": "unrelated-secret"},
+        cookies={"session": "other-account-session"},
+        params={"api_key": "other-account-query-secret"},
+    ) as outbound:
+
+        def client_factory(llm_provider: object = None, params: Mapping[str, object] | None = None) -> ClientFixture:
+            assert params is not None and params["follow_redirects"] is False
+            return ClientFixture(outbound)
+
+        monkeypatch.setattr(relay, "get_async_httpx_client", client_factory)
+        await register_route(endpoint, app, False, set())
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+                response: Final = await client.get("/account-wire-fixture")
+            assert response.status_code == 200
+            await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+            assert observer.records.qsize() == 1
+            stored: Final = observer.records.get_nowait()
+            assert stored["provider_origin"] == "https://vendor.example"
+            assert stored["provider_account_id"] == "fixture-account"
+            assert stored["user_api_key_application_id"] == "fixture-app"
+            assert stored["provider_account_source"] == "configured_credential"
+            assert stored["provider_cost_status"] == "unverified"
+            assert "_cube_account_binding" not in stored
+        finally:
+            await GLOBAL_LOGGING_WORKER.stop()

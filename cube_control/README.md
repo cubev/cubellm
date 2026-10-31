@@ -579,8 +579,68 @@ option from one caller cannot persist into a subsequent request
 
 Native capabilities expose `passthrough_application_identity` and
 `passthrough_header_isolation` for controllers that need these installed
-contracts. Provider-account attribution still requires a verified route and
-credential binding. Query-based credentials, signatures, application route
-grants, per-provider usage/cost parsing and actual account enrollment require
+contracts. The named account binding below adds request-time credential and origin
+attribution; live account ownership still requires provider verification.
+Query-based credentials, signatures, application route grants, per-provider usage/cost parsing and actual account enrollment require
 their own implementation and acceptance. The generic gateway's configured
 per-request price must not be treated as an authoritative provider bill
+
+
+## Named account credentials for HTTP routes
+
+A generic HTTP route can select an existing native named credential without
+putting its value in the route or handing the provider secret to applications.
+The credential's nonsecret `credential_info` must contain both `cube_account_id`
+and `cube_allowed_origins`, for example:
+
+```json
+{"cube_account_id":"example-account","cube_allowed_origins":["https://api.example.com"]}
+```
+
+Keep the provider value in the native `credential_values` or its supported
+`os.environ/...` reference. Register the route using the native pass-through
+configuration/management endpoint with an explicit method list:
+
+```json
+{
+  "path": "/example-account/quota",
+  "target": "https://api.example.com/quota",
+  "auth": true,
+  "methods": ["GET"],
+  "account_credential": {
+    "account_id": "example-account",
+    "credential_name": "example stored credential",
+    "headers": [{"name":"Authorization","field":"api_key","prefix":"Bearer "}]
+  }
+}
+```
+
+The route and credential account IDs must match. The target authority must be
+in the credential's allowed origins; default ports are normalized. HTTPS is
+required except on literal loopback addresses. No user information, target query
+or fragment, unrestricted header forwarding, routing/framing header overrides,
+client `x-pass-*` overrides or implicit method list is accepted. Query parameters
+are denied unless individually listed in `allowed_query_parameters`; common
+query credential names are refused even in that list. The final merged query is
+checked too, including the native JSON request envelope's `query_params`.
+
+Each request resolves the current credential once and captures its account and
+origin. Changes affect subsequent requests. The bound HTTP request does not
+inherit pooled client authentication, cookies, default headers or parameters and
+does not follow redirects. Native credential read endpoints mask all value fields,
+including arbitrary vendor field names; bound debug headers expose no characters.
+
+Stored native spend metadata contains `provider_account_id`, `provider_origin`,
+`provider_account_source: configured_credential` and `provider_cost_status: unverified`.
+The writer derives these from the server-held request snapshot and rejects client
+imitations. It keeps the authenticated application identity independently. The
+credential name and binding object are not stored. This proves configured
+credential selection, not provider ownership or invoice accuracy. Controllers can
+check `passthrough_account_binding: configured_credential_v1` and
+`credential_values_full_masking` in the native capability response.
+
+Actual account enrollment, application route grants, provider-specific usage and
+billing reconciliation, signed/query/OAuth credentials, mTLS and WebSocket account
+binding remain open. Native JSON envelope/body handling still applies; arbitrary
+API payload compatibility needs protocol tests. No production routes or LAN/Tailscale
+access are activated by this source change.
