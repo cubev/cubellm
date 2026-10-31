@@ -3,7 +3,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Final
 
@@ -12,6 +14,7 @@ from pydantic import SecretStr, TypeAdapter, ValidationError
 
 from cube_control.application_access import (
     ApplicationAccessSpec,
+    deliver_application_access,
     prepare_application_access,
     provision_application_access,
 )
@@ -347,3 +350,253 @@ class ApplicationAccessTests(unittest.TestCase):
             self.assertIn('"status":"prepared"', result.stdout)
             raw: Final = TypeAdapter(dict[str, object]).validate_json((directory / "state.json").read_bytes())
             self.assertNotIn(str(raw["token"]), result.stdout + result.stderr)
+
+    def test_delivery_verifies_scope_and_writes_only_the_app_credential_privately(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            destination: Final = Path(root) / "consumer"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            result: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(result.status, "delivered")
+            assert gateway.key is not None
+            content: Final = (destination / "api-key").read_text()
+            self.assertEqual(content, str(gateway.key["key"]) + "\n")
+            self.assertNotIn("inert-master", content)
+            self.assertNotIn(str(gateway.key["key"]), result.model_dump_json())
+            self.assertEqual(os.stat(destination).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(destination / "api-key").st_mode & 0o777, 0o600)
+            inode: Final = os.stat(destination / "api-key").st_ino
+            again: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(again.status, "delivered")
+            self.assertEqual(os.stat(destination / "api-key").st_ino, inode)
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate"])
+
+    def test_delivery_never_provisions_missing_users_or_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            destination: Final = Path(root) / "consumer"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            before: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(before.status, "error")
+            self.assertEqual(gateway.posts, [])
+            self.assertFalse(destination.exists())
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            gateway.key = None
+            after: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(after.status, "error")
+            self.assertFalse(destination.exists())
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate"])
+
+    def test_delivery_rejects_later_scope_changes_and_never_exposes_the_token(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            destination: Final = Path(root) / "consumer"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            assert gateway.key is not None
+            gateway.key["allowed_routes"] = ["/key/generate"]
+            result: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(result.status, "error")
+            self.assertFalse(destination.exists())
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate"])
+
+    def test_delivery_does_not_replace_existing_credentials_or_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            destination: Final = Path(root) / "consumer"
+            destination.mkdir(mode=0o700)
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            credential: Final = destination / "api-key"
+            credential.write_text("existing-unrelated-credential\n")
+            credential.chmod(0o600)
+            result: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(result.status, "error")
+            self.assertEqual(credential.read_text(), "existing-unrelated-credential\n")
+            credential.unlink()
+            outside: Final = Path(root) / "outside"
+            credential.symlink_to(outside)
+            symlink_result: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(symlink_result.status, "error")
+            self.assertTrue(credential.is_symlink())
+            self.assertFalse(outside.exists())
+
+    def test_delivery_rejects_a_public_destination_and_busy_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            destination: Final = Path(root) / "consumer"
+            destination.mkdir(mode=0o755)
+            destination.chmod(0o755)
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            public: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(public.status, "error")
+            self.assertFalse((destination / "api-key").exists())
+            destination.chmod(0o700)
+            lock_path: Final = destination / ".lock"
+            lock_path.touch(mode=0o600)
+            with lock_path.open("r+") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                busy: Final = deliver_application_access(
+                    directory,
+                    destination,
+                    SecretStr("inert-master"),
+                    httpx.MockTransport(gateway),
+                )
+            self.assertEqual(busy.status, "error")
+            self.assertFalse((destination / "api-key").exists())
+
+    def test_delivery_never_exports_after_a_failed_gateway_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            destination: Final = Path(root) / "consumer"
+            prepare_application_access(SPEC, directory)
+
+            def unavailable(request: httpx.Request) -> httpx.Response:
+                raise httpx.ReadTimeout("inert-secret-in-upstream-diagnostic", request=request)
+
+            result: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(unavailable),
+            )
+            self.assertEqual(result.status, "uncertain")
+            self.assertNotIn("inert-secret-in-upstream-diagnostic", result.model_dump_json())
+            self.assertFalse(destination.exists())
+
+    def test_delivery_rejects_a_matching_credential_file_with_public_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            destination: Final = Path(root) / "consumer"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            delivered: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(delivered.status, "delivered")
+            credential: Final = destination / "api-key"
+            credential.chmod(0o644)
+            rejected: Final = deliver_application_access(
+                directory,
+                destination,
+                SecretStr("inert-master"),
+                httpx.MockTransport(gateway),
+            )
+            self.assertEqual(rejected.status, "error")
+            self.assertEqual(os.stat(credential).st_mode & 0o777, 0o644)
+
+    def test_delivery_cli_uses_read_only_gateway_checks_and_never_prints_secrets(self) -> None:
+        gateway: Final = GatewayFixture()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.headers.get("Authorization") != "Bearer inert-master":
+                    self.send_error(403)
+                    return
+                response: Final = gateway(httpx.Request("GET", "http://localhost" + self.path))
+                self.send_response(response.status_code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response.content)))
+                self.end_headers()
+                self.wfile.write(response.content)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as root, ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread: Final = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                directory: Final = Path(root) / "application"
+                destination: Final = Path(root) / "consumer"
+                spec: Final = ApplicationAccessSpec.model_validate(
+                    SPEC.model_dump()
+                    | {
+                        "gateway_origin": f"http://127.0.0.1:{server.server_port}",
+                    }
+                )
+                prepare_application_access(spec, directory)
+                provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+                admin: Final = Path(root) / "admin.env"
+                admin.write_text("LITELLM_MASTER_KEY=inert-master\n")
+                admin.chmod(0o600)
+                result: Final = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "cube_control",
+                        "deliver-application",
+                        "--state-directory",
+                        str(directory),
+                        "--destination-directory",
+                        str(destination),
+                        "--config",
+                        str(admin),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=20,
+                    env={name: value for name, value in os.environ.items() if name != "CUBE_CONTROL_DATABASE_URL"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('"status":"delivered"', result.stdout)
+                assert gateway.key is not None
+                self.assertNotIn(str(gateway.key["key"]), result.stdout + result.stderr)
+                self.assertNotIn("inert-master", result.stdout + result.stderr)
+                self.assertEqual((destination / "api-key").read_text(), str(gateway.key["key"]) + "\n")
+                self.assertEqual(gateway.posts, ["/user/new", "/key/generate"])
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)

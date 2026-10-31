@@ -176,3 +176,28 @@ non-LLM grants are not claimed complete. The current deployed gateway lacks the
 new capability endpoint and writer. An attempted conceptual Opus consultation
 was rejected by automatic approval review before execution; no external review
 is claimed for this controller
+
+
+## Local credential delivery acceptance
+
+The delivery command reuses the native scope inspection with creation disabled.
+It writes only a verified scoped application key to a separate private file;
+publication cannot replace another credential. Eight new behavior tests cover
+private/idempotent handoff, missing users/keys without POSTs, later permission
+changes, symlink/conflicting file refusal, public or locked destinations, matching
+but unprotected files, and gateway timeout diagnostics. One of these tests runs
+the actual CLI against a local HTTP fixture with administrative authentication
+and checks the resulting private file and secret-free output
+
+This is not a remote application rollout or provider-account verification.
+Rotation and revocation remain open. The inspected native /key/block implementation
+updates the row before cache invalidation; a revoked database row alone would not
+prove that every cached credential was invalidated. Revocation acceptance must
+cover this failure window rather than infer effective denial from readback alone
+
+The full companion suite passes 131 tests on isolated PostgreSQL, including the
+local HTTP CLI test. The application controller's statement coverage remains
+95%. Changed controller, CLI and mapped tests pass strict type checking and
+Ruff; wheel and source distributions build. No native source changed in this
+step, and the existing native subset was not rerun. No production service,
+application, gateway key or provider account was changed

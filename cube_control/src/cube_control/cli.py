@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from cube_control.api import create_app
 from cube_control.application_access import (
     ApplicationAccessSpec,
+    deliver_application_access,
     prepare_application_access,
     provision_application_access,
 )
@@ -43,6 +44,7 @@ class CommandArguments(argparse.Namespace):
     port: int
     account_name: str
     state_directory: Path
+    destination_directory: Path
 
 
 def main() -> int:
@@ -57,6 +59,10 @@ def main() -> int:
     provision_access_parser: Final = sub.add_parser("provision-application")
     provision_access_parser.add_argument("--state-directory", required=True, type=Path)
     provision_access_parser.add_argument("--config", required=True, type=Path)
+    deliver_access_parser: Final = sub.add_parser("deliver-application")
+    deliver_access_parser.add_argument("--state-directory", required=True, type=Path)
+    deliver_access_parser.add_argument("--destination-directory", required=True, type=Path)
+    deliver_access_parser.add_argument("--config", required=True, type=Path)
     manage_parser: Final = sub.add_parser("manage")
     manage_parser.add_argument("path", nargs="?", default="-")
     manage_parser.add_argument("--actor", default=getpass.getuser())
@@ -99,11 +105,19 @@ def main() -> int:
         application_prepared: Final = prepare_application_access(application_spec, args.state_directory)
         print(application_prepared.model_dump_json())
         return 0 if application_prepared.status == "prepared" else 1
-    if args.command == "provision-application":
+    if args.command in ("provision-application", "deliver-application"):
         master_key: Final = read_private_key(args.config, "LITELLM_MASTER_KEY", "Gateway")
         if isinstance(master_key, Unavailable):
             print(master_key.message, file=sys.stderr)
             return 2
+        if args.command == "deliver-application":
+            application_delivered: Final = deliver_application_access(
+                args.state_directory,
+                args.destination_directory,
+                master_key,
+            )
+            print(application_delivered.model_dump_json())
+            return 0 if application_delivered.status == "delivered" else 1
         application_provisioned: Final = provision_application_access(args.state_directory, master_key)
         print(application_provisioned.model_dump_json())
         return 0 if application_provisioned.status == "provisioned" else 1

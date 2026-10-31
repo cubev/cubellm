@@ -82,7 +82,7 @@ class ApplicationAccessState(FrozenModel):
 
 class ApplicationAccessResult(FrozenModel):
     application_id: str
-    status: Literal["prepared", "provisioned", "uncertain", "error"]
+    status: Literal["prepared", "provisioned", "delivered", "uncertain", "error"]
     message: str
 
 
@@ -285,7 +285,12 @@ def _matches_key(state: ApplicationAccessState, raw: bytes) -> bool:
     )
 
 
-def _provision(client: httpx.Client, descriptor: int, state: ApplicationAccessState) -> ApplicationAccessResult:
+def _provision(
+    client: httpx.Client,
+    descriptor: int,
+    state: ApplicationAccessState,
+    allow_creation: bool = True,
+) -> ApplicationAccessResult:
     def result(status: Literal["provisioned", "uncertain", "error"], message: str) -> ApplicationAccessResult:
         return ApplicationAccessResult(application_id=state.spec.application_id, status=status, message=message)
 
@@ -314,6 +319,8 @@ def _provision(client: httpx.Client, descriptor: int, state: ApplicationAccessSt
         return result("error", "Application models allow client credential overrides")
     user_code, user_raw = _request(client, "GET", "/user/info", params={"user_id": state.spec.user_id})
     if user_code == 404:
+        if not allow_creation:
+            return result("error", "Application principal is missing; delivery cannot create it")
         if state.user_attempted:
             return result("uncertain", "Previous user creation requires reconciliation; no mutation repeated")
         attempted_user: Final = state.model_copy(update={"user_attempted": True})
@@ -351,6 +358,8 @@ def _provision(client: httpx.Client, descriptor: int, state: ApplicationAccessSt
         )
     if key_code != 404:
         return result("error", "Application key cannot be inspected")
+    if not allow_creation:
+        return result("error", "Application key is missing; delivery cannot create it")
     if state.key_attempted:
         return result("uncertain", "Previous key creation requires reconciliation; no mutation repeated")
     attempted_key: Final = state.model_copy(update={"key_attempted": True})
@@ -404,4 +413,80 @@ def provision_application_access(
     except (OSError, ValueError):
         return ApplicationAccessResult(
             application_id="unknown", status="error", message="Application state or gateway response rejected"
+        )
+
+
+def _deliver_key(descriptor: int, token: SecretStr) -> None:
+    content: Final = token.get_secret_value() + "\n"
+    try:
+        existing_fd: Final = os.open("api-key", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+    except FileNotFoundError:
+        temporary: Final = ".key-" + secrets.token_hex(16)
+        temporary_fd: Final = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=descriptor,
+        )
+        try:
+            with os.fdopen(temporary_fd, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(temporary, "api-key", src_dir_fd=descriptor, dst_dir_fd=descriptor, follow_symlinks=False)
+            os.fsync(descriptor)
+        finally:
+            os.unlink(temporary, dir_fd=descriptor)
+            os.fsync(descriptor)
+        return
+    with os.fdopen(existing_fd, encoding="utf-8") as stream:
+        _require_private(stream.fileno(), 0o600)
+        if stream.read(8193) != content:
+            raise ValueError("Destination contains a different credential")
+
+
+def deliver_application_access(
+    directory: Path,
+    destination_directory: Path,
+    master_key: SecretStr,
+    transport: httpx.BaseTransport | None = None,
+) -> ApplicationAccessResult:
+    try:
+        with _locked_directory(directory) as descriptor:
+            state: Final = _load(descriptor)
+            if state is None:
+                return ApplicationAccessResult(
+                    application_id="unknown",
+                    status="error",
+                    message="Prepare and provision application state first",
+                )
+            with httpx.Client(
+                base_url=state.spec.gateway_origin,
+                headers={"Authorization": "Bearer " + master_key.get_secret_value()},
+                timeout=20,
+                follow_redirects=False,
+                trust_env=False,
+                transport=transport,
+            ) as client:
+                verified: Final = _provision(client, descriptor, state, allow_creation=False)
+            if verified.status != "provisioned":
+                return verified
+            with _locked_directory(destination_directory) as destination:
+                _deliver_key(destination, state.token)
+            return ApplicationAccessResult(
+                application_id=state.spec.application_id,
+                status="delivered",
+                message="Verified application credential delivered to private api-key file",
+            )
+    except httpx.HTTPError:
+        return ApplicationAccessResult(
+            application_id="unknown",
+            status="uncertain",
+            message="Gateway verification failed; no credential delivered",
+        )
+    except (OSError, ValueError):
+        return ApplicationAccessResult(
+            application_id="unknown",
+            status="error",
+            message="Application verification or private delivery failed",
         )

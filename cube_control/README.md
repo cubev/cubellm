@@ -496,8 +496,33 @@ scope is rejected. Results and validation errors do not print raw credentials
 
 `provisioned` verifies the native credential and its scope. It does not prove
 provider billing-account ownership, request accounting, successful inference,
-application wiring or network publication. Automated credential delivery,
+application wiring or network publication. Remote application installation,
 rotation/revocation and non-LLM application grants remain separate work. This
 command does not provide a generic passthrough permission or transfer provider
 credentials to applications. The new native capability endpoint must be deployed
 before provisioning can succeed
+
+
+## Local application credential delivery
+
+Run `deliver-application --state-directory PATH --destination-directory PRIVATE_DIR
+--config ADMIN_ENV` after provisioning. The command checks the current native
+capabilities, model policies, user, team membership and key scope again using
+only management GET requests. It cannot create a missing user or key. If this
+verification fails, it delivers no credential
+
+The destination is a separate current-user-owned directory with mode 0700.
+The command writes only the scoped application key followed by a newline to
+`PRIVATE_DIR/api-key`, with mode 0600. A private temporary file, atomic publication
+without replacement and fsync prevent a consumer from reading a partially
+written key. Existing identical private files are accepted unchanged. A different
+credential, symlink, unprotected file or directory, or concurrent destination
+writer causes failure. Neither results nor exception messages contain secrets
+
+Mount this file read-only as an application secret and configure the application's
+CubeLLM endpoint separately. The file contains no gateway administrator key,
+provider key, account configuration or controller journal. Delivery here is a
+local file handoff; it does not install files on remote hosts, change application
+configuration, test inference, or establish LAN/Tailnet connectivity. Gateway
+authorization still applies when the application makes each request. Later
+permission changes require another verification and are not frozen by delivery
