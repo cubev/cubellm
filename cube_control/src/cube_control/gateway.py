@@ -3,20 +3,42 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import Annotated, Final, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    field_validator,
+)
 
-from cube_control.models import GatewayBatch, GatewayMetrics, GatewayRecord, GatewayScan, Identifier, Provider
+from cube_control.models import (
+    GatewayBatch,
+    GatewayMetrics,
+    GatewayRecord,
+    GatewayScan,
+    Identifier,
+    Provider,
+    ProviderId,
+)
 
 
 class GatewayProjection(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     request_id: Annotated[str, Field(min_length=1, max_length=512)]
     reported_provider: Annotated[str, Field(max_length=100)] | None
-    endpoint_provider: Provider | None
+    endpoint_provider: Provider | ProviderId | None
     custom_endpoint: bool
     model: Annotated[str, Field(max_length=150)] | None
     occurred_at: AwareDatetime
     source_updated_at: AwareDatetime | None
+    account_id: Identifier | None = None
+    application_id: Identifier | None = None
+    deployment_id: Identifier | None = None
+    call_type: Annotated[str, Field(min_length=1, max_length=100)] | None = None
+    completed_at: AwareDatetime | None = None
+    duration_ms: Annotated[int, Field(ge=0, strict=True)] | None = None
     status: str | None
     amount_usd: Annotated[Decimal, Field(ge=0, allow_inf_nan=False)] | None
     input_tokens: Annotated[int, Field(ge=0)] | None
@@ -32,22 +54,37 @@ class GatewayProjection(BaseModel):
         return value
 
 
-def attributed_provider(row: GatewayProjection) -> Provider | None:
+class ReportedProvider(BaseModel):
+    value: ProviderId
+
+
+def attributed_provider(row: GatewayProjection) -> Provider | ProviderId | None:
     if row.endpoint_provider is not None:
         return row.endpoint_provider
     if row.custom_endpoint:
         return None
     normalized: Final[str] = (row.reported_provider or "").lower().strip()
-    return next((provider for provider in Provider if provider.value == normalized), None)
+    if not normalized:
+        return None
+    try:
+        return ReportedProvider.model_validate({"value": normalized}).value
+    except ValidationError:
+        return None
 
 
 def projected_record(row: GatewayProjection, source_id: str) -> GatewayRecord:
     return GatewayRecord(
         source_key=sha256(f"{source_id}:LiteLLM_SpendLogs:{row.request_id}".encode()).hexdigest(),
         provider=attributed_provider(row),
+        account_id=row.account_id,
+        application_id=row.application_id,
+        deployment_id=row.deployment_id,
+        call_type=row.call_type,
         model=row.model or "Unbekanntes Modell",
         occurred_at=row.occurred_at,
         source_updated_at=row.source_updated_at,
+        completed_at=row.completed_at,
+        duration_ms=row.duration_ms,
         status="succeeded" if row.status == "success" else "failed" if row.status == "failure" else "unknown",
         amount_usd=row.amount_usd,
         input_tokens=row.input_tokens,
@@ -85,7 +122,9 @@ def missing_tokens(
     return sum(token_value(record, field) is None for record in records)
 
 
-def gateway_metrics(records: tuple[GatewayRecord, ...], provider: Provider | None, period: str) -> GatewayMetrics:
+def gateway_metrics(
+    records: tuple[GatewayRecord, ...], provider: Provider | ProviderId | None, period: str
+) -> GatewayMetrics:
     matching: Final = tuple(
         record
         for record in records

@@ -16,6 +16,7 @@ from cube_control.gateway_store import GatewayRepository
 from cube_control.models import GatewayBatch, ImportBatch, ManualCommand
 from cube_control.openrouter import collect_openrouter
 from cube_control.store import PostgresRepository
+from cube_control.usage import PostgresUsageReader
 
 
 def main() -> int:
@@ -109,5 +110,11 @@ def main() -> int:
         print(json.dumps({"ok": result.ok, "inserted": result.inserted, "message": result.message}))
         return 0 if result.ok else 1
     repository.initialize()
-    uvicorn.run(create_app(repository), host=args.host, port=args.port, access_log=False, log_level="warning")
+    uvicorn.run(
+        create_app(repository, usage_reader=PostgresUsageReader(dsn)),
+        host=args.host,
+        port=args.port,
+        access_log=False,
+        log_level="warning",
+    )
     return 0

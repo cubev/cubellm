@@ -7,7 +7,7 @@ from typing import Annotated, Final, Literal, Self
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
-ProviderId = Annotated[str, Field(pattern=r"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$")]
+ProviderId = Annotated[str, Field(pattern=r"^[a-z](?:[a-z0-9_-]{0,62}[a-z0-9])?$")]
 
 
 class FrozenModel(BaseModel):
@@ -267,10 +267,16 @@ class ManualFieldView(FrozenModel):
 
 class GatewayRecord(FrozenModel):
     source_key: Identifier
-    provider: Provider | None = None
+    provider: Provider | ProviderId | None = None
+    account_id: Identifier | None = None
+    application_id: Identifier | None = None
+    deployment_id: Identifier | None = None
+    call_type: Annotated[str, Field(min_length=1, max_length=100)] | None = None
     model: Annotated[str, Field(min_length=1, max_length=150)]
     occurred_at: AwareDatetime
     source_updated_at: AwareDatetime | None = None
+    completed_at: AwareDatetime | None = None
+    duration_ms: Annotated[int, Field(ge=0, strict=True)] | None = None
     status: Literal["succeeded", "failed", "unknown"]
     amount_usd: Annotated[Decimal, Field(ge=0, allow_inf_nan=False)] | None = None
     input_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None

@@ -1,10 +1,11 @@
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Final, Literal
+from typing import Annotated, Final, Literal
 
 import psycopg
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Path as PathParameter
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 from starlette.middleware.base import RequestResponseEndpoint
@@ -21,6 +22,7 @@ from cube_control.models import (
 )
 from cube_control.store import Repository
 from cube_control.summary import account_view, current_measurement
+from cube_control.usage import UsageFailure, UsageHistory, UsagePage, UsageQuery, UsageReader
 
 
 class ReadingView(BaseModel):
@@ -61,11 +63,12 @@ def reading_view(reading: Observation, observations: tuple[Observation, ...], no
     )
 
 
-def create_app(repository: Repository, clock: Callable[[], datetime] = utc_now) -> FastAPI:
+def create_app(
+    repository: Repository, clock: Callable[[], datetime] = utc_now, usage_reader: UsageReader | None = None
+) -> FastAPI:
     app: Final[FastAPI] = FastAPI(title="CubeLLM Control", docs_url=None, redoc_url=None, openapi_url=None)
     static: Final[Path] = Path(__file__).parent / "static"
 
-    @app.middleware("http")
     async def response_headers(request: Request, call_next: RequestResponseEndpoint) -> Response:
         response: Final[Response] = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
@@ -77,12 +80,10 @@ def create_app(repository: Repository, clock: Callable[[], datetime] = utc_now) 
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
-    @app.get("/healthz")
     def health() -> JSONResponse:
         ready: Final[bool] = repository.healthy()
         return JSONResponse({"status": "ok" if ready else "unavailable"}, status_code=200 if ready else 503)
 
-    @app.get("/api/v1/summary", response_model=SummaryResponse)
     def summary() -> SummaryResponse:
         try:
             state: Final = repository.state()
@@ -110,23 +111,55 @@ def create_app(repository: Repository, clock: Callable[[], datetime] = utc_now) 
             ),
         )
 
-    @app.get("/api/v1/fleet", response_model=FleetSnapshot | None)
     def fleet() -> FleetSnapshot | None:
         try:
             return repository.state().fleet
         except psycopg.Error:
             raise HTTPException(503, detail="Zentrale Datenbank ist nicht erreichbar") from None
 
-    @app.get("/")
+    def usage_result(result: UsagePage | UsageHistory | UsageFailure) -> UsagePage | UsageHistory:
+        if isinstance(result, UsageFailure):
+            status: Final = {"invalid_cursor": 422, "changed": 409, "unavailable": 503}[result.code]
+            raise HTTPException(status, detail=result.message)
+        return result
+
+    def usage(query: Annotated[UsageQuery, Query()]) -> UsagePage | UsageHistory:
+        if usage_reader is None:
+            raise HTTPException(503, detail="Nutzungsübersicht nicht eingerichtet")
+        return usage_result(usage_reader.page(query, query.cursor))
+
+    def usage_history(
+        source_id: Annotated[str, PathParameter(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")],
+        source_key: Annotated[str, PathParameter(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")],
+        after: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> UsagePage | UsageHistory:
+        if usage_reader is None:
+            raise HTTPException(503, detail="Nutzungsübersicht nicht eingerichtet")
+        return usage_result(usage_reader.history(source_id, source_key, after, limit))
+
     def index() -> FileResponse:
         return FileResponse(static / "index.html", media_type="text/html")
 
-    @app.get("/app.js")
     def script() -> FileResponse:
         return FileResponse(static / "app.js", media_type="application/javascript")
 
-    @app.get("/style.css")
     def stylesheet() -> FileResponse:
         return FileResponse(static / "style.css", media_type="text/css")
 
+    def usage_script() -> FileResponse:
+        return FileResponse(static / "usage.js", media_type="application/javascript")
+
+    app.middleware("http")(response_headers)
+    app.add_api_route("/healthz", health, methods=["GET"])
+    app.add_api_route("/api/v1/summary", summary, methods=["GET"], response_model=SummaryResponse)
+    app.add_api_route("/api/v1/fleet", fleet, methods=["GET"], response_model=FleetSnapshot | None)
+    app.add_api_route("/api/v1/usage", usage, methods=["GET"], response_model=UsagePage)
+    app.add_api_route(
+        "/api/v1/usage/{source_id}/{source_key}/history", usage_history, methods=["GET"], response_model=UsageHistory
+    )
+    app.add_api_route("/", index, methods=["GET"])
+    app.add_api_route("/app.js", script, methods=["GET"])
+    app.add_api_route("/style.css", stylesheet, methods=["GET"])
+    app.add_api_route("/usage.js", usage_script, methods=["GET"])
     return app

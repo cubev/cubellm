@@ -42,6 +42,27 @@ def projection() -> GatewayProjection:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_explicit_custom_provider_and_request_attribution_survive_projection(self) -> None:
+        row: Final = projection().model_copy(
+            update={
+                "reported_provider": "custom-provider",
+                "endpoint_provider": None,
+                "custom_endpoint": False,
+                "account_id": "confirmed-account",
+                "application_id": "authenticated-app",
+                "deployment_id": "deployment",
+                "call_type": "speech",
+                "completed_at": NOW,
+                "duration_ms": 0,
+            }
+        )
+        record: Final = projected_record(row, "instance")
+        self.assertEqual(record.provider, row.reported_provider)
+        self.assertEqual((record.account_id, record.application_id), (row.account_id, row.application_id))
+        self.assertEqual((record.deployment_id, record.call_type), (row.deployment_id, row.call_type))
+        self.assertEqual((record.completed_at, record.duration_ms), (row.completed_at, row.duration_ms))
+        self.assertIsNone(projected_record(row.model_copy(update={"custom_endpoint": True}), "instance").provider)
+
     def test_endpoint_overrides_protocol_and_model_is_not_provider_identity(self) -> None:
         row: Final = projection().model_copy(
             update={"reported_provider": "openai", "endpoint_provider": Provider.OPENROUTER, "custom_endpoint": True}
@@ -49,6 +70,13 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(projected_record(row, "source").provider, Provider.OPENROUTER)
         unassigned: Final = row.model_copy(update={"endpoint_provider": None, "model": "openai/model"})
         self.assertIsNone(projected_record(unassigned, "source").provider)
+
+    def test_explicit_provider_identifiers_support_underscores_without_model_guessing(self) -> None:
+        row: Final = projection().model_copy(update={"reported_provider": "custom_provider"})
+        self.assertEqual(projected_record(row, "instance").provider, "custom_provider")
+        self.assertIsNone(
+            projected_record(row.model_copy(update={"reported_provider": "bad provider"}), "instance").provider
+        )
 
     def test_unknown_amounts_and_tokens_remain_unknown(self) -> None:
         row: Final = projection().model_copy(update={"amount_usd": None, "input_tokens": None})

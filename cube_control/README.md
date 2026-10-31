@@ -58,7 +58,7 @@ PostgreSQL integration tests additionally require `CUBE_CONTROL_TEST_DATABASE_UR
 
 ## Current boundaries
 
-The initial service consumes existing collectors through an authenticated management bridge. Native provider connectors, account-editing authentication, gateway-event ingestion, deployment-job execution and persistent mobile agents remain separate implementation work. Unknown provider balances and subscription states stay unknown until a real source or explicit manual entry is imported
+The service consumes collectors through an authenticated management bridge, supports local account edits and passively ingests gateway events. Provider-native routing, credentials and application rollout still require verification for each account. Deployment and recovery tools live in the existing operations project. Unknown provider balances and subscription states stay unknown until a real source or explicit manual entry is imported
 
 This service uses a separate PostgreSQL instance to keep the live gateway fully isolated and to avoid copying or generating database passwords. No provider API key or new remote access credential is created by this stack
 
@@ -162,3 +162,56 @@ scans continue on the next scheduled run. Its status describes stored source
 coverage only, never all vendor usage. Direct calls, pruned logs and unavailable
 rows cannot be reconstructed from this gateway. Partial and failed imports are
 visible. Readers must be deployed and healthy before enabling a new producer
+
+## Request-level usage audit
+
+The browser overview includes a request explorer with UTC month, provider, account,
+application, model and status filters. It shows original decimal USD strings,
+nullable token counters, source references and correction history. Missing
+attribution stays unknown. Gateway-reported charges are not a verified provider
+invoice, and observed zero does not prove a free request
+
+`GET /api/v1/usage?period=2026-01&limit=50` returns the matching total, known sums,
+unknown counts and a bounded page of source-qualified records. Optional filters
+are source_id, provider, account_id, application_id, model, status and traffic_kind. Status is
+succeeded, failed or unknown. Limit is between 1 and 200. All filters apply to
+both the rows and the totals. Historical months remain queryable independently
+of the current overview
+
+traffic_kind separates known provider_request calls, known gateway_management
+calls and unknown call types. Administrative requests such as model information
+and key listing remain inspectable without being presented as provider requests.
+Missing call types and newly encountered endpoints stay unknown until classified
+
+To continue, pass next_cursor as the cursor query parameter with the same filters
+and limit. If any source scan advances, HTTP409 requires restarting the query
+so pages cannot silently combine different mirror versions. Invalid cursors and
+changed filters return HTTP422. Database failures return HTTP503. Cached browser
+rows are explicitly labelled as a previous successful result after a failure
+
+`GET /api/v1/usage/SOURCE/REQUEST/history?after=0&limit=50` exposes recorded changes
+with their sequence and previous/content hashes. Use the returned source_id and
+record.source_key from the explorer. next_after continues a longer history.
+An unchanged rescan does not create a correction, and A to B to A remains three
+inspectable versions while contributing one current row to totals
+
+Imports can carry confirmed account_id, application_id, deployment_id, call_type,
+completed_at and duration_ms. Legacy imports leave these unknown. Only trusted
+management projections may supply identity: a model name, a provider total or
+arbitrary client metadata is not evidence of an account or authenticated app.
+Custom provider identifiers are supported. No provider credential, request body,
+response body or raw gateway token belongs in a projection
+
+The audit covers retained completed gateway rows, with one row per source and
+request reference. Independent sources may overlap. It cannot reconstruct
+direct provider calls, removed logs, missing stream completion usage or unobserved
+Realtime sessions. Source status and import age remain visible. This endpoint
+uses the same private read interface as the rest of the companion
+
+For a real local browser regression, install Playwright in a test environment
+and run `PYTHONPATH=src python tests/ui_usage.py` with the dedicated
+CUBE_CONTROL_TEST_DATABASE_URL. CUBE_CONTROL_BROWSER_EXECUTABLE can select an
+already installed Chromium. The test starts its own loopback HTTP server and
+checks decimal precision, unknowns, correction history, pagination, concurrent
+scan changes, failed requests, script injection and a 390px viewport. It never
+calls a provider. Screenshots default to /tmp/cubellm-usage-proof

@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="de">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CubeLLM · Übersicht</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CubeLLM · Übersicht</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/usage.js" defer></script></head>
 <body>
 <header><a class="brand" href="/" aria-label="CubeLLM Übersicht"><span class="mark">C</span><span>CubeLLM<small>Deine AI-Dienste im Blick</small></span></a><div class="live"><i></i><span id="connection">Verbinde …</span><button id="refresh" type="button">Aktualisieren</button></div></header>
 <main>
@@ -10,6 +10,26 @@
 <section id="gateway-section" class="gateway-section" hidden aria-label="Gateway-Erfassung"><h2>Gateway-Erfassung</h2><div id="gateway-sources"></div><p id="gateway-unassigned"></p><p class="explanation">Erfasst gespeicherte Gateway-Aufrufe. Direkte Anbieteraufrufe und bereits gelöschte Gateway-Logs fehlen. Gemeldete Nullkosten sind keine bestätigte kostenlose Nutzung.</p></section>
 <nav class="filters" aria-label="Konten filtern"><button data-filter="all" class="selected">Alle Konten</button><button data-filter="subscription">Subscriptions</button><button data-filter="api">API-Zugänge</button><span id="count"></span></nav>
 <section id="accounts" class="grid" aria-label="Anbieterkonten"><div class="empty">Kontodaten werden geladen …</div></section>
+<section class="usage-section" aria-labelledby="usage-heading">
+<h2 id="usage-heading">Einzelne Gateway-Aufrufe prüfen</h2>
+<p class="explanation">Gespeicherte Gateway-Aufrufe mit Originalbeträgen. Gateway-Kosten sind keine bestätigte Anbieterabrechnung. Fehlende Konten- und Anwendungszuordnungen bleiben ausdrücklich unbekannt.</p>
+<form id="usage-filters" class="usage-filters">
+<label>Monat (UTC)<input id="usage-period" type="month" required></label>
+<label>Anbieter-ID<input id="usage-provider" type="text" maxlength="64" placeholder="Alle Anbieter"></label>
+<label>Konto-ID<input id="usage-account" type="text" maxlength="128" placeholder="Alle Konten"></label>
+<label>Anwendungs-ID<input id="usage-application" type="text" maxlength="128" placeholder="Alle Anwendungen"></label>
+<label>Modell<input id="usage-model" type="text" maxlength="150" placeholder="Alle Modelle"></label>
+<label>Status<select id="usage-status"><option value="">Alle</option><option value="succeeded">Erfolgreich</option><option value="failed">Fehlgeschlagen</option><option value="unknown">Unbekannt</option></select></label>
+<label>Aufrufart<select id="usage-traffic"><option value="">Alle</option><option value="provider_request">Anbieter-API</option><option value="gateway_management">Gateway-Verwaltung</option><option value="unknown">Nicht zugeordnet</option></select></label>
+<button id="usage-search" type="submit">Aufrufe laden</button>
+</form>
+<p id="usage-status-message" role="status">Zeitraum auswählen und Aufrufe laden.</p>
+<div id="usage-totals"></div>
+<div class="usage-table-scroll" tabindex="0" role="region" aria-label="Gateway-Aufrufe, horizontal scrollbar">
+<table class="usage-table"><thead><tr><th scope="col">Zeit (UTC)</th><th scope="col">Anbieter / Modell</th><th scope="col">Konto / Anwendung</th><th scope="col">Status / Typ</th><th scope="col">Gateway-USD</th><th scope="col">Input / Output</th><th scope="col">Details</th></tr></thead><tbody id="usage-rows"></tbody></table>
+</div>
+<button id="usage-next" type="button" hidden>Weitere Aufrufe</button>
+</section>
 <section class="fleet-section"><div class="section-heading"><div><p class="eyebrow">ENTWICKLUNG & BETRIEB</p><h2>Deine Systeme</h2></div><span id="fleet-age"></span></div><div id="fleet" class="fleet-grid"><div class="empty">Noch kein zentraler Systembericht</div></div></section>
 <footer>Provider-Kosten und beobachteter Proxy-Verbrauch werden getrennt geführt. Credits sind kein Geldbetrag. Nicht angebundene Konten bleiben sichtbar.</footer>
 </main>

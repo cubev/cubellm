@@ -1,0 +1,38 @@
+# CubeLLM development and acceptance
+
+Scope reconciled on 2026-10-31 against this service, the gateway code, ServiceInventory and the existing CubeUsageBar operations status. The owner explicitly requires every API account to be managed, monitored and supplied to applications across LAN and Tailscale, with precise, inspectable usage. This includes non-LLM APIs and resumes the previously deferred HeyGen API work. An implemented protocol or passing local fixture is not proof of provider authorization, a live billing value, or mobile connectivity
+
+| Capability | Verified baseline | Remaining work and acceptance |
+| --- | --- | --- |
+| Account catalogue and manual management | Transactional CLI, revisions, creation, field provenance and desktop handoff exist | Preserve source distinctions and exercise database concurrency tests |
+| Current measurements | Source-qualified freshness, manual overrides, separate provider and proxy totals | Outage-masked spending fixed in c6b760d; maintain API and browser regression coverage |
+| Gateway ingestion | Passive scans, nullable counters, provider attribution and idempotent history exist | Verify existing client routes; complete project attribution and Realtime session usage before claiming full traffic coverage |
+| Provider collectors | OpenRouter collector here; other existing collectors and live-source notes in CubeUsageBar | Add native collectors where supported without duplicating or replacing verified sources; missing permissions remain explicit |
+| Media jobs | Imported lifecycle records and separate unit reservations exist | Add versioned local management, retry-safe immutable history, read-only monitoring, expiry and uncertain-submission handling, with real PostgreSQL tests |
+| Deployment | Existing build, backup, rollback and activation watchdog tools in CubeUsageBar | Run updated artifact tests before a rollout; retain gateway and database isolation |
+| Browser overview | Account filters, fleet, gateway totals and native editing links exist | Cover refresh failures, rollover, source outages and job monitoring without presenting cached values as current |
+| Mobile access and persistent collection | Trusted management bridges and resident VM collectors exist | Verify actual off-LAN access and independent sources; do not claim a desktop source works while its host is off |
+| HeyGen API | Included by the owner's all-accounts requirement on 2026-10-31 | Inspect existing authorized access, add routing and usage support, and verify real behavior |
+| Anthropic individual-account admin billing | Existing source documents unsupported account type | Keep unavailable; prior account-conversion deferral remains in force |
+
+## Verification baseline
+
+Run `PYTHONPATH=src python -m unittest discover -s tests -v` in this directory. Database tests require a dedicated database named `cubecontrol_test`, owned by a non-administrator application role. Never run them against either production database
+
+Run `node tests/ui_errors.cjs` for the browser source-error regression. Run Ruff on changed Python files, review the diff, and record which live checks could actually run. Commit completed increments separately. External push is pending the automatic review's explicit destination approval
+
+## Current increment
+
+Prioritize the gateway audit surface and reliable application/account attribution. Expose request-level records, reporting periods, model and counter details, missing values and correction history. Provider billing and gateway-reported charges remain separate. Application identity must come from authenticated gateway identity, and account identity from a confirmed server-controlled deployment mapping. Model names, arbitrary client metadata and the existence of one account at a provider do not prove account attribution
+
+Then extend media job record management with stable command identities, expected revisions and immutable history. An unknown vendor outcome must not release a submitted reservation merely because its local deadline passed
+
+## Inventory evidence
+
+The existing inventory includes stored external credentials, reference-only groups, templates, application session secrets, encrypted material and public client configuration. A stored value is not automatically a verified API account. Preserve evidence and distinguish actual external credentials, credential components, archives, public identifiers and local secrets before routing anything. Keep private inventory counts, account metadata and credential locations outside this repository
+
+## Local acceptance for the request explorer
+
+The request audit is implemented and has been tested against a temporary PostgreSQL instance with a dedicated non-administrator test role. Historical UTC periods, all filters, decimal precision, missing counters, management/provider classification, retries, correction history and HTTP validation are covered by the regression suite. An actual Chromium run checks the UI, a 390px viewport, injection handling, corrections, pagination and failure states. Build and type checks use the repository's locked dependency versions. This is local feature acceptance, not evidence that every application or provider is already routed through the gateway
+
+The next integration must project authenticated application identity at request time and confirmed deployment/account identity, then deploy readers before enabling the new producer. Do not infer historical identity from a key's current project assignment or guess an account from the selected model
