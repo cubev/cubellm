@@ -34,8 +34,13 @@ class ModelTests(unittest.TestCase):
     def test_provider_character_usage_is_not_money_and_expires_at_reset(self) -> None:
         account: Final = Account(id="elevenlabs-api", provider=Provider.ELEVENLABS, name="ElevenLabs", kind="api")
         reading: Final = observation(
-            account_id=account.id, metric="usage", unit="characters", value="13", period="",
-            resets_at=NOW + timedelta(seconds=60), expires_at=NOW + timedelta(seconds=60),
+            account_id=account.id,
+            metric="usage",
+            unit="characters",
+            value="13",
+            period="",
+            resets_at=NOW + timedelta(seconds=60),
+            expires_at=NOW + timedelta(seconds=60),
         )
         restored: Final = Observation.model_validate_json(reading.model_dump_json())
         self.assertEqual(restored.value, Decimal(13))
@@ -98,6 +103,34 @@ class ModelTests(unittest.TestCase):
     def test_wrong_period_and_stale_report_do_not_become_current(self) -> None:
         self.assertIsNone(selected_spend((observation(),), NOW, "2026-02"))
         self.assertIsNone(selected_spend((observation(),), NOW + timedelta(hours=1), "2026-01"))
+
+    def test_spend_selection_matches_reading_availability_after_source_outage(self) -> None:
+        reading: Final = observation(observed_at=NOW - timedelta(seconds=10))
+        fallback: Final = observation(external_id="fallback", source="import", value="9.00")
+        for status in ("error", "unknown", "not_configured"):
+            outage: Final = observation(external_id="outage", window="all", status=status, value=None)
+            with self.subTest(status=status):
+                self.assertFalse(reading_view(reading, (reading, outage), NOW).current)
+                self.assertIsNone(selected_spend((reading, outage), NOW, reading.period))
+                self.assertEqual(selected_spend((reading, outage, fallback), NOW, reading.period), fallback)
+
+    def test_spend_recovers_only_after_newer_report_from_same_source(self) -> None:
+        outage: Final = observation(external_id="outage", window="all", status="error", value=None)
+        for offset in (-1, 0, 1):
+            reading: Final = observation(observed_at=NOW + timedelta(seconds=offset))
+            with self.subTest(offset=offset):
+                self.assertEqual(reading_view(reading, (reading, outage), NOW).current, offset > 0)
+                self.assertEqual(
+                    selected_spend((reading, outage), NOW, reading.period), reading if offset > 0 else None
+                )
+
+    def test_unrelated_outages_do_not_hide_current_spend(self) -> None:
+        reading: Final = observation()
+        for changes in ({"source": "import"}, {"metric": "balance"}, {"account_id": "other"}):
+            outage: Final = observation(external_id="outage", window="all", status="error", value=None, **changes)
+            with self.subTest(changes=changes):
+                self.assertTrue(reading_view(reading, (reading, outage), NOW).current)
+                self.assertEqual(selected_spend((reading, outage), NOW, reading.period), reading)
 
     def test_reservations_are_separated_by_unit_and_expire(self) -> None:
         jobs: Final[tuple[MediaJob, ...]] = tuple(

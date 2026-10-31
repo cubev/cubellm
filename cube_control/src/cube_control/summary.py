@@ -20,6 +20,24 @@ def latest_measurements(account_id: str, observations: tuple[Observation, ...]) 
     )
 
 
+def current_measurement(
+    reading: Observation, observations: tuple[Observation, ...], now: datetime, period: str
+) -> bool:
+    if reading.status not in ("known", "manual", "estimated") or reading.freshness(now) != "fresh":
+        return False
+    if reading.metric in ("spend", "budget") and reading.period != period:
+        return False
+    return not any(
+        o.account_id == reading.account_id
+        and o.metric == reading.metric
+        and o.source == reading.source
+        and o.window == "all"
+        and o.status in ("error", "unknown", "not_configured")
+        and o.observed_at >= reading.observed_at
+        for o in observations
+    )
+
+
 def selected_spend(observations: tuple[Observation, ...], now: datetime, period: str) -> Observation | None:
     candidates: Final[tuple[Observation, ...]] = tuple(
         o for o in observations if o.metric == "spend" and o.period == period
@@ -28,9 +46,7 @@ def selected_spend(observations: tuple[Observation, ...], now: datetime, period:
     ordered: Final[list[Observation]] = sorted(
         candidates, key=lambda o: (priority[o.source], -o.observed_at.timestamp())
     )
-    return next(
-        (o for o in ordered if o.status in ("known", "manual", "estimated") and o.freshness(now) == "fresh"), None
-    )
+    return next((o for o in ordered if current_measurement(o, observations, now, period)), None)
 
 
 def proxy_amounts(events: tuple[UsageEvent, ...]) -> dict[str, Decimal]:

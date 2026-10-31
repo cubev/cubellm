@@ -8,6 +8,8 @@ The account catalogue covers OpenAI, Anthropic, OpenRouter, xAI, HeyGen and Suno
 
 Observations carry source, observation time, collection time, reporting period, unit, status and freshness. Unknown values have no numeric amount. Credits, ratios, tokens and currencies cannot be substituted for each other. Provider-reported spending and observed proxy requests remain separate values, so overlapping data is never summed
 
+A source-wide outage hides older measurements from that account, source and metric, including selected monthly spending. A newer successful report restores availability. An independent current source can supply monthly spending while the preferred source is unavailable
+
 Imports are transactional and idempotent. Reusing an observation or request identity with different contents rejects the whole batch. Media jobs follow explicit reservation, submission and finalization states; terminal jobs cannot be reopened and expired reservations are excluded from available-work calculations
 
 The HTTP service is read-only. Account changes and observation imports use the CLI over an already authenticated management connection. Provider credentials never enter observation payloads

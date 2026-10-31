@@ -20,7 +20,7 @@ from cube_control.models import (
     utc_now,
 )
 from cube_control.store import Repository
-from cube_control.summary import account_view
+from cube_control.summary import account_view, current_measurement
 
 
 class ReadingView(BaseModel):
@@ -54,21 +54,10 @@ class SummaryResponse(BaseModel):
 
 
 def reading_view(reading: Observation, observations: tuple[Observation, ...], now: datetime) -> ReadingView:
-    outage: Final[bool] = any(
-        o.metric == reading.metric
-        and o.source == reading.source
-        and o.window == "all"
-        and o.status in ("error", "unknown", "not_configured")
-        and o.observed_at >= reading.observed_at
-        for o in observations
-    )
     return ReadingView(
         reading=reading,
         freshness=reading.freshness(now),
-        current=not outage
-        and reading.freshness(now) == "fresh"
-        and reading.status in ("known", "manual", "estimated")
-        and (reading.metric not in ("spend", "budget") or reading.period == now.strftime("%Y-%m")),
+        current=current_measurement(reading, observations, now, now.strftime("%Y-%m")),
     )
 
 
