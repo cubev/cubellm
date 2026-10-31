@@ -16,13 +16,35 @@ async function usageFetch(url) {
  } finally { clearTimeout(timeout); }
 }
 
+function usageAccountEvidence(record) {
+ const evidence = record.account_evidence;
+ if (!evidence) return "Kein Kontonachweis gespeichert";
+ return [
+  "Kontonachweis: konfigurierter Zugangsschlüssel",
+  `Anbieterkennung: ${usageValue(evidence.provider)}`,
+  `Anbieter-Ziel: ${evidence.origin}`,
+  "Anbieterkosten: ungeprüft"
+ ].join("\n");
+}
+
 async function usageHistory(button, output, row) {
  button.disabled = true;
  try {
   const data = await usageFetch(`/api/v1/usage/${encodeURIComponent(row.source_id)}/${encodeURIComponent(row.record.source_key)}/history?limit=200`);
-  output.textContent = data.changes.map(change =>
-   `Version ${change.sequence}\nGateway-USD: ${usageValue(change.record.amount_usd)}\nInput: ${usageValue(change.record.input_tokens)} · Output: ${usageValue(change.record.output_tokens)}\nStatus: ${usageStates[change.record.status] || "Unbekannt"}\nKonto: ${usageValue(change.record.account_id)} · Anwendung: ${usageValue(change.record.application_id)}\nHash: ${change.content_hash}\nVorher: ${usageValue(change.previous_hash)}`
-  ).join("\n\n") + (data.next_after !== null ? "\n\nWeitere Änderungen vorhanden. Der vollständige Verlauf ist über die API abrufbar." : "");
+  output.textContent = data.changes.map(change => {
+   const record = change.record;
+   return [
+    `Version ${change.sequence}`,
+    `Gateway-USD: ${usageValue(record.amount_usd)}`,
+    `Input: ${usageValue(record.input_tokens)} · Output: ${usageValue(record.output_tokens)}`,
+    `Status: ${usageStates[record.status] || "Unbekannt"}`,
+    `Konto: ${usageValue(record.account_id)} · Anwendung: ${usageValue(record.application_id)}`,
+    usageAccountEvidence(record),
+    `Hash: ${change.content_hash}`,
+    `Vorher: ${usageValue(change.previous_hash)}`
+   ].join("\n");
+  }).join("\n\n") + (data.next_after !== null
+   ? "\n\nWeitere Änderungen vorhanden. Der vollständige Verlauf ist über die API abrufbar." : "");
  } catch { output.textContent = "Verlauf nicht erreichbar. Erneut laden."; }
  finally { button.disabled = false; }
 }
@@ -41,6 +63,7 @@ function usageRow(row) {
   element("p", "", `Quelle: ${row.source_id}`),
   element("p", "", `Request-Referenz: ${r.source_key}`),
   element("p", "", `Originalzeit: ${r.occurred_at}`),
+  element("p", "", usageAccountEvidence(r)),
   element("p", "", `Deployment: ${usageValue(r.deployment_id)}`),
   element("p", "", `Cache gelesen: ${usageValue(r.cache_read_tokens)} · geschrieben: ${usageValue(r.cache_write_tokens)}`),
   element("p", "", `Abschluss: ${usageValue(r.completed_at)} · Dauer: ${usageValue(r.duration_ms)} ms`),

@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC
 from decimal import Decimal
 from hashlib import sha256
@@ -15,6 +16,7 @@ from pydantic import (
 
 from cube_control.amounts import exact_sum
 from cube_control.models import (
+    GatewayAccountEvidence,
     GatewayBatch,
     GatewayMetrics,
     GatewayRecord,
@@ -34,6 +36,7 @@ class GatewayProjection(BaseModel):
     model: Annotated[str, Field(max_length=150)] | None
     occurred_at: AwareDatetime
     source_updated_at: AwareDatetime | None
+    account_evidence: GatewayAccountEvidence | None = None
     account_id: Identifier | None = None
     application_id: Identifier | None = None
     deployment_id: Identifier | None = None
@@ -78,6 +81,7 @@ def projected_record(row: GatewayProjection, source_id: str) -> GatewayRecord:
         source_key=sha256(f"{source_id}:LiteLLM_SpendLogs:{row.request_id}".encode()).hexdigest(),
         provider=attributed_provider(row),
         account_id=row.account_id,
+        account_evidence=row.account_evidence,
         application_id=row.application_id,
         deployment_id=row.deployment_id,
         call_type=row.call_type,
@@ -162,8 +166,11 @@ def safe_projection(raw: JsonValue, identity: str) -> GatewayRecord | None:
         return None
 
 
-def prepare_gateway(batch: GatewayProjectionBatch) -> GatewayBatch:
-    projected: Final = tuple(safe_projection(row, batch.identity) for row in batch.rows)
+def prepare_gateway(
+    batch: GatewayProjectionBatch,
+    project: Callable[[JsonValue, str], GatewayRecord | None] = safe_projection,
+) -> GatewayBatch:
+    projected: Final = tuple(project(row, batch.identity) for row in batch.rows)
     records: Final = tuple(record for record in projected if record is not None)
     rejected: Final = batch.scan.rejected_rows + sum(record is None for record in projected)
     scan: Final = batch.scan.model_copy(

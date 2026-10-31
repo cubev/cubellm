@@ -59,8 +59,10 @@ class SummaryResponse(BaseModel):
 class CapabilitiesResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
     schema_version: Literal[1] = 1
+    gateway_native_account_projection: Literal["credential_snapshot_v1"] = "credential_snapshot_v1"
     gateway_projection_fields: tuple[str, ...] = (
         "account_id",
+        "account_evidence",
         "application_id",
         "deployment_id",
         "call_type",

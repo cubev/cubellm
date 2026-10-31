@@ -594,7 +594,7 @@ The credential's nonsecret `credential_info` must contain both `cube_account_id`
 and `cube_allowed_origins`, for example:
 
 ```json
-{"cube_account_id":"example-account","cube_allowed_origins":["https://api.example.com"]}
+{"cube_account_id":"example-account","cube_provider_id":"example-provider","cube_allowed_origins":["https://api.example.com"]}
 ```
 
 Keep the provider value in the native `credential_values` or its supported
@@ -615,7 +615,10 @@ configuration/management endpoint with an explicit method list:
 }
 ```
 
-The route and credential account IDs must match. The target authority must be
+The route and credential account IDs must match. `cube_provider_id` identifies the
+provider family independently of the account ID. It is captured from the selected
+credential on each request; client metadata cannot replace it. Set it for custom
+API domains so attribution does not depend on a fixed list of known vendor hosts. The target authority must be
 in the credential's allowed origins; default ports are normalized. HTTPS is
 required except on literal loopback addresses. No user information, target query
 or fragment, unrestricted header forwarding, routing/framing header overrides,
@@ -630,17 +633,63 @@ inherit pooled client authentication, cookies, default headers or parameters and
 does not follow redirects. Native credential read endpoints mask all value fields,
 including arbitrary vendor field names; bound debug headers expose no characters.
 
-Stored native spend metadata contains `provider_account_id`, `provider_origin`,
+Stored native spend metadata contains `provider_account_id`,
+`provider_account_provider`, `provider_origin`,
 `provider_account_source: configured_credential` and `provider_cost_status: unverified`.
 The writer derives these from the server-held request snapshot and rejects client
 imitations. It keeps the authenticated application identity independently. The
 credential name and binding object are not stored. This proves configured
 credential selection, not provider ownership or invoice accuracy. Controllers can
 check `passthrough_account_binding: configured_credential_v1` and
-`credential_values_full_masking` in the native capability response.
+`credential_values_full_masking` in the native capability response. The additional
+`passthrough_account_provider: credential_metadata_v1` flag identifies the captured
+provider-label contract.
 
 Actual account enrollment, application route grants, provider-specific usage and
 billing reconciliation, signed/query/OAuth credentials, mTLS and WebSocket account
 binding remain open. Native JSON envelope/body handling still applies; arbitrary
 API payload compatibility needs protocol tests. No production routes or LAN/Tailscale
 access are activated by this source change.
+
+
+## Account provenance in the usage audit
+
+The companion exposes the whitelist SQL columns for native spend rows through
+`python -m cube_control native-gateway-projection`. Feed rows selected with those
+columns to `python -m cube_control project-native-gateway` using the existing scan
+and instance-identity envelope. These commands export/project data without opening
+a database. They do not replace the collector's read-only transaction, pagination,
+completion horizon, instance pinning or durable pending-import journal.
+
+Before enabling this producer mode, verify the native account/provider capability
+flags and companion `gateway_native_account_projection: credential_snapshot_v1`.
+The existing producer and production releases are not switched by this change.
+The older `project-gateway` command remains available. Retry an existing pending
+batch unchanged; do not strip or rewrite a pending batch to fit an older reader.
+
+A named-credential row carries `account_evidence` with its source, origin, optional
+captured provider label and explicitly unverified provider-cost status. The native
+projection accepts only the server-stamped account leaves, checks the origin
+against the recorded target and rejects user information and conflicting provider
+labels. An explicit captured provider supports arbitrary API domains. For older
+bindings without that label, only a known vendor host supplies provider identity;
+an unknown custom origin is rejected until its provider is configured. Invalid
+rows make the scan partial and are counted rather than blocking the whole page.
+An imported account must still exist as a matching API account in the catalogue.
+
+Bound generic HTTP calls are classified as provider API traffic. Their token and
+cache counters remain unknown until a protocol-specific measurement parser exists;
+native placeholder zeros are not treated as measurements. Gateway-reported amounts
+remain separate from provider billing and keep their unverified cost marker.
+
+Usage rows and correction history show the account proof, captured provider label,
+target origin and cost status. Historic snapshots retain their original values.
+Absent evidence and absent provider labels are omitted when serializing, preserving
+legacy batch fingerprints and history payloads. This uses field-level conditional
+serialization, so the API retains its typed record schema. The companion now
+requires Pydantic 2.12 or later for that field option; see the
+[official serialization documentation](https://pydantic.dev/docs/validation/2.12/concepts/serialization/).
+
+These are source/artifact contracts and local acceptance results. Central account
+enrollment, source activation, provider ownership/billing verification and application
+LAN/Tailscale rollout still require their respective acceptance steps.

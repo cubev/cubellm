@@ -105,6 +105,7 @@ def test_route_policy_is_checked_before_crud_can_persist_it() -> None:
 def test_spend_account_provenance_rejects_client_scalars_and_json_imitations(supplied: object) -> None:
     stored: Final = stored_metadata(
         {
+            "provider_account_provider": "forged-provider",
             "provider_origin": "https://forged.example",
             "provider_account_id": "forged-account",
             "provider_account_source": "configured_credential",
@@ -113,6 +114,8 @@ def test_spend_account_provenance_rejects_client_scalars_and_json_imitations(sup
     )
     assert "provider_account_id" in stored
     assert "provider_account_source" in stored
+    assert "provider_account_provider" in stored
+    assert stored["provider_account_provider"] is None
     assert "provider_origin" in stored
     assert stored["provider_origin"] is None
     assert stored["provider_account_id"] is None
@@ -159,3 +162,24 @@ def test_static_headers_cannot_override_the_bound_origin_or_http_framing(name: s
 def test_credential_headers_cannot_use_protocol_fields_mutated_by_the_gateway(name: str) -> None:
     with pytest.raises(ValidationError):
         CredentialHeader(name=name, field="access value")
+
+
+def test_provider_identity_comes_from_the_request_credential_snapshot() -> None:
+    item: Final = credential()
+    cast(dict[str, object], item.credential_info)["cube_provider_id"] = "arbitrary-provider"
+    resolved: Final = resolve_account_credential(POLICY, item, "https://vendor.example/check")
+    cast(dict[str, object], item.credential_info)["cube_provider_id"] = "later-provider"
+    assert resolved.binding.provider == "arbitrary-provider"
+    metadata: Final = stored_metadata(
+        {"provider_account_provider": "forged-provider"}, account_binding=resolved.binding
+    )
+    assert "provider_account_provider" in metadata
+    assert metadata["provider_account_provider"] == "arbitrary-provider"
+
+
+@pytest.mark.parametrize("provider", ("", "Bad Provider", "UPPER"))
+def test_credential_provider_identity_must_be_a_valid_provider_id(provider: str) -> None:
+    item: Final = credential()
+    cast(dict[str, object], item.credential_info)["cube_provider_id"] = provider
+    with pytest.raises(ValueError):
+        resolve_account_credential(POLICY, item, "https://vendor.example/check")

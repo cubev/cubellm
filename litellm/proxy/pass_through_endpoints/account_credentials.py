@@ -64,11 +64,13 @@ class AccountRouteBinding:
     account_id: str
     credential_name: str
     origin: str | None = None
+    provider: str | None = None
 
 
 class CredentialAccountInfo(BaseModel):
     model_config = ConfigDict(frozen=True)
     cube_account_id: Identifier
+    cube_provider_id: Annotated[str, Field(pattern=r"^[a-z](?:[a-z0-9_-]{0,62}[a-z0-9])?$")] | None = None
     cube_allowed_origins: Annotated[tuple[str, ...], Field(min_length=1)]
 
 
@@ -177,7 +179,10 @@ def resolve_account_credential(
 
     return ResolvedAccountCredential(
         binding=AccountRouteBinding(
-            account_id=policy.account_id, credential_name=credential.credential_name, origin=origin
+            account_id=policy.account_id,
+            credential_name=credential.credential_name,
+            origin=origin,
+            provider=info.cube_provider_id,
         ),
         headers=MappingProxyType({header.name: header_value(header) for header in policy.headers}),
     )

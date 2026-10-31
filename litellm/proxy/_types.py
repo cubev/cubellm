@@ -4070,6 +4070,7 @@ class SpendLogsRouterMetadata(TypedDict):
 
 
 class SpendLogsMetadata(TypedDict):
+    provider_account_provider: NotRequired[ReadOnly[str | None]]
     provider_origin: NotRequired[ReadOnly[str | None]]
     provider_account_id: NotRequired[ReadOnly[str | None]]
     provider_account_source: NotRequired[ReadOnly[Literal["configured_credential"] | None]]

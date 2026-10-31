@@ -157,6 +157,7 @@ _STAMPED_METADATA_KEYS: Final = frozenset(
         "autorouter_savings_estimate",
         "autorouter_baseline_observation",
         "user_api_key_application_id",
+        "provider_account_provider",
         "provider_origin",
         "provider_account_id",
         "provider_account_source",
@@ -197,6 +198,7 @@ def _get_spend_logs_metadata(
     )
     if metadata is None:
         return SpendLogsMetadata(
+            provider_account_provider=account_binding.provider if account_binding is not None else None,
             provider_origin=account_binding.origin if account_binding is not None else None,
             provider_account_id=account_id,
             provider_account_source=account_source,
@@ -254,6 +256,7 @@ def _get_spend_logs_metadata(
             {key: metadata.get(key) for key in SpendLogsMetadata.__annotations__ if key not in _STAMPED_METADATA_KEYS}
         ),
         user_api_key_application_id=application_id,
+        provider_account_provider=account_binding.provider if account_binding is not None else None,
         provider_origin=account_binding.origin if account_binding is not None else None,
         provider_account_id=account_id,
         provider_account_source=account_source,

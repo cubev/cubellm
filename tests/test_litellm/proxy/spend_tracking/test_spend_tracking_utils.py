@@ -5497,7 +5497,10 @@ def test_provider_account_binding_requires_a_server_object_at_spend_writer(trust
     from litellm.proxy.pass_through_endpoints.account_credentials import AccountRouteBinding
 
     binding: Final = AccountRouteBinding(
-        account_id="selected-account", credential_name="fixture-credential", origin="https://selected.example"
+        account_id="selected-account",
+        credential_name="fixture-credential",
+        origin="https://selected.example",
+        provider="selected-provider",
     )
     now: Final = datetime.datetime.now(timezone.utc)
     payload: Final = get_logging_payload(
@@ -5505,6 +5508,7 @@ def test_provider_account_binding_requires_a_server_object_at_spend_writer(trust
             "model": "fixture-model",
             "litellm_params": {
                 "metadata": {
+                    "provider_account_provider": "forged-provider",
                     "provider_origin": "https://forged.example",
                     "provider_account_id": "forged-account",
                     "provider_account_source": "configured_credential",
@@ -5518,6 +5522,7 @@ def test_provider_account_binding_requires_a_server_object_at_spend_writer(trust
         end_time=now,
     )
     metadata: Final = json.loads(payload["metadata"])
+    assert metadata["provider_account_provider"] == ("selected-provider" if trusted else None)
     assert metadata["provider_origin"] == ("https://selected.example" if trusted else None)
     assert metadata["provider_account_id"] == ("selected-account" if trusted else None)
     assert metadata["provider_account_source"] == ("configured_credential" if trusted else None)

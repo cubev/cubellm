@@ -1616,6 +1616,7 @@ class LiteLLMProxyRequestSetup:
         stripped_metadata: Final = strip_callback_config(user_api_key_dict.metadata)
         auth_metadata: Final = cast("dict[str, str] | None", stripped_metadata)  # cast-ok: metadata is free-form JSON
         user_api_key_logged_metadata: Final = StandardLoggingUserAPIKeyMetadata(
+            provider_account_provider=None,
             provider_origin=None,
             provider_account_id=None,
             provider_account_source=None,

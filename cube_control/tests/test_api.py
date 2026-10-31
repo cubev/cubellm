@@ -150,6 +150,7 @@ class ApiTests(unittest.TestCase):
         response: Final = client.get("/api/v1/capabilities")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["schema_version"], 1)
+        self.assertEqual(response.json()["gateway_native_account_projection"], "credential_snapshot_v1")
         self.assertTrue(
             {"application_id", "deployment_id", "call_type", "completed_at", "duration_ms"}.issubset(
                 response.json()["gateway_projection_fields"]

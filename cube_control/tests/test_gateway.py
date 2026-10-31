@@ -1,12 +1,15 @@
+import json
 import os
 import unittest
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Final
+from hashlib import sha256
+from typing import Final, cast
 from uuid import uuid4
 
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from cube_control.gateway import (
     GatewayProjection,
@@ -167,6 +170,40 @@ class GatewayStoreTests(unittest.TestCase):
                 "SELECT count(*)::text FROM cube_control.gateway_changes WHERE source_id=%s", (self.source,)
             ).fetchone()
             return int(row[0]) if row else 0
+
+    def test_legacy_batch_replays_with_its_original_persisted_fingerprint(self) -> None:
+        batch: Final = self.batch(0)
+        legacy_fields: Final = (
+            "source_key",
+            "provider",
+            "account_id",
+            "application_id",
+            "deployment_id",
+            "call_type",
+            "model",
+            "occurred_at",
+            "source_updated_at",
+            "completed_at",
+            "duration_ms",
+            "status",
+            "amount_usd",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+        )
+        values: Final = cast(Mapping[str, JsonValue], self.record.model_dump(mode="json"))
+        legacy_record: Final = json.dumps({name: values[name] for name in legacy_fields}, separators=(",", ":"))
+        raw: Final = '{"scan":' + batch.scan.model_dump_json() + ',"records":[' + legacy_record + "]}"
+        self.assertEqual(batch.model_dump_json(), raw)
+        with self.general.connect() as connection:
+            connection.execute(
+                "INSERT INTO cube_control.gateway_scans(id,source_id,sequence,fingerprint,payload) "
+                "VALUES (%s,%s,1,%s,%s::jsonb)",
+                (batch.scan.scan_id, self.source, sha256(raw.encode()).hexdigest(), batch.scan.model_dump_json()),
+            )
+        result: Final = self.repository.import_batch(GatewayBatch.model_validate_json(raw))
+        self.assertEqual((result.status, result.sequence, self.changes()), ("duplicate", 1, 0))
 
     def test_retries_and_unchanged_rescans_do_not_duplicate_changes(self) -> None:
         batch: Final = self.batch(0)

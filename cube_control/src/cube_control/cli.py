@@ -26,6 +26,7 @@ from cube_control.github import collect_github
 from cube_control.heygen import collect_heygen
 from cube_control.media import JobCommand, PostgresJobManager
 from cube_control.models import GatewayBatch, ImportBatch, ManualCommand
+from cube_control.native_gateway import PROJECTION_COLUMNS, prepare_native_gateway
 from cube_control.openrouter import collect_openrouter
 from cube_control.provider_access import Unavailable, read_private_key
 from cube_control.store import PostgresRepository
@@ -54,6 +55,8 @@ def main() -> int:
     sub.add_parser("init")
     sub.add_parser("import-gateway")
     sub.add_parser("project-gateway")
+    sub.add_parser("project-native-gateway")
+    sub.add_parser("native-gateway-projection")
     sub.add_parser("prepare-edge")
     prepare_access_parser: Final = sub.add_parser("prepare-application")
     prepare_access_parser.add_argument("--state-directory", required=True, type=Path)
@@ -151,7 +154,10 @@ def main() -> int:
             return 2
         print(batch.model_dump_json())
         return 0
-    if args.command == "project-gateway":
+    if args.command == "native-gateway-projection":
+        print(json.dumps({"schema_version": 1, "columns": PROJECTION_COLUMNS}))
+        return 0
+    if args.command in {"project-gateway", "project-native-gateway"}:
         raw_projection: Final = sys.stdin.read(8_000_001)
         if len(raw_projection) > 8_000_000:
             print("Gateway projection exceeds size limit", file=sys.stderr)
@@ -161,7 +167,12 @@ def main() -> int:
         except ValidationError:
             print("Gateway projection rejected; source values are not logged", file=sys.stderr)
             return 2
-        print(prepare_gateway(projection).model_dump_json())
+        projected: Final = (
+            prepare_native_gateway(projection)
+            if args.command == "project-native-gateway"
+            else prepare_gateway(projection)
+        )
+        print(projected.model_dump_json())
         return 0
     if args.command == "collect-heygen":
         try:

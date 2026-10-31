@@ -7762,7 +7762,11 @@ def credential(
     return CredentialItem(
         credential_name=POLICY.credential_name,
         credential_values={"access value": value},
-        credential_info={"cube_account_id": account_id, "cube_allowed_origins": [origin]},
+        credential_info={
+            "cube_account_id": account_id,
+            "cube_allowed_origins": [origin],
+            "cube_provider_id": "fixture-provider",
+        },
     )
 
 
@@ -7782,6 +7786,7 @@ class SpendObserver(CustomLogger):
     def __init__(self) -> None:
         super().__init__()  # pyright: ignore[reportUnknownMemberType]  # legacy callback constructor
         self.records: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self.api_bases: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def async_log_success_event(
         self,
@@ -7796,6 +7801,7 @@ class SpendObserver(CustomLogger):
         metadata: Final = TypeAdapter(dict[str, object]).validate_json(payload["metadata"])
         if metadata.get("user_api_key_application_id") == "fixture-app":
             self.records.put_nowait(metadata)
+            self.api_bases.put_nowait(payload["api_base"])
 
 
 @pytest.fixture
@@ -7941,12 +7947,23 @@ async def test_native_relay_and_async_spend_callback_retain_both_identities(monk
         await register_route(endpoint, app, False, set())
         try:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
-                response: Final = await client.get("/account-wire-fixture")
+                response: Final = await client.request(
+                    "GET",
+                    "/account-wire-fixture",
+                    json={
+                        "custom_body": {
+                            "api_base": "https://forged.example/quota",
+                            "metadata": {"provider_account_provider": "forged-provider"},
+                        }
+                    },
+                )
             assert response.status_code == 200
             await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
             assert observer.records.qsize() == 1
+            assert observer.api_bases.get_nowait() == "https://vendor.example/quota?page=first"
             stored: Final = observer.records.get_nowait()
             assert stored["provider_origin"] == "https://vendor.example"
+            assert stored["provider_account_provider"] == "fixture-provider"
             assert stored["provider_account_id"] == "fixture-account"
             assert stored["user_api_key_application_id"] == "fixture-app"
             assert stored["provider_account_source"] == "configured_credential"

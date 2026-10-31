@@ -679,6 +679,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             _metadata["model_info"] = dict(deployment_model_info)
 
         _metadata["_cube_account_binding"] = account_binding
+        _metadata["provider_account_provider"] = account_binding.provider if account_binding is not None else None
         _metadata["provider_origin"] = account_binding.origin if account_binding is not None else None
         _metadata["provider_account_id"] = account_binding.account_id if account_binding is not None else None
         _metadata["provider_account_source"] = "configured_credential" if account_binding is not None else None

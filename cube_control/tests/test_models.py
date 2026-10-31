@@ -6,7 +6,15 @@ from typing import Final
 from pydantic import ValidationError
 
 from cube_control.api import reading_view
-from cube_control.models import Account, MediaJob, Observation, Provider, UsageEvent
+from cube_control.models import (
+    Account,
+    GatewayAccountEvidence,
+    GatewayRecord,
+    MediaJob,
+    Observation,
+    Provider,
+    UsageEvent,
+)
 from cube_control.store import StoredState
 from cube_control.summary import account_view, reservations, selected_spend
 
@@ -31,6 +39,25 @@ def observation(**changes: object) -> Observation:
 
 
 class ModelTests(unittest.TestCase):
+    def test_gateway_evidence_requires_a_matching_account_and_provider(self) -> None:
+        record: Final = GatewayRecord(
+            source_key="request",
+            provider="custom-provider",
+            account_id="custom-account",
+            model="unknown",
+            occurred_at=NOW,
+            status="succeeded",
+            account_evidence=GatewayAccountEvidence(
+                source="configured_credential",
+                provider="custom-provider",
+                origin="https://custom.example",
+                cost_status="unverified",
+            ),
+        )
+        for changes in ({"account_id": None}, {"provider": None}, {"provider": "another-provider"}):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                GatewayRecord.model_validate(record.model_dump() | changes)
+
     def test_budget_remainders_use_only_current_reports_with_matching_currency_and_period(self) -> None:
         account: Final = Account(id="example", provider="fixture", name="Fixture", kind="api")
         spend: Final = observation(external_id="spend", value="0.30000000000000000000000000001")

@@ -13,7 +13,15 @@ from playwright.sync_api import expect, sync_playwright
 from cube_control.api import create_app
 from cube_control.gateway_store import GatewayRepository
 from cube_control.github import RateLimits, quota_readings
-from cube_control.models import Account, GatewayBatch, GatewayRecord, GatewayScan, ImportBatch, Observation
+from cube_control.models import (
+    Account,
+    GatewayAccountEvidence,
+    GatewayBatch,
+    GatewayRecord,
+    GatewayScan,
+    ImportBatch,
+    Observation,
+)
 from cube_control.store import PostgresRepository
 from cube_control.usage import PostgresUsageReader
 
@@ -106,10 +114,21 @@ def main() -> None:
     ).ok:
         raise RuntimeError("Quota fixture import failed")
     now: Final = datetime(2026, 1, 15, tzinfo=UTC)
+    evidence_account: Final = Account(id="ui-" + uuid4().hex, provider=provider, name="Bound API fixture", kind="api")
+    if not repository.import_batch(ImportBatch(accounts=(evidence_account,))).ok:
+        raise RuntimeError("Evidence account fixture import failed")
+    evidence: Final = GatewayAccountEvidence(
+        source="configured_credential",
+        provider=provider,
+        origin="https://api.fixture.example",
+        cost_status="unverified",
+    )
     records: Final = tuple(
         GatewayRecord(
             source_key=f"request-{index:03d}",
             provider=provider,
+            account_id=evidence_account.id if index == 2 else None,
+            account_evidence=evidence if index == 2 else None,
             model='<img src=x onerror="window.unsafe=true">' if index == 0 else "fixture-model",
             occurred_at=now,
             status="unknown" if index == 1 else "succeeded",
@@ -186,7 +205,21 @@ def main() -> None:
                     raise AssertionError("Untrusted model name executed")
                 if page.evaluate("usageTime('2026-02-01T00:30:00+01:00')") != "2026-01-31T23:30:00.000Z":
                     raise AssertionError("Usage timestamp is not displayed in UTC")
+                bound_row: Final = page.locator("#usage-rows tr").filter(has_text=evidence_account.id)
+                expect(bound_row).to_have_count(1)
+                expect(bound_row).to_contain_text(provider)
+                bound_row.locator("summary").click()
+                expect(bound_row).to_contain_text("Kontonachweis: konfigurierter Zugangsschlüssel")
+                expect(bound_row).to_contain_text(f"Anbieterkennung: {provider}")
+                expect(bound_row).to_contain_text(evidence.origin)
+                expect(bound_row).to_contain_text("Anbieterkosten: ungeprüft")
+                bound_row.get_by_role("button", name="Korrekturverlauf laden").click()
+                expect(bound_row.locator("pre")).to_contain_text(f"Anbieterkennung: {provider}")
+                expect(bound_row.locator("pre")).to_contain_text(evidence.origin)
+                expect(bound_row.locator("pre")).to_contain_text("Anbieterkosten: ungeprüft")
+                bound_row.locator("summary").click()
                 page.locator("#usage-rows summary").first.click()
+                expect(page.locator("#usage-rows tr").first).to_contain_text("Kein Kontonachweis gespeichert")
                 page.get_by_role("button", name="Korrekturverlauf laden").first.click()
                 expect(page.locator("#usage-rows pre").first).to_contain_text("Version 3")
                 expect(page.locator("#usage-rows pre").first).to_contain_text("Gateway-USD: 0.2")
@@ -214,7 +247,9 @@ def main() -> None:
             thread.join(timeout=10)
             if thread.is_alive():
                 raise RuntimeError("Local browser test server did not stop")
-    print("Browser checks passed: exact decimals, unknowns, correction history, pagination, 390px, XSS and outages")
+    print(
+        "Browser checks passed: account provenance, exact decimals, unknowns, correction history, pagination, 390px, XSS and outages"
+    )
 
 
 if __name__ == "__main__":

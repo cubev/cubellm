@@ -14,6 +14,7 @@ from cube_control.models import FrozenModel, GatewayMetrics, GatewayRecord, Gate
 TrafficKind = Literal["provider_request", "gateway_management", "unknown"]
 PROVIDER_CALL_TYPES: Final = frozenset(
     {
+        "pass_through_endpoint",
         "completion",
         "acompletion",
         "text_completion",

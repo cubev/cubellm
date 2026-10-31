@@ -3,8 +3,16 @@ from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from typing import Annotated, Final, Literal, Self
+from urllib.parse import urlsplit
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
 ProviderId = Annotated[str, Field(pattern=r"^[a-z](?:[a-z0-9_-]{0,62}[a-z0-9])?$")]
@@ -286,6 +294,35 @@ class ManualFieldView(FrozenModel):
     changed_at: AwareDatetime
 
 
+def missing_evidence(value: object) -> bool:
+    return value is None
+
+
+class GatewayAccountEvidence(FrozenModel):
+    provider: ProviderId | None = Field(default=None, exclude_if=missing_evidence)
+    source: Literal["configured_credential"]
+    origin: Annotated[str, Field(min_length=1, max_length=2048)]
+    cost_status: Literal["unverified"]
+
+    @field_validator("origin")
+    @staticmethod
+    def require_origin(value: str) -> str:
+        parsed: Final = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or any(ord(character) < 33 or ord(character) > 126 for character in value)
+            or (parsed.port is not None and not 1 <= parsed.port <= 65535)
+        ):
+            raise ValueError("Account evidence requires a nonsecret HTTP origin")
+        return value
+
+
 class GatewayRecord(FrozenModel):
     source_key: Identifier
     provider: Provider | ProviderId | None = None
@@ -304,6 +341,20 @@ class GatewayRecord(FrozenModel):
     output_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
     cache_read_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
     cache_write_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
+
+    account_evidence: GatewayAccountEvidence | None = Field(default=None, exclude_if=missing_evidence)
+
+    @model_validator(mode="after")
+    def require_account_for_evidence(self) -> Self:
+        if self.account_evidence is not None and self.account_id is None:
+            raise ValueError("Account evidence requires an account identifier")
+        if (
+            self.account_evidence is not None
+            and self.account_evidence.provider is not None
+            and self.account_evidence.provider != self.provider
+        ):
+            raise ValueError("Account evidence provider must match request provider")
+        return self
 
     @field_validator("occurred_at", "source_updated_at", "completed_at")
     @staticmethod

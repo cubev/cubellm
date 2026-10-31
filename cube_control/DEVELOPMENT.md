@@ -330,3 +330,64 @@ Production native/companion services, credentials, routes and applications are
 unchanged. Production artifact compatibility, account-by-account enrollment,
 non-LLM application grants, provider-specific usage/billing reconciliation and
 actual LAN/Tailscale activation remain open under the full project goal.
+
+
+## Native-to-audit account provenance acceptance
+
+Native credentials can now carry `cube_provider_id` in addition to their account
+and allowed origins. The resolver captures that label with the same request-time
+credential snapshot. The shared metadata helper clears client provider claims,
+and the spend writer independently derives `provider_account_provider` from the
+actual binding object. The new native capability flag is
+`passthrough_account_provider: credential_metadata_v1`.
+
+The companion owns a shared whitelist SQL projection for native spend rows. Its
+`native-gateway-projection` CLI exports the versioned column contract, and
+`project-native-gateway` validates the resulting rows using the existing scan
+preparation, rejected-row counts and import journal semantics. Account leaves
+require the server source marker. Recorded target and origin must agree. Explicit
+captured provider labels support custom API domains without model/provider guessing;
+known vendor origins cannot be relabeled. Unsupported or contradictory rows are
+rejected individually. Catalogue matching still prevents cross-account imports.
+Bound generic HTTP placeholder token/cache zeros become unknown, and provider cost
+remains explicitly unverified. Gateway-reported amounts retain their separate basis.
+
+An additive account_evidence record reaches usage pages and immutable correction
+history. Origin, source, captured provider and cost status appear in the browser.
+The new optional fields are omitted when absent, including nested absent provider
+labels; legacy record/batch serialization remains byte-compatible. A PostgreSQL
+regression seeds an already-confirmed scan with the original fingerprint and
+verifies duplicate acknowledgment. Deliberately adding the null field makes that
+regression fail; restoring field exclusion makes it pass. A model invariant rejects
+account evidence without an account or with a conflicting record provider.
+
+The full companion suite passes 147 tests against isolated PostgreSQL. Native
+projection tests execute the real SQL over temporary native-shaped tables, verify
+arbitrary provider labels, untrusted scalar/target refusal, missing measurements,
+secret-free output, CLI contract export/projection without database configuration,
+actual catalogue-checked imports, filtered usage HTTP responses and correction
+history. The native combined security/capability/provenance selection passes 115
+tests (1153 deselected), including invalid-provider and snapshot cases. The actual
+native relay/callback fixture retains the vault's provider label and the real
+outbound URL even when the request supplies forged provider and api_base values.
+An initial URL assertion omitted the fixture's default query; it was corrected to
+include that query. No URL-forgery vulnerability or fix is claimed from that assertion.
+
+Chromium checks pass desktop and 390px views, explicit captured-provider/account
+proof in current rows and history, absent proof on old rows, exact decimal values,
+unknowns, pagination, stale snapshots, XSS refusal and outages. Node source-error
+checks also pass. The source distribution and companion wheel build; a fresh
+installation of that wheel exports the SQL contract, projects a custom-provider
+row with unknown counters and includes the new UI asset. Changed runtime modules,
+new projection tests, browser harness, native account module and mapped pure/capability
+tests pass strict typing and Ruff. New native relay fixture bodies also pass isolated
+strict checking. No repository-wide native typing claim or budget change is made.
+
+The companion declares Pydantic >=2.12 for field-level exclude_if. This preserves
+the record's API schema as well as legacy serialization. No database schema rewrite
+is required. No native gateway wheel/image was built in this step, and no production
+service, provider token, gateway route, key, collector or application was changed.
+The existing resident producer still uses its older projection until a coordinated
+native/companion/source activation. Actual enrollment, vendor billing/usage parsers,
+real media jobs, LAN/Tailscale, rotation and verified distributed revocation remain
+open under the full all-account goal.
