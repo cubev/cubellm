@@ -15,6 +15,7 @@ from cube_control.api import create_app
 from cube_control.edge import GatewayEdgeSpec, render_gateway_edge
 from cube_control.gateway import GatewayProjectionBatch, prepare_gateway
 from cube_control.gateway_store import GatewayRepository
+from cube_control.heygen import collect_heygen
 from cube_control.media import JobCommand, PostgresJobManager
 from cube_control.models import GatewayBatch, ImportBatch, ManualCommand
 from cube_control.openrouter import collect_openrouter
@@ -58,6 +59,10 @@ def main() -> int:
     collect_parser.add_argument("--config", required=True, type=Path)
     collect_parser.add_argument("--account-id", default="openrouter-api")
     collect_parser.add_argument("--account-name", default="OpenRouter API")
+    heygen_parser: Final = sub.add_parser("collect-heygen")
+    heygen_parser.add_argument("--config", required=True, type=Path)
+    heygen_parser.add_argument("--account-id", default="heygen-api")
+    heygen_parser.add_argument("--account-name", default="HeyGen API")
     import_parser: Final = sub.add_parser("import")
     import_parser.add_argument("path", nargs="?", default="-")
     serve_parser: Final = sub.add_parser("serve")
@@ -98,6 +103,16 @@ def main() -> int:
             print("Gateway projection rejected; source values are not logged", file=sys.stderr)
             return 2
         print(prepare_gateway(projection).model_dump_json())
+        return 0
+    if args.command == "collect-heygen":
+        try:
+            heygen_batch: Final = collect_heygen(
+                args.config, datetime.now(UTC), account_id=args.account_id, account_name=args.account_name
+            )
+        except ValidationError:
+            print("Provider account rejected; input values are not logged", file=sys.stderr)
+            return 2
+        print(heygen_batch.model_dump_json())
         return 0
     dsn: Final[str] = os.environ.get("CUBE_CONTROL_DATABASE_URL", "")
     if not dsn:

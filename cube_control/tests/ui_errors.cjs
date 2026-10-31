@@ -24,4 +24,9 @@ for (const override of [
 assert.equal(context.unresolvedError({reading: {...error.reading, window: 'Other'}}, [good], now), true);
 assert.equal(context.unresolvedError({reading: {...error.reading, status: 'not_configured'}}, [good], now), false);
 assert.equal(context.unresolvedError(good, [good], now), false);
+assert.equal(context.number('0.00000000000000000000000000001', 'USD'), '0.00000000000000000000000000001 USD');
+assert.equal(context.number('9007199254740993.00001', 'credits'), '9007199254740993.00001 credits');
+assert.equal(context.number('-0.00001', 'EUR'), '-0.00001 EUR');
+assert.equal(context.number('0', 'USD'), '0 USD');
+assert.equal(context.number(null, 'USD'), 'unbekannt');
 console.log('UI source-wide error recovery, ties, independent sources and clock-skew checks passed');

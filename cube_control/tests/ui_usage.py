@@ -12,7 +12,7 @@ from playwright.sync_api import expect, sync_playwright
 
 from cube_control.api import create_app
 from cube_control.gateway_store import GatewayRepository
-from cube_control.models import GatewayBatch, GatewayRecord, GatewayScan
+from cube_control.models import Account, GatewayBatch, GatewayRecord, GatewayScan, ImportBatch, Observation
 from cube_control.store import PostgresRepository
 from cube_control.usage import PostgresUsageReader
 
@@ -27,6 +27,41 @@ def main() -> None:
     repository.initialize()
     source: Final = "browser-" + uuid4().hex
     provider: Final = "fixture-" + uuid4().hex
+    exact_value: Final = "9007199254740993.000000000000000000000000001"
+    account: Final = Account(id="ui-" + uuid4().hex, provider="heygen", name="Exact billing " + uuid4().hex, kind="api")
+    checked: Final = datetime.now(UTC)
+    if not repository.import_batch(
+        ImportBatch(
+            accounts=(account,),
+            observations=(
+                Observation(
+                    account_id=account.id,
+                    external_id="wallet",
+                    metric="balance",
+                    window="API-Wallet",
+                    status="known",
+                    source="provider_api",
+                    observed_at=checked,
+                    collected_at=checked,
+                    value=Decimal(exact_value),
+                    unit="USD",
+                ),
+                Observation(
+                    account_id=account.id,
+                    external_id="cap",
+                    metric="spending_cap",
+                    window="Anbieterperiode",
+                    status="known",
+                    source="provider_api",
+                    observed_at=checked,
+                    collected_at=checked,
+                    value=Decimal("12.34"),
+                    unit="USD",
+                ),
+            ),
+        )
+    ).ok:
+        raise RuntimeError("Exact billing fixture import failed")
     now: Final = datetime(2026, 1, 15, tzinfo=UTC)
     records: Final = tuple(
         GatewayRecord(
@@ -86,6 +121,9 @@ def main() -> None:
                 )
                 page: Final = browser.new_page(viewport={"width": 1440, "height": 1000})
                 page.goto(f"http://127.0.0.1:{listener.getsockname()[1]}")
+                account_card: Final = page.locator("#accounts .card").filter(has_text=account.name)
+                expect(account_card).to_contain_text(exact_value + " USD")
+                expect(account_card).to_contain_text("Anbieter-Ausgabenlimit")
                 page.locator("#usage-period").fill("2026-01")
                 page.locator("#usage-provider").fill(provider)
                 page.get_by_role("button", name="Aufrufe laden", exact=True).click()

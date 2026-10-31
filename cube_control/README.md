@@ -308,3 +308,41 @@ account metadata. Register custom accounts before importing failure-only reports
 ```sh
 python -m cube_control collect-openrouter --config /private/account-one.env --account-id account-one --account-name 'Account one'
 ```
+
+## HeyGen account reader
+
+`collect-heygen --config /private/heygen.env` reads `HEYGEN_API_KEY` from a private
+regular file owned by the current user. Symlinks, special files, permissive
+modes, duplicate assignments and oversized configs are rejected before any
+provider request. The reader only calls `GET https://api.heygen.com/v3/users/me`,
+with redirects and environment proxies disabled and a bounded response body.
+HeyGen documents `account:read` for this endpoint. The collector never generates
+videos, rotates keys, changes billing or transmits profile fields into the import
+
+`--account-id` and `--account-name` keep multiple accounts separate. Register
+custom accounts before importing failure-only reports. API failures preserve
+unknown values and fixed reporting windows, so old wallet or credit-pool values
+are superseded when the billing type changes. The read-only CLI emits an import
+batch; it does not install a collector or change the production database
+
+Wallet balances preserve their reported USD or credit unit. Subscription premium
+and add-on credit pools stay separate, with independent reset times. Metered
+usage and its spending cap remain provider-period measurements with no fabricated
+month. `spending_cap` is a separate currency metric, not a monthly manual budget.
+Inactive or null fields stay unknown; zero is a known value. A successful profile
+response verifies API access, not per-request usage or invoice reconciliation
+
+The contract was checked on 2026-10-31 against HeyGen's
+[account profile documentation](https://developers.heygen.com/user-profile) and
+[permission scopes](https://developers.heygen.com/docs/api-key-permissions).
+Legacy quota conversion is not applied to the v3 credit values. Local tests use
+synthetic HTTP responses; a real account report still requires an available
+API key with the documented read permission. Deploy a reader accepting the new
+metric before enabling any producer that emits it
+
+Provider JSON numbers are decoded directly into Decimal rather than a binary
+float. OpenRouter balance subtraction also expands decimal precision to preserve
+all supplied digits within its validated input bounds. Original account amounts
+and counters display their decimal strings in the overview and request explorer.
+The optional remaining-budget calculation in the browser is explicitly labelled
+rounded. Long amounts and account names wrap in the mobile layout

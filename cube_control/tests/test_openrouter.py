@@ -1,4 +1,5 @@
 import tempfile
+import os
 import unittest
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -114,6 +115,37 @@ class OpenRouterTests(unittest.TestCase):
         self.assertIsInstance(result, Credits)
         if isinstance(result, Credits):
             self.assertEqual(result.total_credits - result.total_usage, Decimal(-2))
+
+    def test_provider_json_and_balance_preserve_digits_beyond_default_decimal_precision(self) -> None:
+        raw: Final = (
+            b'{"data":{"total_credits":0.12345678901234567890123456789,"total_usage":0.00000000000000000000000000001}}'
+        )
+        result: Final = fetch_credits(
+            SecretStr("test"), httpx.MockTransport(lambda _: httpx.Response(200, content=raw))
+        )
+        self.assertIsInstance(result, Credits)
+        with tempfile.TemporaryDirectory() as directory:
+            path: Final = Path(directory) / "provider.env"
+            path.write_text("OPENROUTER_MANAGEMENT_KEY=fixture\n")
+            path.chmod(0o600)
+            batch: Final = collect_openrouter(path, NOW, lambda _: result)
+            self.assertEqual(batch.observations[0].value, Decimal("0.12345678901234567890123456788"))
+            self.assertEqual(batch.observations[1].value, Decimal("0.00000000000000000000000000001"))
+
+    def test_symlinks_special_files_and_oversized_configs_are_never_read_as_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path: Final = Path(directory) / "provider.env"
+            path.write_text("OPENROUTER_MANAGEMENT_KEY=fixture\n")
+            path.chmod(0o600)
+            link: Final = Path(directory) / "link.env"
+            link.symlink_to(path)
+            self.assertIsInstance(read_management_key(link), Unavailable)
+            fifo: Final = Path(directory) / "fifo.env"
+            os.mkfifo(fifo, 0o600)
+            self.assertIsInstance(read_management_key(fifo), Unavailable)
+            self.assertIsInstance(read_management_key(Path(directory)), Unavailable)
+            path.write_text("OPENROUTER_MANAGEMENT_KEY=fixture\n" + "x" * 65536)
+            self.assertIsInstance(read_management_key(path), Unavailable)
 
     def test_incomplete_assignment_and_duplicate_key_are_safe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

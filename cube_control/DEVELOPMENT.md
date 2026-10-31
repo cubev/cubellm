@@ -12,7 +12,7 @@ Scope reconciled on 2026-10-31 against this service, the gateway code, ServiceIn
 | Deployment | Existing build, backup, rollback and activation watchdog tools in CubeUsageBar | Run updated artifact tests before a rollout; retain gateway and database isolation |
 | Browser overview | Account filters, fleet, gateway totals and native editing links exist | Cover refresh failures, rollover, source outages and job monitoring without presenting cached values as current |
 | Mobile access and persistent collection | Trusted bridges, resident collectors and tested private-edge preparation exist | Verify actual off-LAN activation, app authentication and independent sources; do not claim a desktop source works while its host is off |
-| HeyGen API | Included by the owner's all-accounts requirement on 2026-10-31 | Inspect existing authorized access, add routing and usage support, and verify real behavior |
+| HeyGen API | V3 read-only wallet, separate subscription pools and metered usage/cap reader passes local HTTP tests | Obtain existing authorized API access, verify live account behavior, add routing and per-job usage reconciliation |
 | Anthropic individual-account admin billing | Existing source documents unsupported account type | Keep unavailable; prior account-conversion deferral remains in force |
 
 ## Verification baseline
@@ -40,3 +40,15 @@ The next integration must project authenticated application identity at request 
 ## Local acceptance for media records
 
 Eight media tests cover concurrent edits, immutable retry identity, imported baselines, atomic rejection of collector overwrites, reservation expiry, cross-account isolation, paginated HTTP reads, exact decimals and actual CLI subprocesses. The full companion suite passes 86 tests with a dedicated PostgreSQL database and no skips on this test host. Chromium and source-error browser regressions still pass. No vendor job was created and no live billing claim follows from these fixtures
+
+## Provider precision and account isolation
+
+OpenRouter collection now supports explicit independent account IDs. Both provider readers retain numeric JSON precision, reject unsafe key files and avoid exporting credentials. HeyGen v3 billing modes, null versus zero, credit resets, billing-mode changes, HTTP failures and bounded streaming reads are covered locally. No live HeyGen account report or routed application has been verified. The current static overview preserves supplied decimal strings; its optional remaining-budget calculation is labelled rounded
+
+The provider increment passes 96 companion tests on the isolated PostgreSQL host.
+The Chromium regression now also exercises a long account name, an exact amount
+beyond JavaScript integer precision, the spending-cap display and a 390px layout.
+New provider, CLI and model modules pass strict type checks. The unchanged ten
+strict-type diagnostics in the existing store module were reproduced against its
+previous committed version; this increment does not claim a clean repository-wide
+type check or a complete native gateway test run

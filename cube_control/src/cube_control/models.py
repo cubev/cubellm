@@ -37,7 +37,7 @@ class Account(FrozenModel):
 class Observation(FrozenModel):
     account_id: Identifier
     external_id: Identifier
-    metric: Literal["spend", "budget", "balance", "limit", "recurring_cost", "usage"]
+    metric: Literal["spend", "budget", "balance", "limit", "recurring_cost", "usage", "spending_cap"]
     window: Annotated[str, Field(min_length=1, max_length=80)]
     status: Literal["known", "manual", "estimated", "unknown", "error", "not_configured"]
     source: Literal["provider_api", "local_collector", "manual", "import"]
@@ -60,7 +60,7 @@ class Observation(FrozenModel):
         if self.value is not None and not self.value.is_finite():
             raise ValueError("Measurements must be finite")
         if (
-            self.metric in ("spend", "budget", "recurring_cost")
+            self.metric in ("spend", "budget", "recurring_cost", "spending_cap")
             and self.value is not None
             and self.unit not in ("USD", "EUR")
         ):
