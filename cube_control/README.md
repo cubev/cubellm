@@ -202,6 +202,18 @@ arbitrary client metadata is not evidence of an account or authenticated app.
 Custom provider identifiers are supported. No provider credential, request body,
 response body or raw gateway token belongs in a projection
 
+Claimed accounts must already exist, match the record's provider and be API
+accounts. An invalid claim rejects the entire scan before it advances. The
+account overview only shows request totals for explicit matching account IDs;
+it never copies a provider total to every account at that provider. The provider
+total includes assigned requests and must not be added to account subtotals
+
+Gateway record timestamps are canonical UTC values, so a source session timezone
+change does not create a false correction. `GET /api/v1/capabilities` advertises
+the supported gateway projection fields before a new collector is enabled.
+Existing materialized pending batches must finish unchanged before collecting
+a new projection
+
 The audit covers retained completed gateway rows, with one row per source and
 request reference. Independent sources may overlap. It cannot reconstruct
 direct provider calls, removed logs, missing stream completion usage or unobserved

@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from cube_control.api import create_app
 from cube_control.gateway_store import GatewayRepository
-from cube_control.models import GatewayBatch, GatewayRecord, GatewayScan
+from cube_control.models import Account, GatewayBatch, GatewayRecord, GatewayScan, ImportBatch
 from cube_control.store import PostgresRepository
 from cube_control.usage import PostgresUsageReader, UsageFailure, UsageHistory, UsagePage, UsageQuery
 
@@ -40,6 +40,15 @@ class UsageStoreTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.source = "usage-" + uuid4().hex
+        registered: Final = self.repository.import_batch(
+            ImportBatch(
+                accounts=(
+                    Account(id="account-one", provider="custom-provider", name="First fixture", kind="api"),
+                    Account(id="account-two", provider="other-provider", name="Second fixture", kind="api"),
+                )
+            )
+        )
+        self.assertTrue(registered.ok)
         self.record = GatewayRecord(
             source_key="request-1",
             provider="custom-provider",

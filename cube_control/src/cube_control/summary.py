@@ -3,6 +3,7 @@ from decimal import Decimal
 from itertools import groupby
 from typing import Final
 
+from cube_control.gateway import gateway_metrics
 from cube_control.manual import active_fields, effective_account, effective_readings
 from cube_control.models import Account, AccountView, MediaJob, Observation, UsageEvent
 from cube_control.store import StoredState
@@ -74,9 +75,14 @@ def account_view(account: Account, state: StoredState, now: datetime, period: st
     events: Final[tuple[UsageEvent, ...]] = tuple(
         e for e in state.events if e.account_id == account.id and e.period == period
     )
+    gateway_records: Final = tuple(
+        record
+        for record in state.gateway_records
+        if record.account_id == account.id and record.provider == account.provider and account.kind == "api"
+    )
     return AccountView(
         account=effective_account(account, fields),
-        gateway=None,
+        gateway=gateway_metrics(gateway_records, account.provider, period) if gateway_records else None,
         automatic_account=account,
         manual_fields=fields,
         manually_created=any(

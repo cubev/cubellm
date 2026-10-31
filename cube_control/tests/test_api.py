@@ -1,6 +1,7 @@
 import unittest
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Final
 
 from fastapi.testclient import TestClient
@@ -35,6 +36,30 @@ class FixedRepository:
 
 
 class ApiTests(unittest.TestCase):
+    def test_explicit_account_attribution_is_never_copied_to_other_provider_accounts(self) -> None:
+        now: Final = datetime(2026, 1, 5, tzinfo=UTC)
+        accounts: Final = tuple(
+            Account(id=f"account-{index}", provider=Provider.OPENROUTER, name=f"Account {index}", kind="api")
+            for index in range(2)
+        )
+        assigned: Final = GatewayRecord(
+            source_key="assigned",
+            provider=Provider.OPENROUTER,
+            account_id=accounts[0].id,
+            model="test",
+            occurred_at=now,
+            status="succeeded",
+            amount_usd=Decimal("0.30"),
+        )
+        unassigned: Final = assigned.model_copy(update={"source_key": "unassigned", "account_id": None})
+        state: Final = StoredState(accounts, (), (), (), gateway_records=(assigned, unassigned))
+        client: Final = TestClient(create_app(FixedRepository(snapshot=state), clock=lambda: now))
+        rows: Final = client.get("/api/v1/summary").json()["accounts"]
+        self.assertEqual(rows[0]["data"]["gateway"]["calls"], 1)
+        self.assertEqual(rows[0]["data"]["gateway"]["reported_usd"], "0.30")
+        self.assertIsNone(rows[1]["data"]["gateway"])
+        self.assertTrue(all(row["data"]["selected_spend"] is None for row in rows))
+
     def test_summary_excludes_outage_masked_spend_until_provider_recovers(self) -> None:
         now: Final = datetime(2026, 1, 5, tzinfo=UTC)
         account: Final = Account(id="example", provider=Provider.OPENAI, name="Example", kind="api")
@@ -119,6 +144,18 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
         self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_capabilities_advertise_supported_gateway_projection_without_writes(self) -> None:
+        client: Final = TestClient(create_app(FixedRepository()))
+        response: Final = client.get("/api/v1/capabilities")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["schema_version"], 1)
+        self.assertTrue(
+            {"application_id", "deployment_id", "call_type", "completed_at", "duration_ms"}.issubset(
+                response.json()["gateway_projection_fields"]
+            )
+        )
+        self.assertEqual(client.post("/api/v1/capabilities", json={}).status_code, 405)
 
     def test_health_fails_when_database_is_unavailable(self) -> None:
         client: Final[TestClient] = TestClient(create_app(FixedRepository(available=False)))

@@ -4,7 +4,7 @@ from enum import StrEnum
 from hashlib import sha256
 from typing import Annotated, Final, Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
 ProviderId = Annotated[str, Field(pattern=r"^[a-z](?:[a-z0-9_-]{0,62}[a-z0-9])?$")]
@@ -283,6 +283,11 @@ class GatewayRecord(FrozenModel):
     output_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
     cache_read_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
     cache_write_tokens: Annotated[int, Field(ge=0, strict=True)] | None = None
+
+    @field_validator("occurred_at", "source_updated_at", "completed_at")
+    @staticmethod
+    def utc_timestamp(value: datetime | None) -> datetime | None:
+        return value.astimezone(UTC) if value is not None else None
 
 
 class GatewayScan(FrozenModel):

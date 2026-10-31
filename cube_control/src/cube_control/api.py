@@ -55,6 +55,19 @@ class SummaryResponse(BaseModel):
     gateway_providers: tuple[ProviderGatewayView, ...] = ()
 
 
+class CapabilitiesResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    schema_version: Literal[1] = 1
+    gateway_projection_fields: tuple[str, ...] = (
+        "account_id",
+        "application_id",
+        "deployment_id",
+        "call_type",
+        "completed_at",
+        "duration_ms",
+    )
+
+
 def reading_view(reading: Observation, observations: tuple[Observation, ...], now: datetime) -> ReadingView:
     return ReadingView(
         reading=reading,
@@ -83,6 +96,9 @@ def create_app(
     def health() -> JSONResponse:
         ready: Final[bool] = repository.healthy()
         return JSONResponse({"status": "ok" if ready else "unavailable"}, status_code=200 if ready else 503)
+
+    def capabilities() -> CapabilitiesResponse:
+        return CapabilitiesResponse()
 
     def summary() -> SummaryResponse:
         try:
@@ -152,6 +168,7 @@ def create_app(
 
     app.middleware("http")(response_headers)
     app.add_api_route("/healthz", health, methods=["GET"])
+    app.add_api_route("/api/v1/capabilities", capabilities, methods=["GET"], response_model=CapabilitiesResponse)
     app.add_api_route("/api/v1/summary", summary, methods=["GET"], response_model=SummaryResponse)
     app.add_api_route("/api/v1/fleet", fleet, methods=["GET"], response_model=FleetSnapshot | None)
     app.add_api_route("/api/v1/usage", usage, methods=["GET"], response_model=UsagePage)

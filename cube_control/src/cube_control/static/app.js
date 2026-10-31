@@ -66,6 +66,7 @@ function renderAccounts() {
   if(!current.length&&!spend)card.append(element("p","empty","Noch keine verifizierten aktuellen Werte"));
   for(const [currency,value] of Object.entries(data.proxy_amounts)) {metric(card,"Beobachteter Proxy-Verbrauch",number(value,currency),true);card.append(element("p","explanation","Separat erfasst. Wird nicht zum Anbieterbericht addiert."));}
   for(const [unit,value] of Object.entries(data.open_reservations))metric(card,"Für laufende Aufträge reserviert",number(value,unit),true);
+  if(data.gateway)gatewayAccount(card,data.gateway);
   const errors=item.readings.filter(v=>unresolvedError(v,item.readings));
   if(errors.length)card.append(element("p","explanation error",errors[0].reading.message||"Datenquelle nicht verfügbar"));
   if(account.note)card.append(element("p","explanation",account.note));
@@ -91,7 +92,7 @@ function renderGateway(data) {
  for(const provider of data.gateway_providers||[]){
   if(!provider.metrics.calls)continue;
   const row=element("div","provider-gateway");
-  row.append(element("h3","",names[provider.provider]||provider.provider),element("p","explanation","Anbieter gesamt. Keinem einzelnen Konto zugeordnet."));
+  row.append(element("h3","",names[provider.provider]||provider.provider),element("p","explanation","Anbieter gesamt, einschließlich zugeordneter Konten. Nicht zu den Kontowerten addieren."));
   gatewayAccount(row,provider.metrics);$("gateway-sources").append(row);
  }
  const unknown=data.gateway_unassigned;

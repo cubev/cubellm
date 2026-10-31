@@ -19,7 +19,7 @@ Scope reconciled on 2026-10-31 against this service, the gateway code, ServiceIn
 
 Run `PYTHONPATH=src python -m unittest discover -s tests -v` in this directory. Database tests require a dedicated database named `cubecontrol_test`, owned by a non-administrator application role. Never run them against either production database
 
-Run `node tests/ui_errors.cjs` for the browser source-error regression. Run Ruff on changed Python files, review the diff, and record which live checks could actually run. Commit completed increments separately. External push is pending the automatic review's explicit destination approval
+Run `node tests/ui_errors.cjs` for the browser source-error regression. Run Ruff on changed Python files, review the diff, and record which live checks could actually run. Commit completed increments separately. Keep production activation separate from local acceptance and use the existing build, database-test, backup and guarded activation gates
 
 ## Current increment
 

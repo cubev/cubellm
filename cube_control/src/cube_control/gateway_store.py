@@ -83,6 +83,18 @@ class GatewayRepository:
                 sequence: Final[int] = int(head[0]) if head else 0
                 if sequence != batch.scan.expected_sequence:
                     return GatewayResult("conflict", sequence, message="Refresh source before another scan")
+                claims: Final = frozenset(
+                    (record.account_id, record.provider) for record in batch.records if record.account_id is not None
+                )
+                if any(
+                    connection.execute(
+                        "SELECT payload->>'provider',payload->>'kind' FROM cube_control.accounts WHERE id=%s",
+                        (account_id,),
+                    ).fetchone()
+                    != (provider, "api")
+                    for account_id, provider in claims
+                ):
+                    return GatewayResult("rejected", message="Gateway attribution requires a matching API account")
                 next_sequence: Final = sequence + 1
                 connection.execute(
                     "INSERT INTO cube_control.gateway_scans(id,source_id,sequence,fingerprint,payload) "

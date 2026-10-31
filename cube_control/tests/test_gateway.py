@@ -1,7 +1,7 @@
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Final
 from uuid import uuid4
@@ -16,7 +16,7 @@ from cube_control.gateway import (
     projected_record,
 )
 from cube_control.gateway_store import GatewayRepository
-from cube_control.models import GatewayBatch, GatewayRecord, GatewayScan, Provider
+from cube_control.models import Account, GatewayBatch, GatewayRecord, GatewayScan, ImportBatch, Provider
 from cube_control.store import PostgresRepository
 
 NOW: Final = datetime.now(UTC)
@@ -176,6 +176,26 @@ class GatewayStoreTests(unittest.TestCase):
         self.assertEqual((result.status, result.changed), ("applied", 0))
         self.assertEqual(self.changes(), 1)
 
+    def test_invalid_account_attribution_rejects_scan_atomically(self) -> None:
+        account: Final = Account(id=self.source + "-api", provider=Provider.OPENROUTER, name="Fixture", kind="api")
+        subscription: Final = Account(
+            id=self.source + "-subscription", provider=Provider.OPENROUTER, name="Fixture", kind="subscription"
+        )
+        self.assertTrue(self.general.import_batch(ImportBatch(accounts=(account, subscription))).ok)
+        for changes in (
+            {"account_id": self.source + "-missing"},
+            {"account_id": subscription.id},
+            {"account_id": account.id, "provider": Provider.OPENAI},
+            {"account_id": account.id, "provider": None},
+        ):
+            with self.subTest(changes=changes):
+                result: Final = self.repository.import_batch(self.batch(0, self.record.model_copy(update=changes)))
+                self.assertEqual(result.status, "rejected")
+                self.assertEqual(self.changes(), 0)
+        valid: Final = self.record.model_copy(update={"account_id": account.id})
+        self.assertEqual(self.repository.import_batch(self.batch(0, valid)).status, "applied")
+        self.assertEqual(self.mirror().account_id, account.id)
+
     def test_latest_scan_keeps_advancing_past_single_digit_sequences(self) -> None:
         scan_count: Final = 12
         for sequence in range(scan_count):
@@ -193,6 +213,21 @@ class GatewayStoreTests(unittest.TestCase):
             self.assertEqual(result.status, "applied")
         self.assertEqual(self.mirror().amount_usd, Decimal("0.10"))
         self.assertEqual(self.changes(), 3)
+
+    def test_equivalent_timestamp_offsets_do_not_create_false_corrections(self) -> None:
+        original: Final = self.batch(0)
+        self.assertEqual(self.repository.import_batch(original).status, "applied")
+        other_zone: Final = timezone(timedelta(hours=2))
+        equivalent: Final = GatewayRecord.model_validate(
+            self.record.model_dump()
+            | {
+                "occurred_at": self.record.occurred_at.astimezone(other_zone),
+                "source_updated_at": NOW.astimezone(other_zone),
+            }
+        )
+        result: Final = self.repository.import_batch(self.batch(1, equivalent))
+        self.assertEqual((result.status, result.changed), ("applied", 0))
+        self.assertEqual(self.changes(), 1)
 
     def test_attribution_change_moves_call_instead_of_double_counting(self) -> None:
         self.assertEqual(
