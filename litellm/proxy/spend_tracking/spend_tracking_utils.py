@@ -1095,6 +1095,15 @@ _SENSITIVE_REQUEST_BODY_KEYS: Final = frozenset(
         "access_token",
         "api_token",
         "client_secret",
+        "api_secret",
+        "secret_key",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "refresh_token",
+        "private_key",
+        "password",
+        "xi-api-key",
+        "credential_values",
     }
 )
 _CREDENTIAL_KEY_START_PATTERN: Final = re.compile(
@@ -1174,11 +1183,7 @@ def _sanitize_request_body_for_spend_logs_payload(
             return value
         return value
 
-    return {
-        k: _sanitize_value(v)
-        for k, v in request_body.items()
-        if k.casefold() not in _SENSITIVE_REQUEST_BODY_KEYS
-    }
+    return {k: _sanitize_value(v) for k, v in request_body.items() if k.casefold() not in _SENSITIVE_REQUEST_BODY_KEYS}
 
 
 # Quoted-key form: ``"input"`` / ``'messages'`` / ``"prompt"`` followed by

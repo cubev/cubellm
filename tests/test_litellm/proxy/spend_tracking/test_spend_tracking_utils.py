@@ -83,10 +83,16 @@ def test_classifier_audit_spend_storage_obeys_privacy_and_truncation(monkeypatch
         "classifier_input": {"system": "rubric" * 1000, "messages": [{"role": "user", "content": "ask"}]},
         "originating_request_masked": {"input": "source-only", "api_key": "REDACTED"},
     }
-    stored: Final = json.loads(_get_proxy_server_request_for_spend_logs_payload(
-        metadata={}, litellm_params={"proxy_server_request": {"body": {"model": "classifier"}}},
-        kwargs={"standard_logging_object": audit, "standard_callback_dynamic_params": {"turn_off_message_logging": redact}},
-    ))
+    stored: Final = json.loads(
+        _get_proxy_server_request_for_spend_logs_payload(
+            metadata={},
+            litellm_params={"proxy_server_request": {"body": {"model": "classifier"}}},
+            kwargs={
+                "standard_logging_object": audit,
+                "standard_callback_dynamic_params": {"turn_off_message_logging": redact},
+            },
+        )
+    )
     if not store_prompts or redact:
         assert "classifier_input" not in stored
         assert "originating_request_masked" not in stored
@@ -212,9 +218,7 @@ def test_batch_lifecycle_rows_derive_the_same_session_from_the_batch_id():
     from litellm.proxy.spend_tracking.spend_tracking_utils import _get_batch_trace_session_id
 
     create_session: Final = _get_batch_trace_session_id(call_type="acreate_batch", request_id="batch-uid-1")
-    cost_session: Final = _get_batch_trace_session_id(
-        call_type="aretrieve_batch", request_id="batch-uid-1_batch_cost"
-    )
+    cost_session: Final = _get_batch_trace_session_id(call_type="aretrieve_batch", request_id="batch-uid-1_batch_cost")
     assert create_session == cost_session == "batch-uid-1"
 
 
@@ -4974,7 +4978,7 @@ ANTHROPIC_MESSAGES_SSE_CHUNKS: Final = (
     'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
     'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
     '"usage":{"output_tokens":4}}\n\n',
-    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
 )
 
 
@@ -5012,9 +5016,7 @@ def test_spend_log_request_id_is_the_message_id_a_non_streaming_messages_caller_
     """
     logging_obj = _anthropic_messages_logging_obj(stream=False)
 
-    logged_response = logging_obj._handle_anthropic_messages_response_logging(
-        result=ANTHROPIC_MESSAGES_RESPONSE
-    )
+    logged_response = logging_obj._handle_anthropic_messages_response_logging(result=ANTHROPIC_MESSAGES_RESPONSE)
 
     assert logged_response.id == "msg_01Lit6806NonStreaming"
     assert (
@@ -5090,9 +5092,7 @@ def test_spend_log_request_id_still_falls_back_to_litellm_call_id_without_a_prov
         end_time=datetime.datetime.now(timezone.utc),
         logging_obj=logging_obj,
     )
-    assert logging_obj.model_call_details["complete_streaming_response"].id == (
-        "6806cafe-0000-4000-8000-000000000001"
-    )
+    assert logging_obj.model_call_details["complete_streaming_response"].id == ("6806cafe-0000-4000-8000-000000000001")
 
 
 def test_spend_log_request_id_for_chat_completions_is_untouched():
@@ -5273,13 +5273,18 @@ def test_baseline_estimate_metadata_comes_from_the_logging_stamp() -> None:
     supplied: Final = MappingProxyType({"version": 1, "status": "estimated", "reason": "caller_supplied"})
     recorded: Final = MappingProxyType({"version": 1, "status": "unknown", "reason": "history_unavailable"})
     result: Final = _get_spend_logs_metadata(
-        {"autorouter_savings": 999.0, "autorouter_savings_estimate": supplied},  # mutable-ok: legacy metadata helper accepts dicts
+        {
+            "autorouter_savings": 999.0,
+            "autorouter_savings_estimate": supplied,
+        },  # mutable-ok: legacy metadata helper accepts dicts
         autorouter_savings=None,
         autorouter_savings_estimate=recorded,
     )
     assert result["autorouter_savings"] is None
     assert result["autorouter_savings_estimate"] == recorded
-    absent: Final = _get_spend_logs_metadata({"autorouter_savings_estimate": supplied})  # mutable-ok: legacy metadata helper accepts dicts
+    absent: Final = _get_spend_logs_metadata(
+        {"autorouter_savings_estimate": supplied}
+    )  # mutable-ok: legacy metadata helper accepts dicts
     assert absent["autorouter_savings_estimate"] is None
 
 
@@ -5296,6 +5301,15 @@ def test_request_credentials_are_removed_at_every_depth_without_changing_provide
         "access_token",
         "api_token",
         "client_secret",
+        "api_secret",
+        "secret_key",
+        "AWS_SECRET_ACCESS_KEY",
+        "aws_session_token",
+        "refresh_token",
+        "private_key",
+        "password",
+        "xi-api-key",
+        "credential_values",
         "SECRET_FIELDS",
     ):
         original: Final[dict[str, object]] = {
@@ -5313,6 +5327,37 @@ def test_request_credentials_are_removed_at_every_depth_without_changing_provide
             {key: marker, "keep": 1},
             {"headers": {key: marker, "content-type": "application/json"}},
         ]
+
+
+@pytest.mark.parametrize("store_prompts", (False, True))
+def test_native_credential_values_are_redacted_without_vendor_specific_field_names(store_prompts: bool) -> None:
+    marker: Final = "public-canary-not-a-credential"
+    values: Final = MappingProxyType({"vendor_specific_secret": marker, "nested": {"another_secret": marker}})
+    request: Final = MappingProxyType(
+        {
+            "credential_name": "fixture-credential",
+            "credential_values": values,
+            "credential_info": {"account_id": "fixture-account"},
+        }
+    )
+    assert _sanitize_request_body_for_spend_logs_payload(request) == {
+        "credential_name": "fixture-credential",
+        "credential_info": {"account_id": "fixture-account"},
+    }
+    assert values["vendor_specific_secret"] == marker
+    error: Final[StandardLoggingPayloadErrorInformation] = {
+        "error_code": "400",
+        "error_class": "ProviderError",
+        "llm_provider": "openai",
+        "error_message": json.dumps({"credential_values": dict(values), "detail": "public diagnostic"}),
+    }
+    with patch(
+        "litellm.proxy.spend_tracking.spend_tracking_utils.should_store_prompts_and_responses_in_spend_logs",
+        return_value=store_prompts,
+    ):
+        sanitized: Final = _sanitize_error_information_for_spend_logs(error)
+    assert marker not in json.dumps(sanitized)
+    assert "public diagnostic" in json.dumps(sanitized)
 
 
 def test_stored_success_request_excludes_credentials_even_when_body_logging_is_enabled() -> None:
