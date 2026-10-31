@@ -559,3 +559,28 @@ all serving workers and handling in-flight requests remain deployment acceptance
 requirements. Previously delivered files remain in place; the controller does
 not silently alter an application's mounted secret. Rotation and controlled
 re-enablement require their own lifecycle implementation
+
+
+## Generic pass-through application attribution
+
+Generic pass-through requests now use the shared authenticated request metadata
+snapshot before the spend writer runs. The writer can therefore retain the
+application ID from the actual authenticated key, even when a client sends
+forged application/authentication metadata. Later edits to the key metadata do
+not alter the request snapshot. Full authentication objects and opaque key
+metadata stay outside stored spend metadata
+
+Configured outbound headers have case-insensitive precedence over both direct
+request headers and stripped `x-pass-*` headers. This protects arbitrary configured
+vendor credential and account-selection header names alongside the built-in
+protected names. Unconfigured public `x-pass-*` options continue to work. Header
+processing leaves both the incoming and configured mappings unchanged, so an
+option from one caller cannot persist into a subsequent request
+
+Native capabilities expose `passthrough_application_identity` and
+`passthrough_header_isolation` for controllers that need these installed
+contracts. Provider-account attribution still requires a verified route and
+credential binding. Query-based credentials, signatures, application route
+grants, per-provider usage/cost parsing and actual account enrollment require
+their own implementation and acceptance. The generic gateway's configured
+per-request price must not be treated as an authoritative provider bill

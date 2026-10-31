@@ -56,6 +56,8 @@ async def test_capabilities_reports_running_policy_without_configuration_secrets
     assert response.json() == {
         "schema_version": 1,
         "application_identity": "authenticated_object_v1",
+        "passthrough_application_identity": "authenticated_object_v1",
+        "passthrough_header_isolation": True,
         "virtual_key_log_redaction": True,
         "custom_keys_allowed": disable_custom_keys not in (True, "true"),
         "client_side_credentials_allowed": allow_client_credentials,

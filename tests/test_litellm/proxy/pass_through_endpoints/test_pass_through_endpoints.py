@@ -8,9 +8,10 @@ import zlib
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import BytesIO
 from types import MappingProxyType, SimpleNamespace
-from typing import Final
+from typing import Final, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -47,13 +48,67 @@ from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
+from litellm.proxy.spend_tracking.spend_tracking_utils import (
+    get_logging_payload,  # pyright: ignore[reportUnknownVariableType]  # legacy writer accepts unparameterized dicts
+)
 from litellm.types import utils as types_utils
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_DEPLOYMENT_MODEL_INFO_STATE_KEY,
     LITELLM_PASS_THROUGH_RAW_BODY_STATE_KEY,
+    PassthroughStandardLoggingPayload,
 )
 
 MESSAGE_START_SSE_FRAME = b'event: message_start\ndata: {"type": "message_start"}\n\n'
+
+
+@pytest.mark.parametrize("client_metadata_key", ("metadata", "litellm_metadata"))
+@pytest.mark.parametrize("bound", (False, True))
+def test_generic_passthrough_persists_authenticated_application_snapshot(client_metadata_key: str, bound: bool) -> None:
+    auth: Final = UserAPIKeyAuth(
+        api_key="inert-hashed-key",
+        metadata={"cube_application_id": "original-app", "private_account_hint": "opaque-canary"} if bound else {},
+    )
+    request: Final = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/vendor/check",
+            "headers": [],
+            "scheme": "http",
+            "server": ("test", 80),
+            "query_string": b"",
+        }
+    )
+    passthrough_payload: Final[PassthroughStandardLoggingPayload] = {"url": "https://vendor.example/check"}
+    helper: Final = HttpPassThroughEndpointHelpers
+    kwargs: Final = cast(
+        dict[str, object],
+        helper._init_kwargs_for_pass_through_endpoint(  # pyright: ignore[reportUnknownMemberType, reportPrivateUsage]
+            request=request,
+            user_api_key_dict=auth,
+            passthrough_logging_payload=passthrough_payload,
+            logging_obj=MagicMock(),
+            litellm_call_id="fixture-call",
+            _parsed_body={
+                client_metadata_key: {
+                    "user_api_key_application_id": "forged-app",
+                    "user_api_key_auth": {"metadata": {"cube_application_id": "forged-app"}},
+                }
+            },
+        ),
+    )
+    cast(dict[str, object], auth.metadata)["cube_application_id"] = "later-app"
+    now: Final = datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs=kwargs,
+        response_obj=litellm.ModelResponse(id="fixture-call", choices=[], usage=litellm.Usage()),
+        start_time=now,
+        end_time=now,
+    )
+    stored: Final = TypeAdapter(dict[str, object]).validate_json(payload["metadata"])
+    assert stored["user_api_key_application_id"] == ("original-app" if bound else None)
+    assert "user_api_key_auth" not in stored
+    assert "opaque-canary" not in json.dumps(stored)
 
 
 def test_with_trace_context_without_opentelemetry(monkeypatch: pytest.MonkeyPatch):

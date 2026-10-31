@@ -4,14 +4,13 @@ from urllib.parse import parse_qs
 
 import httpx
 
-from litellm._logging import verbose_logger
 from litellm.constants import PASS_THROUGH_HEADER_PREFIX
 from litellm.litellm_core_utils.aws_partition import contains_aws_arn
 
 # Headers that must not be overwritten via the x-pass- forwarding mechanism.
 # Includes standard credential/auth headers and protocol-level headers that
 # affect routing or message framing.
-_PASS_THROUGH_PROTECTED_HEADERS: Final[frozenset] = frozenset(
+_PASS_THROUGH_PROTECTED_HEADERS: Final[frozenset[str]] = frozenset(
     {
         "authorization",
         "api-key",
@@ -25,15 +24,27 @@ _PASS_THROUGH_PROTECTED_HEADERS: Final[frozenset] = frozenset(
 )
 
 # Header name prefix used to block AWS SigV4 signing headers from being overridden.
-_PASS_THROUGH_PROTECTED_HEADER_PREFIXES: Final[tuple] = ("x-amz-",)
+_PASS_THROUGH_PROTECTED_HEADER_PREFIXES: Final[tuple[str, ...]] = ("x-amz-",)
+
+
+def _can_forward_prefixed_header(name: str, configured_names: frozenset[str]) -> bool:
+    if not name.lower().startswith(PASS_THROUGH_HEADER_PREFIX):
+        return False
+    actual: Final = name[len(PASS_THROUGH_HEADER_PREFIX) :].lower()
+    return (
+        bool(actual)
+        and actual not in configured_names
+        and actual not in _PASS_THROUGH_PROTECTED_HEADERS
+        and not any(actual.startswith(prefix) for prefix in _PASS_THROUGH_PROTECTED_HEADER_PREFIXES)
+    )
 
 
 class BasePassthroughUtils:
     @staticmethod
     def get_merged_query_parameters(
         existing_url: httpx.URL,
-        request_query_params: Mapping[str, str | list],
-        default_query_params: dict[str, str | list] | None = None,
+        request_query_params: Mapping[str, str | list[str]],
+        default_query_params: dict[str, str | list[str]] | None = None,
     ) -> dict[str, str | list[str]]:
         # Get the existing query params from the target URL
         existing_query_string: Final = existing_url.query.decode("utf-8")
@@ -43,7 +54,7 @@ class BasePassthroughUtils:
         updated_existing_query_params: Final = {k: v[0] if len(v) == 1 else v for k, v in existing_query_params.items()}
 
         # Start with default query params (lowest priority)
-        merged_params: Final = {}
+        merged_params: Final[dict[str, str | list[str]]] = {}
         if default_query_params:
             merged_params.update(default_query_params)
 
@@ -57,50 +68,25 @@ class BasePassthroughUtils:
 
     @staticmethod
     def forward_headers_from_request(
-        request_headers: dict,
-        headers: dict,
+        request_headers: Mapping[str, str],
+        headers: Mapping[str, str],
         forward_headers: bool | None = False,
-    ):
-        """
-        Helper to forward headers from original request.
-
-        Also handles 'x-pass-' prefixed headers which are always forwarded
-        with the prefix stripped, regardless of forward_headers setting.
-        e.g., 'x-pass-anthropic-beta: value' becomes 'anthropic-beta: value'
-        """
-        if forward_headers is True:
-            # Header We Should NOT forward
-            request_headers.pop("content-length", None)
-            request_headers.pop("host", None)
-            # accept-encoding must stay client-negotiated: forwarding e.g. "br" when
-            # the brotli package is absent relays undecodable bytes to the caller
-            request_headers.pop("accept-encoding", None)
-
-            custom_header_names: Final = {header_name.lower() for header_name in headers}
-            for header_name in list(request_headers.keys()):
-                if header_name.lower() in custom_header_names:
-                    request_headers.pop(header_name, None)
-
-            # Combine request headers with custom headers
-            headers = {**request_headers, **headers}
-
-        # Process x-pass- prefixed headers (strip prefix and forward)
-        # Credential and protocol-level headers are excluded from this mechanism.
-        for header_name, header_value in request_headers.items():
-            if header_name.lower().startswith(PASS_THROUGH_HEADER_PREFIX):
-                # Strip the 'x-pass-' prefix and normalize to lowercase
-                actual_header_name = header_name[len(PASS_THROUGH_HEADER_PREFIX) :].lower()
-                if actual_header_name in _PASS_THROUGH_PROTECTED_HEADERS or any(
-                    actual_header_name.startswith(p) for p in _PASS_THROUGH_PROTECTED_HEADER_PREFIXES
-                ):
-                    verbose_logger.debug(
-                        "x-pass- header %s maps to a protected header name; skipping",
-                        header_name,
-                    )
-                    continue
-                headers[actual_header_name] = header_value
-
-        return headers
+    ) -> dict[str, str]:
+        configured_names: Final = frozenset(name.lower() for name in headers)
+        prefixed: Final = {
+            name[len(PASS_THROUGH_HEADER_PREFIX) :].lower(): value
+            for name, value in request_headers.items()
+            if _can_forward_prefixed_header(name, configured_names)
+        }
+        forwarded: Final = {
+            name: value
+            for name, value in request_headers.items()
+            if forward_headers is True
+            and name.lower() not in {"content-length", "host", "accept-encoding"}
+            and name.lower() not in configured_names
+            and name.lower() not in prefixed
+        }
+        return {**forwarded, **headers, **prefixed}
 
 
 class CommonUtils:

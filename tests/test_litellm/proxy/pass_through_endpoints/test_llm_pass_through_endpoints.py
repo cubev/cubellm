@@ -7608,3 +7608,44 @@ class TestTinyFishRouteTimeout:
 
         monkeypatch.setattr(proxy_server, "general_settings", {"pass_through_request_timeout": 30}, raising=False)
         assert _tinyfish_route_timeout() is None
+
+
+@pytest.mark.parametrize("forward_headers", (False, True))
+@pytest.mark.parametrize("configured_name", ("X-Vendor-Credential", "vendor-organization", "Vendor-Beta"))
+def test_configured_passthrough_headers_cannot_be_overridden_by_x_pass(
+    forward_headers: bool,
+    configured_name: str,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import HttpPassThroughEndpointHelpers
+
+    configured: Final = {configured_name: "server-owned-value"}
+    request: Final = {"x-pass-" + configured_name.upper(): "client-replacement", "x-pass-public-option": "public-value"}
+    outgoing: Final = HttpPassThroughEndpointHelpers.forward_headers_from_request(
+        request_headers=dict(request),
+        headers=dict(configured),
+        forward_headers=forward_headers,
+    )
+    assert httpx.Headers(outgoing).get_list(configured_name) == ["server-owned-value"]
+    assert outgoing["public-option"] == "public-value"
+
+
+@pytest.mark.parametrize("forward_headers", (False, True))
+def test_passthrough_header_forwarding_does_not_leak_options_between_requests(forward_headers: bool) -> None:
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import HttpPassThroughEndpointHelpers
+
+    configured: Final = {"X-Vendor-Credential": "server-owned-value"}
+    incoming: Final = {"x-pass-public-option": "first-request", "host": "client.example", "content-length": "123"}
+    first: Final = HttpPassThroughEndpointHelpers.forward_headers_from_request(
+        request_headers=incoming,
+        headers=configured,
+        forward_headers=forward_headers,
+    )
+    second: Final = HttpPassThroughEndpointHelpers.forward_headers_from_request(
+        request_headers={},
+        headers=configured,
+        forward_headers=forward_headers,
+    )
+    assert first["public-option"] == "first-request"
+    assert "public-option" not in second
+    assert configured == {"X-Vendor-Credential": "server-owned-value"}
+    assert incoming == {"x-pass-public-option": "first-request", "host": "client.example", "content-length": "123"}

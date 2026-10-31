@@ -16,6 +16,8 @@ class CubeControlCapabilities(BaseModel):
 
     schema_version: Literal[1] = 1
     application_identity: Literal["authenticated_object_v1"] = "authenticated_object_v1"
+    passthrough_application_identity: Literal["authenticated_object_v1"] = "authenticated_object_v1"
+    passthrough_header_isolation: Literal[True] = True
     virtual_key_log_redaction: Literal[True] = True
     custom_keys_allowed: bool
     client_side_credentials_allowed: bool

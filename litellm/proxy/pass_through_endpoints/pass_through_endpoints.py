@@ -633,8 +633,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             _metadata["user_api_key_team_model_max_budget"] = user_api_key_dict.team_model_max_budget
             _metadata["user_api_key_user_model_max_budget"] = user_api_key_dict.user_model_max_budget
             _metadata["user_api_key_end_user_model_max_budget"] = user_api_key_dict.end_user_model_max_budget
-        _metadata.update(
-            LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(user_api_key_dict=user_api_key_dict)
+        LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+            data={"metadata": _metadata},
+            user_api_key_dict=user_api_key_dict,
+            _metadata_variable_name="metadata",
         )
         _request_state: Final = getattr(request, "state", None)
         deployment_model_info: Final = getattr(

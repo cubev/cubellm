@@ -227,3 +227,36 @@ actual block request against native BlockKeyRequest and is_valid_api_key.
 The existing native cache-eviction failure regression passes with repository
 conftests and network sockets disabled (392 tests deselected), confirming the
 best-effort limitation. No full native suite or live gateway revocation is claimed
+
+
+## Generic pass-through provenance and header isolation acceptance
+
+Before the fix, two request-to-spend regressions lost a valid authenticated
+application ID, and eight header regressions reproduced configured header
+replacement or mutation across requests. The corrected builder uses the shared
+authenticated snapshot helper. The header helper returns a new mapping, preserves
+configured values case-insensitively and retains unconfigured public options
+
+The combined native capability, identity, spend redaction and pass-through subset
+passes 145 tests with repository conftests and network sockets disabled (1043
+deselected). This includes the actual spend payload writer after a later key
+metadata edit, both client metadata carriers, absence of binding, forgery refusal,
+private metadata exclusion, all new header cases and adjacent callback/trace and
+budget regressions. A broader keyword selection also selected an unrelated
+Transcribe synchronous TestClient test which hit its deadline; that class is
+explicitly excluded from this acceptance claim. No complete native suite is claimed
+
+Optional Google authentication, OpenTelemetry and Langfuse test dependencies were
+installed only in the isolated native environment using the repository lockfile
+versions and constraints. The header utility and capability endpoint pass strict
+type checking. The new regression function bodies also pass isolated strict
+checking, with explicit legacy-boundary annotations. These checks do not establish
+that the entire legacy test modules pass strict typing. Ruff passes the changed
+source, capability tests and generic pass-through test module. The older provider
+test module has 39 pre-existing lint diagnostics; an exact baseline comparison
+found no additions. No lint/type budget was edited
+
+No companion code, database schema, production gateway, route, credential or
+application was changed. Provider-account selection and actual non-LLM application
+wiring remain open. Native gateway rollout and live protocol verification are
+required before these protections can be relied on in production
