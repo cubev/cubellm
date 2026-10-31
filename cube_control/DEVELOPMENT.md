@@ -130,3 +130,20 @@ passes strict type checking. A separate read-only baseline probe confirmed that
 the deployed writer does not yet know this field and no stored nonempty value
 exists there. This confirms the deployment dependency; the new attribution is not
 live. The Opus /simplify consultation was conceptual, not a file or full-path audit
+
+
+## Application provisioning preflight acceptance
+
+The native admin-only capability endpoint reports the actual running custom-key
+and client-credential policies and the installed writer/redaction contracts.
+Ten ASGI HTTP tests verify role denial, boolean/string custom-key policy and
+absence of configuration secrets. Two new regressions reproduced native virtual
+key fields leaking before the fix; nested request bodies and error strings now
+redact `key` and `keys`, with provider input and aliases preserved
+
+The combined identity/redaction/capability subset passes 110 tests with ordinary
+repository conftests and network sockets disabled (183 deselected). The ordinary
+conftest harness stalled and is not claimed as passing. New endpoint and mapped
+tests pass strict type checking; Ruff passes for changed endpoint and sanitizer
+files. No application credential has been issued and no production service has
+been updated by this work

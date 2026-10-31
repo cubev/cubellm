@@ -1115,6 +1115,8 @@ _SENSITIVE_REQUEST_BODY_KEYS: Final = frozenset(
         "password",
         "xi-api-key",
         "credential_values",
+        "key",
+        "keys",
     }
 )
 _CREDENTIAL_KEY_START_PATTERN: Final = re.compile(

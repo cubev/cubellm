@@ -695,6 +695,7 @@ class LiteLLMRoutes(enum.Enum):
 
     management_routes = (
         [
+            "/cube_control/capabilities",
             # user
             "/user/new",
             "/management/v1/users/bulk",

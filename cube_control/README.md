@@ -439,3 +439,16 @@ Actual key issuance, application wiring and protocol coverage still need their
 own verification. Deploy the gateway writer and verify its stored scalar before
 enabling the revised application projection. A companion rollout alone does not
 install this native writer
+
+The native `GET /cube_control/capabilities` endpoint requires a proxy administrator.
+It reports the installed application identity writer, virtual-key request/error
+log protection, whether custom keys are allowed, and the running global client
+credential override policy. It returns no credentials or complete configuration.
+A provisioning controller must check this endpoint before sending a custom key;
+a missing endpoint is an unsupported gateway, not permission to proceed
+
+Stored request bodies and provider error strings redact `key` and `keys` at
+all nesting depths, alongside other credential fields. This also removes benign
+fields with those names from stored prompt bodies. Original provider input is
+unchanged; request costs, counters and the nonsecret `key_alias` remain available.
+This protection concerns spend logs, not every external logger or callback

@@ -697,7 +697,7 @@ def test_sanitize_request_body_for_spend_logs_payload_mixed_types():
     request_body = {
         "text": long_string,
         "number": 42,
-        "nested": {"list": ["short", long_string], "dict": {"key": long_string}},
+        "nested": {"list": ["short", long_string], "dict": {"text": long_string}},
     }
     sanitized = _sanitize_request_body_for_spend_logs_payload(request_body)
 
@@ -716,7 +716,7 @@ def test_sanitize_request_body_for_spend_logs_payload_mixed_types():
     assert sanitized["number"] == 42
     assert sanitized["nested"]["list"][0] == "short"
     assert len(sanitized["nested"]["list"][1]) == expected_length
-    assert len(sanitized["nested"]["dict"]["key"]) == expected_length
+    assert len(sanitized["nested"]["dict"]["text"]) == expected_length
 
 
 def test_sanitize_request_body_for_spend_logs_payload_uses_runtime_env_override(
@@ -5373,6 +5373,8 @@ def test_request_credentials_are_removed_at_every_depth_without_changing_provide
     marker: Final = "public-canary-not-a-credential"
     for key in (
         "api_key",
+        "key",
+        "keys",
         "apiKey",
         "API-KEY",
         "Authorization",
@@ -5439,6 +5441,27 @@ def test_native_credential_values_are_redacted_without_vendor_specific_field_nam
         sanitized: Final = _sanitize_error_information_for_spend_logs(error)
     assert marker not in json.dumps(sanitized)
     assert "public diagnostic" in json.dumps(sanitized)
+
+
+@pytest.mark.parametrize("store_prompts", (False, True))
+def test_native_virtual_key_fields_do_not_enter_stored_request_or_error_logs(store_prompts: bool) -> None:
+    marker: Final = "inert-virtual-key-canary"
+    original: Final = {"key": marker, "nested": {"keys": [marker]}, "key_alias": "fixture-app"}
+    assert _sanitize_request_body_for_spend_logs_payload(original) == {"nested": {}, "key_alias": "fixture-app"}
+    error: Final[StandardLoggingPayloadErrorInformation] = {
+        "error_code": "400",
+        "error_class": "BadRequest",
+        "llm_provider": "openai",
+        "error_message": repr(original),
+        "traceback": json.dumps(original),
+    }
+    with patch(
+        "litellm.proxy.spend_tracking.spend_tracking_utils.should_store_prompts_and_responses_in_spend_logs",
+        return_value=store_prompts,
+    ):
+        sanitized: Final = _sanitize_error_information_for_spend_logs(error)
+    assert marker not in safe_dumps(sanitized)
+    assert original["key"] == marker
 
 
 def test_stored_success_request_excludes_credentials_even_when_body_logging_is_enabled() -> None:
