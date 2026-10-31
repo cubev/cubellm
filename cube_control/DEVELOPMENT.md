@@ -52,3 +52,21 @@ New provider, CLI and model modules pass strict type checks. The unchanged ten
 strict-type diagnostics in the existing store module were reproduced against its
 previous committed version; this increment does not claim a clean repository-wide
 type check or a complete native gateway test run
+
+## Native credential selection boundary
+
+The native proxy request guard now rejects client-supplied
+`litellm_credential_name` through its existing default banned-parameter path,
+including the nested configuration and metadata locations that guard inspects.
+Five regression cases reproduced the previous acceptance. After the fix, 148
+related guard tests pass with network sockets disabled. Direct SDK resolution,
+server-configured credential resolution and explicit proxy opt-ins are retained
+
+The existing broad `allow_client_side_credentials` switch and a per-deployment
+`configurable_clientside_auth_params` grant still permit name selection. Neither
+provides a per-credential entitlement check. Scoped application routes must keep
+those grants disabled for this parameter and select their credential on the
+server. This fix covers the existing guard, not every protocol or custom auth
+implementation. The complete native auth module did not finish in this harness;
+only the relevant guard subset is claimed as passed. Native gateway changes need
+a gateway rollout, independently of a companion release

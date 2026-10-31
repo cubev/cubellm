@@ -4,7 +4,7 @@ Unit tests for auth_utils functions related to rate limiting and customer ID ext
 
 import base64
 import logging
-from typing import Optional
+from typing import Final
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,8 +16,6 @@ from litellm.proxy.auth.auth_utils import (
     abbreviate_api_key,
     check_complete_credentials,
     custom_auth_common_checks_warning,
-    log_once_if_budget_reservation_disabled,
-    warn_once_if_custom_auth_skips_common_checks,
     get_end_user_id_from_request_body,
     get_key_mcp_rpm_limit,
     get_key_model_rpm_limit,
@@ -29,7 +27,65 @@ from litellm.proxy.auth.auth_utils import (
     get_project_model_tpm_limit,
     get_request_route_template,
     is_request_body_safe,
+    log_once_if_budget_reservation_disabled,
+    warn_once_if_custom_auth_skips_common_checks,
 )
+
+
+@pytest.mark.parametrize("container", (None, "extra_body", "litellm_embedding_config", "metadata", "litellm_metadata"))
+def test_named_provider_credentials_require_explicit_proxy_opt_in(container: str | None) -> None:
+    selector: Final = {"litellm_credential_name": "another-account"}
+    body: Final = {container: selector} if container else selector
+    with pytest.raises(ValueError, match="litellm_credential_name"):
+        is_request_body_safe(body, general_settings={}, llm_router=None, model="fixture")
+
+
+def test_named_provider_credentials_preserve_sdk_and_explicit_proxy_opt_ins(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+    from litellm.models.credentials import CredentialItem
+    from litellm.utils import load_credentials_from_list
+
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [
+            CredentialItem(
+                credential_name="fixture-access", credential_info={}, credential_values={"api_key": "fixture-secret"}
+            )
+        ],
+    )
+    kwargs: Final[dict[str, object]] = {"litellm_credential_name": "fixture-access"}
+    load_credentials_from_list(kwargs)
+    assert kwargs["api_key"] == "fixture-secret"
+    assert is_request_body_safe(
+        {"litellm_credential_name": "fixture-access"},
+        general_settings={"allow_client_side_credentials": True},
+        llm_router=None,
+        model="fixture",
+    )
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "fixture",
+                "litellm_params": {
+                    "model": "openai/fixture",
+                    "litellm_credential_name": "fixture-access",
+                    "configurable_clientside_auth_params": ["litellm_credential_name"],
+                },
+                "model_info": {"id": "fixture-deployment"},
+            }
+        ]
+    )
+    assert router.get_deployment_credentials_with_provider("fixture-deployment")["api_key"] == "fixture-secret"
+    assert is_request_body_safe(
+        {"litellm_credential_name": "fixture-access"}, general_settings={}, llm_router=router, model="fixture"
+    )
+    assert is_request_body_safe(
+        {"messages": [{"role": "user", "content": "litellm_credential_name"}]},
+        general_settings={},
+        llm_router=None,
+        model="fixture",
+    )
 
 
 class TestCustomAuthCommonChecksWarning:
@@ -508,8 +564,8 @@ def _cache_prediction_auth_app(
 
     from fastapi import FastAPI
 
-    import litellm.proxy.proxy_server as proxy_server
     from litellm.caching.dual_cache import DualCache
+    from litellm.proxy import proxy_server
     from litellm.proxy._types import LiteLLM_TeamTableCachedObj, LiteLLM_UserTable, LitellmUserRoles, ProxyException
     from litellm.proxy.auth import auth_checks
     from litellm.proxy.hooks.parallel_request_limiter_v3 import _PROXY_MaxParallelRequestsHandler_v3
@@ -1780,7 +1836,7 @@ class TestGetEndUserIdDropsMalformedBodyValues:
 
 
 def _make_deployment_dict(
-    model_name: str, tpm: Optional[int] = None, rpm: Optional[int] = None
+    model_name: str, tpm: int | None = None, rpm: int | None = None
 ) -> dict:
     """Helper to build a minimal deployment dict as returned by router.get_model_list."""
     litellm_params: dict = {"model": model_name}

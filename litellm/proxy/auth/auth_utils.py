@@ -307,6 +307,7 @@ _BANNED_REQUEST_BODY_PARAMS: Final[tuple[str, ...]] = (
     "api_base",
     "base_url",
     "user_config",
+    "litellm_credential_name",
     "aws_sts_endpoint",
     "aws_web_identity_token",
     "aws_role_name",
