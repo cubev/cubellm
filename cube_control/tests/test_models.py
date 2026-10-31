@@ -132,7 +132,7 @@ class ModelTests(unittest.TestCase):
                 self.assertTrue(reading_view(reading, (reading, outage), NOW).current)
                 self.assertEqual(selected_spend((reading, outage), NOW, reading.period), reading)
 
-    def test_reservations_are_separated_by_unit_and_expire(self) -> None:
+    def test_submitted_reservations_remain_separate_and_held_after_local_deadline(self) -> None:
         jobs: Final[tuple[MediaJob, ...]] = tuple(
             MediaJob(
                 account_id="example",
@@ -146,7 +146,14 @@ class ModelTests(unittest.TestCase):
             for unit in ("USD", "credits")
         )
         self.assertEqual(reservations(jobs, "example", NOW), {"USD": Decimal(3), "credits": Decimal(3)})
-        self.assertEqual(reservations(jobs, "example", NOW + timedelta(minutes=2)), {})
+        self.assertEqual(
+            reservations(jobs, "example", NOW + timedelta(minutes=2)), {"USD": Decimal(3), "credits": Decimal(3)}
+        )
+        unsubmitted: Final = tuple(job.model_copy(update={"state": "reserved"}) for job in jobs)
+        self.assertEqual(reservations(unsubmitted, "example", NOW + timedelta(minutes=2)), {})
+        self.assertFalse(
+            jobs[0].model_copy(update={"state": "expired", "updated_at": NOW + timedelta(hours=1)}).can_replace(jobs[0])
+        )
 
     def test_media_jobs_cannot_be_reopened_or_switch_units(self) -> None:
         reserved: Final[MediaJob] = MediaJob(

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
+import psycopg
 import uvicorn
 from pydantic import ValidationError
 
@@ -14,10 +15,24 @@ from cube_control.api import create_app
 from cube_control.edge import GatewayEdgeSpec, render_gateway_edge
 from cube_control.gateway import GatewayProjectionBatch, prepare_gateway
 from cube_control.gateway_store import GatewayRepository
+from cube_control.media import JobCommand, PostgresJobManager
 from cube_control.models import GatewayBatch, ImportBatch, ManualCommand
 from cube_control.openrouter import collect_openrouter
 from cube_control.store import PostgresRepository
 from cube_control.usage import PostgresUsageReader
+
+
+class CommandArguments(argparse.Namespace):
+    command: str
+    path: str
+    actor: str
+    config: Path
+    account_id: str
+    job_id: str
+    after: int
+    limit: int
+    host: str
+    port: int
 
 
 def main() -> int:
@@ -30,6 +45,14 @@ def main() -> int:
     manage_parser: Final = sub.add_parser("manage")
     manage_parser.add_argument("path", nargs="?", default="-")
     manage_parser.add_argument("--actor", default=getpass.getuser())
+    job_parser: Final = sub.add_parser("manage-job")
+    job_parser.add_argument("path", nargs="?", default="-")
+    job_parser.add_argument("--actor", default=getpass.getuser())
+    history_parser: Final = sub.add_parser("job-history")
+    history_parser.add_argument("account_id")
+    history_parser.add_argument("job_id")
+    history_parser.add_argument("--after", type=int, default=0)
+    history_parser.add_argument("--limit", type=int, default=50)
     collect_parser: Final = sub.add_parser("collect-openrouter")
     collect_parser.add_argument("--config", required=True, type=Path)
     import_parser: Final = sub.add_parser("import")
@@ -37,7 +60,8 @@ def main() -> int:
     serve_parser: Final = sub.add_parser("serve")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=4001)
-    args: Final = parser.parse_args()
+    args: Final = CommandArguments()
+    parser.parse_args(namespace=args)
     if args.command == "prepare-edge":
         raw_edge: Final = sys.stdin.read(65537)
         if len(raw_edge) > 65536:
@@ -74,6 +98,31 @@ def main() -> int:
     if args.command == "init":
         repository.initialize()
         print("CubeLLM Control schema ready")
+        return 0
+    if args.command == "manage-job":
+        with sys.stdin if args.path == "-" else Path(args.path).open() as job_input:
+            raw_job: Final = job_input.read(65537)
+        if len(raw_job) > 65536:
+            print("Job command exceeds size limit", file=sys.stderr)
+            return 2
+        try:
+            job_command: Final = JobCommand.model_validate_json(raw_job)
+        except ValidationError:
+            print("Job command rejected; input values are not logged", file=sys.stderr)
+            return 2
+        job_result: Final = PostgresJobManager(dsn).manage(job_command, args.actor, datetime.now(UTC))
+        print(json.dumps({"status": job_result.status, "version": job_result.version, "message": job_result.message}))
+        return 0 if job_result.status in ("applied", "duplicate") else 1
+    if args.command == "job-history":
+        try:
+            history: Final = PostgresJobManager(dsn).history(args.account_id, args.job_id, args.after, args.limit)
+        except ValueError:
+            print("Invalid job history query", file=sys.stderr)
+            return 2
+        except psycopg.Error:
+            print("Job history unavailable", file=sys.stderr)
+            return 1
+        print(history.model_dump_json())
         return 0
     if args.command == "import-gateway":
         raw_gateway: Final = sys.stdin.read(8_000_001)
@@ -125,7 +174,7 @@ def main() -> int:
         return 0 if result.ok else 1
     repository.initialize()
     uvicorn.run(
-        create_app(repository, usage_reader=PostgresUsageReader(dsn)),
+        create_app(repository, usage_reader=PostgresUsageReader(dsn), job_reader=PostgresJobManager(dsn)),
         host=args.host,
         port=args.port,
         access_log=False,

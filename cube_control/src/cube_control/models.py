@@ -143,7 +143,7 @@ class MediaJob(FrozenModel):
     def can_replace(self, previous: "MediaJob") -> bool:
         allowed: Final[dict[str, tuple[str, ...]]] = {
             "reserved": ("submitted", "failed", "expired"),
-            "submitted": ("finalized", "failed", "expired"),
+            "submitted": ("finalized", "failed"),
             "finalized": (),
             "failed": (),
             "expired": (),
@@ -153,9 +153,14 @@ class MediaJob(FrozenModel):
             and self.job_id == previous.job_id
             and self.unit == previous.unit
             and self.reserved_amount == previous.reserved_amount
+            and self.expires_at == previous.expires_at
             and self.updated_at >= previous.updated_at
+            and (self.state != "expired" or self.updated_at >= self.expires_at)
             and (self == previous or self.state in allowed[previous.state])
         )
+
+    def holds_reservation(self, now: datetime) -> bool:
+        return self.state == "submitted" or (self.state == "reserved" and self.expires_at > now)
 
 
 class RepositoryState(FrozenModel):

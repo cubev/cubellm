@@ -259,3 +259,42 @@ transport, bidirectional traffic, half-close and exclusion of payloads from its
 output. It also asks systemd to verify the generated units. These host tests are
 skipped where the server relay binary is absent, such as the companion container.
 They do not establish live Tailnet connectivity or complete Realtime accounting
+
+## Versioned media job management
+
+`manage-job` reads a JSON command from stdin or a file. It requires a stable
+`command_id`, the current `expected_version` and the complete `job` value from
+the MediaJob import contract. `--actor` records the local operator. Keep the
+command unchanged until its outcome is known: retrying the same command and
+actor returns the original revision, while changing an already used command ID
+is rejected. This command records lifecycle evidence and does not submit a
+provider request or enforce a spending budget
+
+```sh
+python -m cube_control manage-job --actor local-owner < job-command.json
+python -m cube_control job-history example-api example-job --limit 50 --after 0
+```
+
+New jobs start reserved or submitted on a registered API account. Subsequent
+commands require the current revision. Unit, original reservation, expiry and
+identity stay fixed. Finalized jobs require actual usage. An unsubmitted
+reservation can expire after its deadline, while a submitted job keeps its hold
+until a confirmed finalization or failure. A timeout or unknown provider result
+must remain submitted. Reserved holds can age out of the overview without a
+background write; submitted holds never disappear just because local time passes
+
+The companion exposes GET-only `/api/v1/accounts/{account_id}/jobs/{job_id}`
+with its current version and the corresponding `/history?after=0&limit=50`.
+History pages contain the original command, actor, receipt time and previous
+snapshot, including an imported baseline when first managed. `next_after` is an
+exclusive revision cursor; old entries remain unchanged when later commands
+arrive. Decimal amounts remain strings. Missing jobs return 404; absent readers
+or unavailable databases return 503. Import-only jobs have revision zero
+
+Initialization adds the job command table without rewriting existing rows.
+Managed jobs reject differing legacy imports atomically, so an old collector
+cannot bypass revisions or erase the journal. An identical import is harmless.
+For a binary rollback, stop job writers and retain the additive table and journal;
+an older importer does not understand this ownership rule. No production schema
+or service is changed by local acceptance. Read access uses the existing private
+companion interface; the PC audit bridge currently forwards request usage only

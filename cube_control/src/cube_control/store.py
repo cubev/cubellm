@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from cube_control.gateway_store import SCHEMA as GATEWAY_SCHEMA
 from cube_control.gateway_store import current_records, latest_scans
+from cube_control.media import SCHEMA as MEDIA_SCHEMA
 from cube_control.models import (
     CATALOG,
     Account,
@@ -89,6 +90,7 @@ class PostgresRepository:
         with self.connect() as connection:
             connection.execute(SCHEMA)
             connection.execute(GATEWAY_SCHEMA)
+            connection.execute(MEDIA_SCHEMA)
             for account in CATALOG:
                 connection.execute(
                     "INSERT INTO cube_control.accounts (id, payload) VALUES (%s, %s::jsonb) ON CONFLICT DO NOTHING",
@@ -199,6 +201,15 @@ class PostgresRepository:
                     previous_job: Final[MediaJob | None] = (
                         MediaJob.model_validate_json(stored_job[0]) if stored_job else None
                     )
+                    if (
+                        job != previous_job
+                        and connection.execute(
+                            "SELECT command_id FROM cube_control.job_commands WHERE job_id=%s LIMIT 1", (job.id,)
+                        ).fetchone()
+                        is not None
+                    ):
+                        connection.rollback()
+                        return ImportResult(False, message="Managed jobs require a versioned command")
                     if previous_job and not job.can_replace(previous_job):
                         connection.rollback()
                         return ImportResult(False, message="Invalid media job transition")

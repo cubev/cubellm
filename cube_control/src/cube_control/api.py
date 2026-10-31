@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict
 from starlette.middleware.base import RequestResponseEndpoint
 
 from cube_control.gateway import gateway_metrics
+from cube_control.media import JobHistory, JobReader, JobSnapshot
 from cube_control.models import (
     AccountView,
     FleetSnapshot,
@@ -77,7 +78,10 @@ def reading_view(reading: Observation, observations: tuple[Observation, ...], no
 
 
 def create_app(
-    repository: Repository, clock: Callable[[], datetime] = utc_now, usage_reader: UsageReader | None = None
+    repository: Repository,
+    clock: Callable[[], datetime] = utc_now,
+    usage_reader: UsageReader | None = None,
+    job_reader: JobReader | None = None,
 ) -> FastAPI:
     app: Final[FastAPI] = FastAPI(title="CubeLLM Control", docs_url=None, redoc_url=None, openapi_url=None)
     static: Final[Path] = Path(__file__).parent / "static"
@@ -154,6 +158,33 @@ def create_app(
             raise HTTPException(503, detail="Nutzungsübersicht nicht eingerichtet")
         return usage_result(usage_reader.history(source_id, source_key, after, limit))
 
+    def job_detail(
+        account_id: Annotated[str, PathParameter(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")],
+        job_id: Annotated[str, PathParameter(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")],
+    ) -> JobSnapshot:
+        if job_reader is None:
+            raise HTTPException(503, detail="Auftragsübersicht nicht eingerichtet")
+        try:
+            snapshot: Final = job_reader.get(account_id, job_id)
+        except psycopg.Error:
+            raise HTTPException(503, detail="Auftragsdatenbank ist nicht erreichbar") from None
+        if snapshot is None:
+            raise HTTPException(404, detail="Auftrag nicht erfasst")
+        return snapshot
+
+    def job_history(
+        account_id: Annotated[str, PathParameter(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")],
+        job_id: Annotated[str, PathParameter(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")],
+        after: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> JobHistory:
+        if job_reader is None:
+            raise HTTPException(503, detail="Auftragsübersicht nicht eingerichtet")
+        try:
+            return job_reader.history(account_id, job_id, after, limit)
+        except psycopg.Error:
+            raise HTTPException(503, detail="Auftragsdatenbank ist nicht erreichbar") from None
+
     def index() -> FileResponse:
         return FileResponse(static / "index.html", media_type="text/html")
 
@@ -172,6 +203,12 @@ def create_app(
     app.add_api_route("/api/v1/summary", summary, methods=["GET"], response_model=SummaryResponse)
     app.add_api_route("/api/v1/fleet", fleet, methods=["GET"], response_model=FleetSnapshot | None)
     app.add_api_route("/api/v1/usage", usage, methods=["GET"], response_model=UsagePage)
+    app.add_api_route(
+        "/api/v1/accounts/{account_id}/jobs/{job_id}", job_detail, methods=["GET"], response_model=JobSnapshot
+    )
+    app.add_api_route(
+        "/api/v1/accounts/{account_id}/jobs/{job_id}/history", job_history, methods=["GET"], response_model=JobHistory
+    )
     app.add_api_route(
         "/api/v1/usage/{source_id}/{source_key}/history", usage_history, methods=["GET"], response_model=UsageHistory
     )

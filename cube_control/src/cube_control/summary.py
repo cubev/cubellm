@@ -59,7 +59,7 @@ def proxy_amounts(events: tuple[UsageEvent, ...]) -> dict[str, Decimal]:
 
 def reservations(jobs: tuple[MediaJob, ...], account_id: str, now: datetime) -> dict[str, Decimal]:
     pending: Final[tuple[MediaJob, ...]] = tuple(
-        j for j in jobs if j.account_id == account_id and j.state in ("reserved", "submitted") and j.expires_at > now
+        j for j in jobs if j.account_id == account_id and j.holds_reservation(now)
     )
     return {
         unit: sum((j.reserved_amount for j in pending if j.unit == unit), Decimal(0))
