@@ -452,3 +452,52 @@ all nesting depths, alongside other credential fields. This also removes benign
 fields with those names from stored prompt bodies. Original provider input is
 unchanged; request costs, counters and the nonsecret `key_alias` remain available.
 This protection concerns spend logs, not every external logger or callback
+
+
+## Application credential provisioning
+
+`prepare-application --state-directory PATH` reads a bounded JSON specification
+from stdin and prepares one private operation without contacting the gateway:
+
+```json
+{
+  "application_id": "example-app",
+  "team_id": "existing-team",
+  "gateway_origin": "http://127.0.0.1:4000",
+  "models": ["example-chat"],
+  "routes": ["/v1/chat/completions"]
+}
+```
+
+Run `provision-application --state-directory PATH --config ADMIN_ENV` on the
+gateway host or through a loopback management tunnel. `ADMIN_ENV` must be a
+private, current-user-owned file containing `LITELLM_MASTER_KEY`. Neither command
+requires the companion database. The administrative origin must be a literal
+loopback address with an explicit port. LAN and Tailnet application endpoints
+are configured separately
+
+The controller checks native capabilities, existing team and configured model
+aliases. Global or selected-model client credential overrides stop issuance.
+It creates a dedicated `internal_user`, disables automatic key creation and
+invitations, verifies ordinary team membership, and creates one key with the
+specified model and inference-route restrictions. It checks the resulting row
+again before reporting `provisioned`. Existing unrelated or privileged users,
+changed permissions, blocked/expired keys, passthrough grants and key-level
+alias/config overrides fail closed. It never updates an existing principal or key
+
+The state directory must be owned by the current user with mode 0700, and its
+files must have mode 0600. It contains the application key, never the master or
+provider keys. Keep it outside source control and ordinary artifact uploads.
+A separate lock and atomic fsynced journal persist each attempt before sending
+a mutation. After a timeout, subsequent runs reconcile the same key by its hash;
+they never repeat an uncertain creation, even after a not-found response.
+Unresolved partial membership needs operator reconciliation. Changing a prepared
+scope is rejected. Results and validation errors do not print raw credentials
+
+`provisioned` verifies the native credential and its scope. It does not prove
+provider billing-account ownership, request accounting, successful inference,
+application wiring or network publication. Automated credential delivery,
+rotation/revocation and non-LLM application grants remain separate work. This
+command does not provide a generic passthrough permission or transfer provider
+credentials to applications. The new native capability endpoint must be deployed
+before provisioning can succeed

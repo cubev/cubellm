@@ -147,3 +147,32 @@ conftest harness stalled and is not claimed as passing. New endpoint and mapped
 tests pass strict type checking; Ruff passes for changed endpoint and sanitizer
 files. No application credential has been issued and no production service has
 been updated by this work
+
+
+## Scoped application issuer acceptance
+
+The new prepare/provision CLI uses private per-application durable state, a
+stable lock, dedicated internal users and explicit model/route scopes. Readback
+verifies team membership and rejects privilege or credential override paths.
+Fourteen tests exercise the actual controller and CLI, including timeouts after
+commit, unresolved not-found outcomes, conflicting scope, later permission edits,
+partial/privileged membership, competing controllers, symlinks, private file
+modes, missing preflight and global/per-model override denial
+
+The full companion suite passes 123 tests on isolated PostgreSQL. Controller
+behavior tests cover 95% of its statements. New controller,
+CLI and tests pass strict type checking and Ruff. Wheel and source distributions
+build. A separate inert transport probe validates the generated user/key requests
+against native NewUserRequest and GenerateKeyRequest and verifies that native
+key-type processing preserves the explicit routes. Native route checks accept
+the allowed inference path and reject management and unrelated inference paths.
+A separate native authenticated-key enforcement probe passes one allowed route
+and six denials, including a misleading path prefix.
+These checks do not execute the native database-backed creation endpoints or
+contact a provider, production gateway or application
+
+No production key was issued. Credential delivery, rotation, revocation and
+non-LLM grants are not claimed complete. The current deployed gateway lacks the
+new capability endpoint and writer. An attempted conceptual Opus consultation
+was rejected by automatic approval review before execution; no external review
+is claimed for this controller

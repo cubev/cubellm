@@ -12,6 +12,11 @@ import uvicorn
 from pydantic import ValidationError
 
 from cube_control.api import create_app
+from cube_control.application_access import (
+    ApplicationAccessSpec,
+    prepare_application_access,
+    provision_application_access,
+)
 from cube_control.edge import GatewayEdgeSpec, render_gateway_edge
 from cube_control.gateway import GatewayProjectionBatch, prepare_gateway
 from cube_control.gateway_store import GatewayRepository
@@ -20,6 +25,7 @@ from cube_control.heygen import collect_heygen
 from cube_control.media import JobCommand, PostgresJobManager
 from cube_control.models import GatewayBatch, ImportBatch, ManualCommand
 from cube_control.openrouter import collect_openrouter
+from cube_control.provider_access import Unavailable, read_private_key
 from cube_control.store import PostgresRepository
 from cube_control.usage import PostgresUsageReader
 
@@ -36,6 +42,7 @@ class CommandArguments(argparse.Namespace):
     host: str
     port: int
     account_name: str
+    state_directory: Path
 
 
 def main() -> int:
@@ -45,6 +52,11 @@ def main() -> int:
     sub.add_parser("import-gateway")
     sub.add_parser("project-gateway")
     sub.add_parser("prepare-edge")
+    prepare_access_parser: Final = sub.add_parser("prepare-application")
+    prepare_access_parser.add_argument("--state-directory", required=True, type=Path)
+    provision_access_parser: Final = sub.add_parser("provision-application")
+    provision_access_parser.add_argument("--state-directory", required=True, type=Path)
+    provision_access_parser.add_argument("--config", required=True, type=Path)
     manage_parser: Final = sub.add_parser("manage")
     manage_parser.add_argument("path", nargs="?", default="-")
     manage_parser.add_argument("--actor", default=getpass.getuser())
@@ -75,6 +87,26 @@ def main() -> int:
     serve_parser.add_argument("--port", type=int, default=4001)
     args: Final = CommandArguments()
     parser.parse_args(namespace=args)
+    if args.command == "prepare-application":
+        raw_application: Final = sys.stdin.read(65537)
+        try:
+            if len(raw_application) > 65536:
+                raise ValueError("Application specification exceeds size limit")
+            application_spec: Final = ApplicationAccessSpec.model_validate_json(raw_application)
+        except ValueError:
+            print("Application specification rejected; input values are not logged", file=sys.stderr)
+            return 2
+        application_prepared: Final = prepare_application_access(application_spec, args.state_directory)
+        print(application_prepared.model_dump_json())
+        return 0 if application_prepared.status == "prepared" else 1
+    if args.command == "provision-application":
+        master_key: Final = read_private_key(args.config, "LITELLM_MASTER_KEY", "Gateway")
+        if isinstance(master_key, Unavailable):
+            print(master_key.message, file=sys.stderr)
+            return 2
+        application_provisioned: Final = provision_application_access(args.state_directory, master_key)
+        print(application_provisioned.model_dump_json())
+        return 0 if application_provisioned.status == "provisioned" else 1
     if args.command == "prepare-edge":
         raw_edge: Final = sys.stdin.read(65537)
         if len(raw_edge) > 65536:
