@@ -446,3 +446,52 @@ image with a UI built from the same source and execution on its target Python
 3.13 runtime remains open. No production image, service, collector, application
 or credential was changed. The full all-account, precise-usage and LAN/Tailscale
 objective remains active
+
+
+## Native gateway image build corrections
+
+Regenerating the dashboard API types adds the account credential schema and
+Cube Control capability endpoint to the native Admin UI contract. The lazy
+OpenAPI fragments regenerate without a diff. The UI builds with Node 24.19.0
+from the pinned image, including TypeScript checking and the static export
+
+The full Docker build exposed two existing dependency problems. The unqualified
+Rust package resolved to 1.99, while rust-toolchain.toml specifies 1.98.0. The
+builder now reads that version from the committed file and verifies the official
+Rust distribution against its published SHA-256 sidecar before installation.
+Both rustc and cargo report 1.98.0 in the build. BusyBox tar cannot directly
+decode this valid Rust XZ archive; explicit xz decompression followed by tar
+succeeds against the same verified bytes
+
+PgBouncer 1.25.2 fails to compile against the current OpenSSL 4 headers because
+it accesses an opaque ASN.1 structure. The Dockerfile pins PgBouncer 1.26.1 and
+its official source checksum. The documented upstream fix addresses that exact
+compiler failure, and the new binary builds against the existing OpenSSL 4
+packages. See the [PgBouncer changelog](https://www.pgbouncer.org/changelog.html)
+
+The complete x86_64 image builds and runs with CPython 3.13.18 and glibc 2.44.
+Its installed SDK contains the rebuilt UI export, with 728 files including 184
+JavaScript files. The native extension is 39,630,848 bytes, below the unchanged
+40 MB limit, and does not expose the panic test hook. The actual PgBouncer binary
+reports 1.26.1 with OpenSSL 4.0.3; Prisma selects and executes its baked query
+engine with networking disabled
+
+An independent test image adds only offline, version-pinned test dependencies,
+never SDK source. The installed SDK/native provenance, packaged UI, native async
+counter and the existing account/capability/relay/privacy selection pass 118 tests
+on Python 3.13, with 1153 unrelated tests deselected. The existing PgBouncer suite
+passes 65 tests. Network sockets are disabled except required local sockets, and
+the containers have no external network. Existing AsyncMock warnings and a blocked
+fake telemetry exporter remain visible; no real provider traffic is claimed
+
+A separate probe runs the original runtime image through its actual production
+entrypoint with a synthetic local key and no provider keys or database URL. Live
+HTTP checks pass for health, authenticated capability flags, denial of unauthenticated
+capability access, the Admin UI HTML and an exported JavaScript asset. This proves
+local startup and these HTTP contracts, not database writes, provider billing,
+real account ownership or production deployment
+
+These corrections and the image proof do not complete account enrollment,
+application method/account grants, authoritative provider usage and billing,
+LAN/Tailscale activation, credential rotation or distributed revocation. No
+production image, service, provider credential, collector or application has changed
