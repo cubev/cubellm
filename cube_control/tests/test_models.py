@@ -31,6 +31,52 @@ def observation(**changes: object) -> Observation:
 
 
 class ModelTests(unittest.TestCase):
+    def test_full_provider_snapshots_retire_missing_resources_and_preserve_other_sources(self) -> None:
+        account: Final = Account(id="example", provider="fixture", name="Fixture", kind="api")
+        old: Final = observation(metric="balance", window="removed-resource", period="", snapshot_scope="quotas")
+        current: Final = observation(
+            metric="balance",
+            window="current-resource",
+            period="",
+            snapshot_scope="quotas",
+            external_id="new",
+            collected_at=NOW + timedelta(seconds=1),
+            observed_at=NOW + timedelta(seconds=1),
+        )
+        independent: Final = observation(metric="balance", window="wallet", period="", snapshot_scope="wallet")
+        unscoped: Final = observation(metric="balance", window="legacy", period="")
+        state: Final = StoredState((account,), (old, current, independent, unscoped), (), ())
+        view: Final = account_view(account, state, NOW + timedelta(seconds=2), "2026-01")
+        self.assertEqual({row.window for row in view.observations}, {"current-resource", "wallet", "legacy"})
+        self.assertFalse(reading_view(old, state.observations, NOW + timedelta(seconds=2)).current)
+        other_metric: Final = current.model_copy(update={"metric": "usage"})
+        self.assertFalse(reading_view(old, (old, other_metric), NOW + timedelta(seconds=2)).current)
+
+    def test_snapshot_outages_and_late_arrivals_do_not_resurrect_old_or_poison_independent_data(self) -> None:
+        account: Final = Account(id="example", provider="fixture", name="Fixture", kind="api")
+        old: Final = observation(snapshot_scope="billing")
+        outage: Final = observation(
+            snapshot_scope="billing",
+            window="all",
+            status="error",
+            value=None,
+            observed_at=NOW + timedelta(seconds=2),
+            collected_at=NOW + timedelta(seconds=2),
+        )
+        late: Final = observation(
+            snapshot_scope="billing",
+            external_id="late",
+            value="99",
+            observed_at=NOW + timedelta(seconds=1),
+            collected_at=NOW + timedelta(seconds=1),
+        )
+        independent: Final = observation(snapshot_scope="independent", external_id="independent")
+        state: Final = StoredState((account,), (outage, late, old, independent), (), ())
+        view: Final = account_view(account, state, NOW + timedelta(seconds=3), "2026-01")
+        self.assertEqual({row.external_id for row in view.observations}, {outage.external_id, independent.external_id})
+        self.assertEqual(view.selected_spend, independent)
+        self.assertTrue(reading_view(independent, (independent, outage), NOW + timedelta(seconds=3)).current)
+
     def test_provider_character_usage_is_not_money_and_expires_at_reset(self) -> None:
         account: Final = Account(id="elevenlabs-api", provider=Provider.ELEVENLABS, name="ElevenLabs", kind="api")
         reading: Final = observation(

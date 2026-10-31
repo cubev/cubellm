@@ -346,3 +346,18 @@ all supplied digits within its validated input bounds. Original account amounts
 and counters display their decimal strings in the overview and request explorer.
 The optional remaining-budget calculation in the browser is explicitly labelled
 rounded. Long amounts and account names wrap in the mobile layout
+
+## Complete provider snapshots
+
+An observation may declare `snapshot_scope` when its collector emits a complete
+report family. All rows in that report use the same `collected_at`. A newer
+collection then supersedes the older rows in that account, source and scope,
+including resources omitted by the new report. Late older reports remain stored
+but cannot become current again. An error snapshot can contain an unavailable
+`all` observation and retire the previous family without inventing zero usage
+
+Use this only for complete reports, not incremental events or individual pages.
+Independent scopes and unscoped observations retain their separate lifetimes.
+Source-wide failures and browser recovery checks use the same scope boundary.
+The schema is additive and does not reclassify legacy rows; readers accepting
+the field must be deployed before scoped producers are enabled

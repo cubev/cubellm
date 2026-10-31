@@ -9,12 +9,30 @@ from cube_control.models import Account, AccountView, MediaJob, Observation, Usa
 from cube_control.store import StoredState
 
 
-def measurement_key(observation: Observation) -> tuple[str, str, str, str]:
-    return observation.metric, observation.window, observation.period, observation.source
+def measurement_key(observation: Observation) -> tuple[str, str, str, str, str]:
+    return (
+        observation.metric,
+        observation.window,
+        observation.period,
+        observation.source,
+        observation.snapshot_scope or "",
+    )
+
+
+def snapshot_key(observation: Observation) -> tuple[str, str]:
+    return observation.source, observation.snapshot_scope or ""
 
 
 def latest_measurements(account_id: str, observations: tuple[Observation, ...]) -> tuple[Observation, ...]:
-    matching: Final[tuple[Observation, ...]] = tuple(o for o in observations if o.account_id == account_id)
+    account_readings: Final = tuple(o for o in observations if o.account_id == account_id)
+    scoped: Final = tuple(o for o in account_readings if o.snapshot_scope is not None)
+    generations: Final = {
+        key: max(o.collected_at for o in group)
+        for key, group in groupby(sorted(scoped, key=snapshot_key), key=snapshot_key)
+    }
+    matching: Final = tuple(
+        o for o in account_readings if o.snapshot_scope is None or o.collected_at == generations[snapshot_key(o)]
+    )
     return tuple(
         max(group, key=lambda o: (o.observed_at, o.collected_at))
         for _, group in groupby(sorted(matching, key=measurement_key), key=measurement_key)
@@ -30,11 +48,17 @@ def current_measurement(
         return False
     return not any(
         o.account_id == reading.account_id
-        and o.metric == reading.metric
         and o.source == reading.source
-        and o.window == "all"
-        and o.status in ("error", "unknown", "not_configured")
-        and o.observed_at >= reading.observed_at
+        and o.snapshot_scope == reading.snapshot_scope
+        and (
+            (reading.snapshot_scope is not None and o.collected_at > reading.collected_at)
+            or (
+                o.metric == reading.metric
+                and o.window == "all"
+                and o.status in ("error", "unknown", "not_configured")
+                and o.observed_at >= reading.observed_at
+            )
+        )
         for o in observations
     )
 

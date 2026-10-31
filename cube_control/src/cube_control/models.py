@@ -41,6 +41,7 @@ class Observation(FrozenModel):
     window: Annotated[str, Field(min_length=1, max_length=80)]
     status: Literal["known", "manual", "estimated", "unknown", "error", "not_configured"]
     source: Literal["provider_api", "local_collector", "manual", "import"]
+    snapshot_scope: Identifier | None = None
     observed_at: AwareDatetime
     collected_at: AwareDatetime
     value: Decimal | None = None

@@ -26,6 +26,7 @@ function unresolvedError(view, readings, now = Date.now()) {
   const good = other.reading;
   const observed = Date.parse(good.observed_at);
   return good.metric === error.metric && good.source === error.source
+   && (good.snapshot_scope || null) === (error.snapshot_scope || null)
    && goodStatuses.has(good.status) && observed > since && observed <= now + 60000;
  });
 }
