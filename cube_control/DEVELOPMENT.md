@@ -43,7 +43,7 @@ Eight media tests cover concurrent edits, immutable retry identity, imported bas
 
 ## Provider precision and account isolation
 
-OpenRouter collection now supports explicit independent account IDs. Both provider readers retain numeric JSON precision, reject unsafe key files and avoid exporting credentials. HeyGen v3 billing modes, null versus zero, credit resets, billing-mode changes, HTTP failures and bounded streaming reads are covered locally. No live HeyGen account report or routed application has been verified. The current static overview preserves supplied decimal strings; its optional remaining-budget calculation is labelled rounded
+OpenRouter collection now supports explicit independent account IDs. Both provider readers retain numeric JSON precision, reject unsafe key files and avoid exporting credentials. HeyGen v3 billing modes, null versus zero, credit resets, billing-mode changes, HTTP failures and bounded streaming reads are covered locally. No live HeyGen account report or routed application has been verified. The current static overview preserves supplied decimal strings; current budget remainders are calculated on the server with exact decimal arithmetic
 
 The provider increment passes 96 companion tests on the isolated PostgreSQL host.
 The Chromium regression now also exercises a long account name, an exact amount
@@ -86,3 +86,16 @@ was followed by an exact metadata-only import and curl readback from the local
 HTTP companion backed by the dedicated test database. No provider token was
 exported and no production service or account was changed. This verifies quota
 observation, not per-request attribution or application routing
+
+
+## Exact sum acceptance
+
+Two regressions reproduced rounded dashboard totals while the PostgreSQL request
+audit retained all digits, and lost account precision under a small caller
+Decimal context. Shared exact arithmetic now covers gateway totals, imported
+request costs, media reservations, OpenRouter subtraction and derived budget
+remainders. Rational-number checks verify cancellation and widely separated
+exponents without changing the caller's context. An HTTP regression compares the
+account total with the SQL audit total; Chromium verifies the full budget
+remainder string and mobile layout. The full companion suite passes 109 tests
+on the isolated PostgreSQL host. No provider or production account was changed

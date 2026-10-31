@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from cube_control.api import create_app
 from cube_control.gateway_store import GatewayRepository
+from cube_control.gateway import gateway_metrics
 from cube_control.models import Account, GatewayBatch, GatewayRecord, GatewayScan, ImportBatch
 from cube_control.store import PostgresRepository
 from cube_control.usage import PostgresUsageReader, UsageFailure, UsageHistory, UsagePage, UsageQuery
@@ -66,14 +67,14 @@ class UsageStoreTests(unittest.TestCase):
             duration_ms=2000,
         )
 
-    def import_records(self, records: tuple[GatewayRecord, ...], sequence: int = 0) -> None:
+    def import_records(self, records: tuple[GatewayRecord, ...], sequence: int = 0, checked_at: datetime = NOW) -> None:
         result: Final = self.gateway.import_batch(
             GatewayBatch(
                 scan=GatewayScan(
                     scan_id=uuid4().hex,
                     source_id=self.source,
                     expected_sequence=sequence,
-                    checked_at=NOW,
+                    checked_at=checked_at,
                     state="ok",
                     available_rows=len(records),
                     scanned_rows=len(records),
@@ -97,6 +98,46 @@ class UsageStoreTests(unittest.TestCase):
         if not isinstance(result, UsagePage):
             self.fail("Usage page unavailable")
         return result
+
+    def test_summary_sum_matches_exact_database_audit_with_widely_scaled_costs(self) -> None:
+        occurred_at: Final = datetime.now(UTC)
+        period: Final = occurred_at.strftime("%Y-%m")
+        account: Final = Account(
+            id="precision-" + uuid4().hex, provider="precision-" + uuid4().hex, name="Exact sum fixture", kind="api"
+        )
+        self.assertTrue(self.repository.import_batch(ImportBatch(accounts=(account,))).ok)
+        original: Final = self.record.model_copy(
+            update={
+                "account_id": account.id,
+                "provider": account.provider,
+                "occurred_at": occurred_at,
+                "completed_at": occurred_at + timedelta(seconds=2),
+            }
+        )
+        records: Final = (
+            original.model_copy(update={"amount_usd": Decimal("9007199254740993.12345678901234567890123456789")}),
+            original.model_copy(
+                update={"source_key": "tiny", "amount_usd": Decimal("0.00000000000000000000000000001")}
+            ),
+            original.model_copy(update={"source_key": "missing", "amount_usd": None}),
+        )
+        self.import_records(records, checked_at=occurred_at)
+        page: Final = self.page(period=period)
+        expected: Final = Decimal("9007199254740993.12345678901234567890123456790")
+        self.assertEqual(page.metrics.reported_usd, expected)
+        summary: Final = gateway_metrics(records, account.provider, period)
+        self.assertEqual(summary.reported_usd, page.metrics.reported_usd)
+        self.assertEqual(summary.unknown_cost_calls, 1)
+        client: Final = TestClient(create_app(self.repository, clock=lambda: occurred_at, usage_reader=self.reader))
+        accounts: Final = client.get("/api/v1/summary").json()["accounts"]
+        summary_value: Final = next(
+            item["data"]["gateway"]["reported_usd"] for item in accounts if item["data"]["account"]["id"] == account.id
+        )
+        audit_value: Final = client.get(f"/api/v1/usage?period={period}&source_id={self.source}").json()["metrics"][
+            "reported_usd"
+        ]
+        self.assertEqual(Decimal(summary_value), expected)
+        self.assertEqual(summary_value, audit_value)
 
     def test_exact_counters_and_unknowns_remain_separate_from_billing(self) -> None:
         missing: Final = self.record.model_copy(

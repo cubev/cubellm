@@ -59,6 +59,32 @@ def main() -> None:
                     value=Decimal("12.34"),
                     unit="USD",
                 ),
+                Observation(
+                    account_id=account.id,
+                    external_id="budget",
+                    metric="budget",
+                    window="Monat",
+                    status="known",
+                    source="provider_api",
+                    observed_at=checked,
+                    collected_at=checked,
+                    period=checked.strftime("%Y-%m"),
+                    value=Decimal("0.40000000000000000000000000002"),
+                    unit="USD",
+                ),
+                Observation(
+                    account_id=account.id,
+                    external_id="spend",
+                    metric="spend",
+                    window="Monat",
+                    status="known",
+                    source="provider_api",
+                    observed_at=checked,
+                    collected_at=checked,
+                    period=checked.strftime("%Y-%m"),
+                    value=Decimal("0.30000000000000000000000000001"),
+                    unit="USD",
+                ),
             ),
         )
     ).ok:
@@ -141,6 +167,8 @@ def main() -> None:
                 account_card: Final = page.locator("#accounts .card").filter(has_text=account.name)
                 expect(account_card).to_contain_text(exact_value + " USD")
                 expect(account_card).to_contain_text("Anbieter-Ausgabenlimit")
+                expect(account_card).to_contain_text("0.10000000000000000000000000001 USD")
+                expect(account_card).to_contain_text("Verbleibendes Monatsbudget (berechnet)")
                 quota_card: Final = page.locator("#accounts .card").filter(has_text=github_account.name)
                 expect(quota_card).to_contain_text("9007199254740993 Anfragen")
                 expect(quota_card).to_contain_text("0 Punkte")

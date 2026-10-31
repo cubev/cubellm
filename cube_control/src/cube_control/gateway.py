@@ -13,6 +13,7 @@ from pydantic import (
     field_validator,
 )
 
+from cube_control.amounts import exact_sum
 from cube_control.models import (
     GatewayBatch,
     GatewayMetrics,
@@ -134,7 +135,7 @@ def gateway_metrics(
         calls=len(matching),
         failures=sum(record.status == "failed" for record in matching),
         unknown_status=sum(record.status == "unknown" for record in matching),
-        reported_usd=sum((record.amount_usd for record in matching if record.amount_usd is not None), Decimal(0)),
+        reported_usd=exact_sum(record.amount_usd for record in matching if record.amount_usd is not None),
         unknown_cost_calls=sum(record.amount_usd is None for record in matching),
         input_tokens=token_sum(matching, "input_tokens"),
         unknown_input_calls=missing_tokens(matching, "input_tokens"),

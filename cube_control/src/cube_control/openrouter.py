@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from datetime import datetime
-from decimal import Decimal, localcontext
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Final, Literal
@@ -9,6 +9,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from cube_control.models import Account, ImportBatch, Observation, Provider
+from cube_control.amounts import exact_sum
 from cube_control.provider_access import Unavailable, fetch_report, read_private_key
 
 
@@ -69,13 +70,7 @@ def observation(
 
 
 def remaining_credits(result: Credits) -> Decimal:
-    credits: Final = result.total_credits.as_tuple()
-    usage: Final = result.total_usage.as_tuple()
-    with localcontext() as context:
-        context.prec = (
-            max(len(credits.digits), len(usage.digits)) + abs(int(credits.exponent) - int(usage.exponent)) + 1
-        )
-        return result.total_credits - result.total_usage
+    return exact_sum((result.total_credits, result.total_usage.copy_negate()))
 
 
 def collect_openrouter(

@@ -3,6 +3,7 @@ from decimal import Decimal
 from itertools import groupby
 from typing import Final
 
+from cube_control.amounts import exact_sum
 from cube_control.gateway import gateway_metrics
 from cube_control.manual import active_fields, effective_account, effective_readings
 from cube_control.models import Account, AccountView, MediaJob, Observation, UsageEvent
@@ -76,7 +77,7 @@ def selected_spend(observations: tuple[Observation, ...], now: datetime, period:
 
 def proxy_amounts(events: tuple[UsageEvent, ...]) -> dict[str, Decimal]:
     return {
-        currency: sum((e.amount for e in events if e.currency == currency and e.amount is not None), Decimal(0))
+        currency: exact_sum(e.amount for e in events if e.currency == currency and e.amount is not None)
         for currency in sorted({e.currency for e in events if e.amount is not None})
     }
 
@@ -86,8 +87,28 @@ def reservations(jobs: tuple[MediaJob, ...], account_id: str, now: datetime) -> 
         j for j in jobs if j.account_id == account_id and j.holds_reservation(now)
     )
     return {
-        unit: sum((j.reserved_amount for j in pending if j.unit == unit), Decimal(0))
+        unit: exact_sum(j.reserved_amount for j in pending if j.unit == unit)
         for unit in sorted({j.unit for j in pending})
+    }
+
+
+def budget_remainders(
+    readings: tuple[Observation, ...],
+    spend: Observation | None,
+    now: datetime,
+    period: str,
+) -> dict[str, Decimal]:
+    if spend is None or spend.value is None:
+        return {}
+    cost: Final = spend.value
+    return {
+        f"{reading.source}:{reading.external_id}": exact_sum((reading.value, cost.copy_negate()))
+        for reading in readings
+        if reading.metric == "budget"
+        and reading.value is not None
+        and reading.unit == spend.unit
+        and reading.period == spend.period
+        and current_measurement(reading, readings, now, period)
     }
 
 
@@ -104,6 +125,7 @@ def account_view(account: Account, state: StoredState, now: datetime, period: st
         for record in state.gateway_records
         if record.account_id == account.id and record.provider == account.provider and account.kind == "api"
     )
+    spend: Final = selected_spend(latest, now, period)
     return AccountView(
         account=effective_account(account, fields),
         gateway=gateway_metrics(gateway_records, account.provider, period) if gateway_records else None,
@@ -119,6 +141,7 @@ def account_view(account: Account, state: StoredState, now: datetime, period: st
         observations=latest,
         proxy_events=len(events),
         proxy_amounts=proxy_amounts(events),
-        selected_spend=selected_spend(latest, now, period),
+        selected_spend=spend,
         open_reservations=reservations(state.jobs, account.id, now),
+        budget_remaining=budget_remainders(latest, spend, now, period),
     )

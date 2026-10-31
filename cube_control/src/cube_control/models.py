@@ -373,6 +373,7 @@ class AccountView(FrozenModel):
     proxy_amounts: dict[str, Decimal]
     selected_spend: Observation | None
     open_reservations: dict[str, Decimal]
+    budget_remaining: dict[str, Decimal] = Field(default_factory=dict)
 
 
 CATALOG: Final[tuple[Account, ...]] = (

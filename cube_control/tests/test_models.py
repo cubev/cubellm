@@ -1,6 +1,6 @@
 import unittest
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Final
 
 from pydantic import ValidationError
@@ -31,6 +31,60 @@ def observation(**changes: object) -> Observation:
 
 
 class ModelTests(unittest.TestCase):
+    def test_budget_remainders_use_only_current_reports_with_matching_currency_and_period(self) -> None:
+        account: Final = Account(id="example", provider="fixture", name="Fixture", kind="api")
+        spend: Final = observation(external_id="spend", value="0.30000000000000000000000000001")
+        budget: Final = observation(external_id="budget", metric="budget", value="0.40000000000000000000000000002")
+        other: Final = budget.model_copy(update={"external_id": "other-currency", "unit": "EUR"})
+        previous: Final = budget.model_copy(update={"external_id": "old-period", "period": "2025-12"})
+        state: Final = StoredState((account,), (spend, budget, other, previous), (), ())
+        view: Final = account_view(account, state, NOW, "2026-01")
+        self.assertEqual(view.budget_remaining, {"provider_api:budget": Decimal("0.10000000000000000000000000001")})
+        smaller: Final = budget.model_copy(update={"value": Decimal("0.1")})
+        overdrawn: Final = account_view(account, StoredState((account,), (spend, smaller), (), ()), NOW, "2026-01")
+        self.assertEqual(
+            overdrawn.budget_remaining, {"provider_api:budget": Decimal("-0.20000000000000000000000000001")}
+        )
+        outage: Final = observation(
+            external_id="outage", window="all", status="error", value=None, observed_at=NOW + timedelta(seconds=1)
+        )
+        failed: Final = account_view(
+            account, StoredState((account,), (spend, budget, outage), (), ()), NOW + timedelta(seconds=2), "2026-01"
+        )
+        self.assertEqual(failed.budget_remaining, {})
+
+    def test_account_totals_and_reservations_preserve_digits_under_small_caller_context(self) -> None:
+        account: Final = Account(id="precision", provider="fixture", name="Fixture", kind="api")
+        amounts: Final = (Decimal("123456789012345678901234567890.123456789"), Decimal("0.000000001"))
+        events: Final = tuple(
+            UsageEvent(
+                account_id=account.id,
+                event_id=f"request-{index}",
+                occurred_at=NOW,
+                collected_at=NOW,
+                model="fixture",
+                period="2026-01",
+                amount=value,
+            )
+            for index, value in enumerate(amounts)
+        )
+        jobs: Final = tuple(
+            MediaJob(
+                account_id=account.id,
+                job_id=f"job-{index}",
+                state="submitted",
+                updated_at=NOW,
+                reserved_amount=value,
+                unit="credits",
+                expires_at=NOW + timedelta(minutes=1),
+            )
+            for index, value in enumerate(amounts)
+        )
+        with localcontext(prec=6):
+            view: Final = account_view(account, StoredState((account,), (), events, jobs), NOW, "2026-01")
+            self.assertEqual(view.proxy_amounts, {"USD": Decimal("123456789012345678901234567890.123456790")})
+            self.assertEqual(view.open_reservations, {"credits": Decimal("123456789012345678901234567890.123456790")})
+
     def test_full_provider_snapshots_retire_missing_resources_and_preserve_other_sources(self) -> None:
         account: Final = Account(id="example", provider="fixture", name="Fixture", kind="api")
         old: Final = observation(metric="balance", window="removed-resource", period="", snapshot_scope="quotas")

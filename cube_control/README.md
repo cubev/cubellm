@@ -344,8 +344,8 @@ Provider JSON numbers are decoded directly into Decimal rather than a binary
 float. OpenRouter balance subtraction also expands decimal precision to preserve
 all supplied digits within its validated input bounds. Original account amounts
 and counters display their decimal strings in the overview and request explorer.
-The optional remaining-budget calculation in the browser is explicitly labelled
-rounded. Long amounts and account names wrap in the mobile layout
+Remaining budgets are computed on the server from current reports of the
+same currency and period, using exact decimal arithmetic. Long amounts and account names wrap in the mobile layout
 
 ## Complete provider snapshots
 
@@ -399,3 +399,19 @@ disables environment proxies and parses numeric JSON directly into Decimal.
 Deploy readers accepting `snapshot_scope`, the quota metrics and their units
 before enabling this producer. Register custom accounts before importing
 failure-only reports
+
+
+## Exact monetary aggregation
+
+Gateway totals, imported request totals, reservations and OpenRouter balance
+subtraction share exact decimal arithmetic. Calculation precision covers every
+supplied coefficient and exponent plus possible carries, independently of the
+caller's Decimal context. Original amounts remain unchanged. Unknown request
+costs remain counted separately and are never silently converted to known zero
+
+`budget_remaining` is keyed by `source:external_id` within each account and uses
+only a current selected spending report and a current budget with the same
+currency and period. Missing reports, outages and currency mismatches yield no
+remainder. The browser displays the server's decimal string and does not subtract
+binary floating-point values. A remainder based on estimated costs stays labelled
+as such. Older readers without this field simply omit that optional calculation

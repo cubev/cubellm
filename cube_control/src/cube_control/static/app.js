@@ -60,9 +60,11 @@ function renderAccounts() {
    const r=v.reading;
    const organization=r.source==="provider_api"&&r.window==="Org-Limit";
    metric(card,organization?"Organisationslimit / Monat":"Selbst gesetztes Monatsbudget",number(r.value,r.unit));
-   if(spend&&spend.unit===r.unit&&spend.period===r.period) {
-    const remaining=Number(r.value)-Number(spend.value);
-    metric(card,(organization?(remaining<0?"Organisationslimit überschritten um":"Bis zum Organisationslimit"):(remaining<0?"Budget überschritten um":"Verbleibendes Monatsbudget"))+" (gerundet)",number(Math.abs(remaining),r.unit));
+   const remaining=data.budget_remaining?.[r.source+":"+r.external_id];
+   if(spend&&typeof remaining==="string") {
+    const negative=remaining.startsWith("-");
+    const magnitude=negative?remaining.slice(1):remaining;
+    metric(card,(organization?(negative?"Organisationslimit überschritten um":"Bis zum Organisationslimit"):(negative?"Budget überschritten um":"Verbleibendes Monatsbudget"))+(spend.status==="estimated"?" (aus geschätzten Kosten)":" (berechnet)"),number(magnitude,r.unit));
    }
   }
   for(const v of current.filter(v=>Object.hasOwn(readingLabels,v.reading.metric))) {const r=v.reading;metric(card,`${readingLabels[r.metric]}${r.window?" · "+r.window:""}`,number(r.value,r.unit));}
