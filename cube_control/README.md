@@ -227,3 +227,35 @@ already installed Chromium. The test starts its own loopback HTTP server and
 checks decimal precision, unknowns, correction history, pagination, concurrent
 scan changes, failed requests, script injection and a 390px viewport. It never
 calls a provider. Screenshots default to /tmp/cubellm-usage-proof
+
+## Private Tailnet edge preparation
+
+`prepare-edge` reads a metadata-only specification from stdin and emits a
+versioned JSON artifact containing systemd units, Tailnet Serve commands and
+matching deactivation commands. It requires no database and never applies the
+artifact or changes a running service
+
+```sh
+printf '%s' '{"backend_host":"192.168.1.10","paths":["/v1"]}' | python -m cube_control prepare-edge
+```
+
+The artifact binds a relay socket to loopback and uses the server's standard
+systemd-socket-proxyd to reach the private gateway address. Tailscale Serve can
+then terminate HTTPS on the existing Tailnet node without enrolling another
+device. No provider credential or master key belongs in this artifact. Gateway
+authentication remains required, and Tailnet device identity does not replace
+application identity. Public backends, root paths, administration namespaces,
+duplicate paths and relay loops are rejected
+
+The generated commands preserve configured API prefixes, use Serve rather than
+Funnel and deactivate only their own paths. Activation still requires checking
+the existing node/service configuration, file ownership and port availability.
+No generated command resets the shared Serve configuration. Gateway key/role
+checks, path handling, TLS and access from an actual Tailnet client must be
+verified before switching an application
+
+The local regression uses the actual standard relay binary to verify binary
+transport, bidirectional traffic, half-close and exclusion of payloads from its
+output. It also asks systemd to verify the generated units. These host tests are
+skipped where the server relay binary is absent, such as the companion container.
+They do not establish live Tailnet connectivity or complete Realtime accounting

@@ -11,7 +11,7 @@ Scope reconciled on 2026-10-31 against this service, the gateway code, ServiceIn
 | Media jobs | Imported lifecycle records and separate unit reservations exist | Add versioned local management, retry-safe immutable history, read-only monitoring, expiry and uncertain-submission handling, with real PostgreSQL tests |
 | Deployment | Existing build, backup, rollback and activation watchdog tools in CubeUsageBar | Run updated artifact tests before a rollout; retain gateway and database isolation |
 | Browser overview | Account filters, fleet, gateway totals and native editing links exist | Cover refresh failures, rollover, source outages and job monitoring without presenting cached values as current |
-| Mobile access and persistent collection | Trusted management bridges and resident VM collectors exist | Verify actual off-LAN access and independent sources; do not claim a desktop source works while its host is off |
+| Mobile access and persistent collection | Trusted bridges, resident collectors and tested private-edge preparation exist | Verify actual off-LAN activation, app authentication and independent sources; do not claim a desktop source works while its host is off |
 | HeyGen API | Included by the owner's all-accounts requirement on 2026-10-31 | Inspect existing authorized access, add routing and usage support, and verify real behavior |
 | Anthropic individual-account admin billing | Existing source documents unsupported account type | Keep unavailable; prior account-conversion deferral remains in force |
 

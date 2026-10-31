@@ -11,6 +11,7 @@ import uvicorn
 from pydantic import ValidationError
 
 from cube_control.api import create_app
+from cube_control.edge import GatewayEdgeSpec, render_gateway_edge
 from cube_control.gateway import GatewayProjectionBatch, prepare_gateway
 from cube_control.gateway_store import GatewayRepository
 from cube_control.models import GatewayBatch, ImportBatch, ManualCommand
@@ -25,6 +26,7 @@ def main() -> int:
     sub.add_parser("init")
     sub.add_parser("import-gateway")
     sub.add_parser("project-gateway")
+    sub.add_parser("prepare-edge")
     manage_parser: Final = sub.add_parser("manage")
     manage_parser.add_argument("path", nargs="?", default="-")
     manage_parser.add_argument("--actor", default=getpass.getuser())
@@ -36,6 +38,18 @@ def main() -> int:
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=4001)
     args: Final = parser.parse_args()
+    if args.command == "prepare-edge":
+        raw_edge: Final = sys.stdin.read(65537)
+        if len(raw_edge) > 65536:
+            print("Gateway edge specification exceeds size limit", file=sys.stderr)
+            return 2
+        try:
+            edge: Final = GatewayEdgeSpec.model_validate_json(raw_edge)
+        except ValidationError:
+            print("Gateway edge specification rejected; input values are not logged", file=sys.stderr)
+            return 2
+        print(render_gateway_edge(edge).model_dump_json())
+        return 0
     if args.command == "collect-openrouter":
         batch: Final = collect_openrouter(args.config, datetime.now(UTC))
         print(batch.model_dump_json())
