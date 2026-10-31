@@ -585,3 +585,29 @@ Automatic non-LLM controller provisioning, complete account inventory, provider
 usage and billing reconciliation, dynamic resource paths, the next complete image
 and real LAN/Tailscale application acceptance remain open. No production service,
 route, credential, application or collector was changed by these local checks
+
+
+## Exact native key route entries
+
+Added opt-in `exact:/path` entries to the existing native key route matcher.
+Plain entries retain prefix semantics. This supplies a prerequisite for granting
+one non-LLM endpoint without implicitly granting child paths. A versioned native
+capability advertises the contract, and generated dashboard types include it
+
+The two positive exact-path regressions fail before implementation and pass with
+the change. Thirteen new functional cases exercise exact allowance, denial of
+children/trailing slash/siblings, inherited team permissions, invalid group
+notation and unchanged ordinary prefix semantics. Together with the existing
+route-check suite and capability API tests, 612 tests pass after source restoration.
+Three targeted mutations (prefix expansion, blanket allowance and blanket denial)
+are all detected. Ruff and strict
+Python 3.10 typing pass for the new tests and capability API; the legacy route
+module passes Ruff. Generated API schema and a strict TypeScript consumer pass.
+Existing dependency and Pydantic warnings remain visible. This is source acceptance,
+without a new complete image or live application rollout
+
+An initial investigation suspected inherited team passthrough permissions could
+bypass an existing inference-only key's explicit route list. Direct execution of
+the native key gate returns 403 despite the team's exact passthrough grant.
+That suspicion was disproved and the unnecessary team-rejection experiment was
+removed. No existing team is rejected by this change

@@ -151,6 +151,7 @@ async def test_capabilities_reports_running_policy_without_configuration_secrets
     assert response.json() == {
         "schema_version": 1,
         "application_identity": "authenticated_object_v1",
+        "application_exact_routes": "exact_path_v1",
         "passthrough_application_identity": "authenticated_object_v1",
         "passthrough_header_isolation": True,
         "passthrough_account_binding": "configured_credential_v1",

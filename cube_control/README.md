@@ -678,6 +678,22 @@ API payload compatibility needs protocol tests. No production routes or LAN/Tail
 access are activated by this source change.
 
 
+## Exact application key paths
+
+Native key `allowed_routes` entries can use `exact:/path` to allow only that
+request path. For example, `exact:/vendor/quota` does not allow
+`/vendor/quota/child` or `/vendor/quota/`. Existing plain entries retain their
+native prefix behavior, and wildcard and named-group entries retain their
+existing contracts. `exact:` does not turn a route group into a grant
+
+The versioned capability `application_exact_routes: exact_path_v1` lets controllers
+require this support before issuing a restricted key. Exact key paths still need
+the native role/passthrough permission and, for named account routes, the separate
+application/key/account/path/method grant. They do not grant provider ownership or
+promise worker-wide reload. The current application controller still uses its
+existing inference-only specification; account-route enrollment remains open
+
+
 ## Atomic account grant management
 
 Proxy administrators can inspect an existing named HTTP route with

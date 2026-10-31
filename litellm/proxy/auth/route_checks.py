@@ -601,6 +601,10 @@ class RouteChecks:
         Returns:
             bool: True if route matches (exact or prefix), False otherwise
         """
+        if allowed_route.startswith("exact:"):
+            exact_path: Final = allowed_route.removeprefix("exact:")
+            return exact_path.startswith("/") and route == exact_path
+
         # Exact match
         if route == allowed_route:
             return True

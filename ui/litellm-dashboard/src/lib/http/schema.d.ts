@@ -29451,6 +29451,12 @@ export interface components {
         /** CubeControlCapabilities */
         CubeControlCapabilities: {
             /**
+             * Application Exact Routes
+             * @default exact_path_v1
+             * @constant
+             */
+            application_exact_routes: "exact_path_v1";
+            /**
              * Application Identity
              * @default authenticated_object_v1
              * @constant

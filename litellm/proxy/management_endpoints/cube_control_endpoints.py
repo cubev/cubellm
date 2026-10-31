@@ -25,6 +25,7 @@ class CubeControlCapabilities(BaseModel):
 
     schema_version: Literal[1] = 1
     application_identity: Literal["authenticated_object_v1"] = "authenticated_object_v1"
+    application_exact_routes: Literal["exact_path_v1"] = "exact_path_v1"
     passthrough_application_identity: Literal["authenticated_object_v1"] = "authenticated_object_v1"
     passthrough_header_isolation: Literal[True] = True
     passthrough_account_binding: Literal["configured_credential_v1"] = "configured_credential_v1"
