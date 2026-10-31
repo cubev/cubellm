@@ -3705,6 +3705,40 @@ export interface paths {
         patch: operations["update_credential_credentials__credential_name__patch"];
         trace?: never;
     };
+    "/cube_control/account_routes/{route_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cube Control Account Route */
+        get: operations["cube_control_account_route_cube_control_account_routes__route_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cube_control/account_routes/{route_id}/grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cube Control Append Account Grant */
+        post: operations["cube_control_append_account_grant_cube_control_account_routes__route_id__grants_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cube_control/capabilities": {
         parameters: {
             query?: never;
@@ -23859,6 +23893,28 @@ export interface components {
             /** Path */
             path: string;
         };
+        /** AccountGrantCommand */
+        AccountGrantCommand: {
+            /** Expected Fingerprint */
+            expected_fingerprint: string;
+            grant: components["schemas"]["AccountApplicationGrant"];
+        };
+        /** AccountGrantReceipt */
+        AccountGrantReceipt: {
+            /**
+             * Enforcement
+             * @default not_verified
+             * @constant
+             */
+            enforcement: "not_verified";
+            route: components["schemas"]["AccountRouteDescriptor"];
+            /**
+             * Stored
+             * @default true
+             * @constant
+             */
+            stored: true;
+        };
         /** AccountHeaderCredential */
         AccountHeaderCredential: {
             /** Account Id */
@@ -23877,6 +23933,23 @@ export interface components {
             credential_name: string;
             /** Headers */
             headers: components["schemas"]["CredentialHeader"][];
+        };
+        /** AccountRouteDescriptor */
+        AccountRouteDescriptor: {
+            /** Account Id */
+            account_id: string;
+            /** Fingerprint */
+            fingerprint: string;
+            /** Grants */
+            grants: components["schemas"]["AccountApplicationGrant"][];
+            /** Methods */
+            methods: string[];
+            /** Origin */
+            origin: string;
+            /** Path */
+            path: string;
+            /** Route Id */
+            route_id: string;
         };
         /**
          * AcknowledgedSafetyCheck
@@ -29399,6 +29472,12 @@ export interface components {
              * @constant
              */
             passthrough_account_binding: "configured_credential_v1";
+            /**
+             * Passthrough Account Grant Management
+             * @default atomic_append_v1
+             * @constant
+             */
+            passthrough_account_grant_management: "atomic_append_v1";
             /**
              * Passthrough Account Grants
              * @default application_account_path_method_v1
@@ -52856,6 +52935,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_account_route_cube_control_account_routes__route_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                route_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountRouteDescriptor"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_append_account_grant_cube_control_account_routes__route_id__grants_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                route_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountGrantCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountGrantReceipt"];
                 };
             };
             /** @description Validation Error */

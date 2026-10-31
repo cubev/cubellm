@@ -678,6 +678,40 @@ API payload compatibility needs protocol tests. No production routes or LAN/Tail
 access are activated by this source change.
 
 
+## Atomic account grant management
+
+Proxy administrators can inspect an existing named HTTP route with
+`GET /cube_control/account_routes/{route_id}` and append a grant with
+`POST /cube_control/account_routes/{route_id}/grants`. The descriptor exposes
+account, origin, path, methods, existing grants and a configuration fingerprint,
+without provider credential values. The capability
+`passthrough_account_grant_management: atomic_append_v1` identifies this contract
+
+The POST body contains `expected_fingerprint` from that descriptor and one `grant`
+with `application_id`, the actual native `key_hash`, `account_id`, exact `path` and
+explicit `methods`. It contains neither the application token nor provider keys.
+Changes to routing invalidate the fingerprint and return 409. Other independent
+grant additions do not invalidate it. An exact retry makes no database write;
+changing methods on the same application/key/path returns 409. The requested
+account, concrete path and methods must fit the registered route. A route allowing
+subpaths can grant a concrete child path, without introducing wildcard grants
+
+This operation requires database configuration updates, an existing
+`general_settings` row and an existing account route. File-owned passthrough
+configuration or disabled database updates return 409. It does not create routes,
+issue keys, replace grants or delete grants. Concurrent updates lock the native
+configuration row and patch only the grant list with PostgreSQL JSONB operations.
+The transaction reads back the stored grant before committing; unrelated JSON
+values, including exact decimal numbers, are preserved. Object and JSON-string
+configuration representations are supported
+
+A successful receipt reports `stored: true` and `enforcement: not_verified`.
+The existing native configuration cache is invalidated, but this does not prove
+that every worker has reloaded or that a provider request succeeds. Automatic
+controller enrollment of non-LLM application routes remains open, as do dynamic
+resource scopes, a new complete gateway image and real application acceptance
+
+
 ## Account provenance in the usage audit
 
 The companion exposes the whitelist SQL columns for native spend rows through

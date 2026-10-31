@@ -542,3 +542,46 @@ and does not include these new grants. Automated non-LLM key/route provisioning,
 dynamic-resource scopes, real account/application acceptance, the next packaged
 image and coordinated native/control/collector activation remain open. No live
 route, application key, provider credential or production service was changed
+
+
+## Atomic native account grant updates
+
+Added administrator-only route descriptors and append-only grant management for
+existing database-owned named HTTP account routes. The API checks the expected
+route fingerprint, account, concrete path and method subset. Identical retries
+are read-only; scope changes conflict. Native management route permissions include
+the new endpoints, and generated dashboard types expose the request, receipt and
+versioned capability
+
+The transaction locks the existing configuration row and patches only the grant
+list on the database server. An early prototype reserialized the entire settings
+object and rounded an unrelated JSON decimal. The failing precision regression
+now passes with the targeted JSONB patch. Readback verifies the written grant
+before commit. File-owned configuration and disabled database updates are rejected.
+Successful storage explicitly does not assert distributed runtime enforcement
+
+The combined source selection passes 202 tests, including 8 real PostgreSQL
+transaction/API tests, with 1153 unrelated tests deselected. Isolated schemas in
+the dedicated local test database exercise concurrent row locking, idempotent
+retry, conflicts, rollback, missing configuration and preservation of unrelated
+exact decimal values. All twelve targeted mutations are detected, including lock
+removal, retry writes, wrong JSON leaf, fingerprint/scope and administrator gates.
+Original source was restored and the combined selection passed afterward
+
+An additional test-only image uses the actual generated Prisma client and query
+engine on Python 3.13.18. Against an isolated schema it stores two concurrent
+grants, avoids rewriting the row on retry and preserves an unrelated exact
+number. This image layers only the affected account modules and probe over the
+previous complete image. It is not a new SDK release or full gateway acceptance
+
+Ruff and strict Python 3.10 typing pass for the new core, management API and mapped
+unit/integration tests. OpenAPI fragments regenerate without a diff; dashboard
+schema generation succeeds. A strict TypeScript consumer of the generated API
+contract passes. The earlier 957 whole-dashboard diagnostics remain an unresolved
+separate boundary; no clean whole-dashboard typecheck is claimed. Existing mock
+and blocked test-telemetry warnings remain visible. No lint/type budget changed
+
+Automatic non-LLM controller provisioning, complete account inventory, provider
+usage and billing reconciliation, dynamic resource paths, the next complete image
+and real LAN/Tailscale application acceptance remain open. No production service,
+route, credential, application or collector was changed by these local checks
