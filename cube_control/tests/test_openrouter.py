@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Final
 
 import httpx
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from cube_control.openrouter import Credits, Unavailable, collect_openrouter, fetch_credits, read_management_key
 
@@ -14,6 +14,40 @@ NOW: Final = datetime(2026, 1, 4, tzinfo=UTC)
 
 
 class OpenRouterTests(unittest.TestCase):
+    def test_multiple_accounts_preserve_identity_and_isolate_outages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path: Final = Path(directory) / "provider.env"
+            path.write_text("OPENROUTER_MANAGEMENT_KEY=fixture\n")
+            path.chmod(0o600)
+            first: Final = collect_openrouter(
+                path,
+                NOW,
+                lambda _: Credits(total_credits="8", total_usage="1"),
+                account_id="account-one",
+                account_name="First",
+            )
+            second: Final = collect_openrouter(
+                path,
+                NOW,
+                lambda _: Credits(total_credits="9", total_usage="2"),
+                account_id="account-two",
+                account_name="Second",
+            )
+            outage: Final = collect_openrouter(
+                path, NOW, lambda _: Unavailable("error", "Unavailable"), account_id="account-one"
+            )
+            self.assertEqual(first.accounts[0].id, "account-one")
+            self.assertEqual(second.accounts[0].name, "Second")
+            self.assertEqual({row.account_id for row in first.observations + outage.observations}, {"account-one"})
+            self.assertEqual({row.account_id for row in second.observations}, {"account-two"})
+            self.assertTrue(set(row.id for row in first.observations).isdisjoint(row.id for row in second.observations))
+            self.assertTrue(all(row.value is None for row in outage.observations))
+            self.assertFalse(outage.accounts)
+            with self.assertRaises(ValidationError):
+                collect_openrouter(
+                    path, NOW, lambda _: self.fail("Invalid account reached provider"), account_id="not/an/account"
+                )
+
     def test_balance_uses_decimal_and_never_becomes_monthly_spend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path: Final = Path(directory) / "provider.env"

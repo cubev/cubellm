@@ -298,3 +298,13 @@ For a binary rollback, stop job writers and retain the additive table and journa
 an older importer does not understand this ownership rule. No production schema
 or service is changed by local acceptance. Read access uses the existing private
 companion interface; the PC audit bridge currently forwards request usage only
+
+The OpenRouter reader accepts `--account-id` and `--account-name` for independent
+accounts, each with its own private config file. Existing calls retain the
+`openrouter-api` identity. All emitted observations use the explicit account ID;
+provider errors do not move measurements to the default account or replace its
+account metadata. Register custom accounts before importing failure-only reports
+
+```sh
+python -m cube_control collect-openrouter --config /private/account-one.env --account-id account-one --account-name 'Account one'
+```

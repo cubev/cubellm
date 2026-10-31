@@ -33,6 +33,7 @@ class CommandArguments(argparse.Namespace):
     limit: int
     host: str
     port: int
+    account_name: str
 
 
 def main() -> int:
@@ -55,6 +56,8 @@ def main() -> int:
     history_parser.add_argument("--limit", type=int, default=50)
     collect_parser: Final = sub.add_parser("collect-openrouter")
     collect_parser.add_argument("--config", required=True, type=Path)
+    collect_parser.add_argument("--account-id", default="openrouter-api")
+    collect_parser.add_argument("--account-name", default="OpenRouter API")
     import_parser: Final = sub.add_parser("import")
     import_parser.add_argument("path", nargs="?", default="-")
     serve_parser: Final = sub.add_parser("serve")
@@ -75,7 +78,13 @@ def main() -> int:
         print(render_gateway_edge(edge).model_dump_json())
         return 0
     if args.command == "collect-openrouter":
-        batch: Final = collect_openrouter(args.config, datetime.now(UTC))
+        try:
+            batch: Final = collect_openrouter(
+                args.config, datetime.now(UTC), account_id=args.account_id, account_name=args.account_name
+            )
+        except ValidationError:
+            print("Provider account rejected; input values are not logged", file=sys.stderr)
+            return 2
         print(batch.model_dump_json())
         return 0
     if args.command == "project-gateway":

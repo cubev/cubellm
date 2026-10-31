@@ -81,7 +81,9 @@ def fetch_credits(key: SecretStr, transport: httpx.BaseTransport | None = None) 
         return Unavailable("error", "OpenRouter-Netzwerkfehler oder Zeitüberschreitung")
 
 
-def observation(metric: Literal["balance", "usage"], result: CreditsResult, now: datetime) -> Observation:
+def observation(
+    metric: Literal["balance", "usage"], result: CreditsResult, now: datetime, account_id: str
+) -> Observation:
     unavailable: Final[bool] = isinstance(result, Unavailable)
     value: Final[Decimal | None] = (
         None
@@ -91,7 +93,7 @@ def observation(metric: Literal["balance", "usage"], result: CreditsResult, now:
         else result.total_usage
     )
     return Observation(
-        account_id="openrouter-api",
+        account_id=account_id,
         external_id=sha256(f"{metric}:{now.isoformat()}:{value}".encode()).hexdigest(),
         metric=metric,
         window="Kontoguthaben" if metric == "balance" else "Gesamtnutzung seit Kontoeröffnung",
@@ -106,19 +108,18 @@ def observation(metric: Literal["balance", "usage"], result: CreditsResult, now:
 
 
 def collect_openrouter(
-    path: Path, now: datetime, fetch: Callable[[SecretStr], CreditsResult] = fetch_credits
+    path: Path,
+    now: datetime,
+    fetch: Callable[[SecretStr], CreditsResult] = fetch_credits,
+    *,
+    account_id: str = "openrouter-api",
+    account_name: str = "OpenRouter API",
 ) -> ImportBatch:
+    account: Final = Account(id=account_id, provider=Provider.OPENROUTER, name=account_name, kind="api", state="active")
     key: Final = read_management_key(path)
     result: Final[CreditsResult] = key if isinstance(key, Unavailable) else fetch(key)
-    accounts: Final[tuple[Account, ...]] = (
-        ()
-        if isinstance(result, Unavailable)
-        else (
-            Account(
-                id="openrouter-api", provider=Provider.OPENROUTER, name="OpenRouter API", kind="api", state="active"
-            ),
-        )
-    )
+    accounts: Final[tuple[Account, ...]] = () if isinstance(result, Unavailable) else (account,)
     return ImportBatch(
-        accounts=accounts, observations=tuple(observation(metric, result, now) for metric in ("balance", "usage"))
+        accounts=accounts,
+        observations=tuple(observation(metric, result, now, account.id) for metric in ("balance", "usage")),
     )
