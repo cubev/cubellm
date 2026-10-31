@@ -3,11 +3,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from ipaddress import ip_address
 from types import MappingProxyType
-from typing import Annotated, Final, Self, cast
+from typing import Annotated, Final, cast
 from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from typing_extensions import Self
 
 from litellm.models.credentials import CredentialItem
 
