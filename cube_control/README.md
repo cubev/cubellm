@@ -497,7 +497,8 @@ scope is rejected. Results and validation errors do not print raw credentials
 `provisioned` verifies the native credential and its scope. It does not prove
 provider billing-account ownership, request accounting, successful inference,
 application wiring or network publication. Remote application installation,
-rotation/revocation and non-LLM application grants remain separate work. This
+rotation, runtime revocation verification and non-LLM application grants remain
+separate work. This
 command does not provide a generic passthrough permission or transfer provider
 credentials to applications. The new native capability endpoint must be deployed
 before provisioning can succeed
@@ -526,3 +527,35 @@ local file handoff; it does not install files on remote hosts, change applicatio
 configuration, test inference, or establish LAN/Tailnet connectivity. Gateway
 authorization still applies when the application makes each request. Later
 permission changes require another verification and are not frozen by delivery
+
+
+## Application credential revocation
+
+`revoke-application --state-directory PATH --config ADMIN_ENV` first records a
+revocation request in the private journal. Preparation, provisioning and delivery
+from that state are then disabled, including when the gateway is unreachable.
+This local interlock does not itself revoke an already delivered credential
+
+The controller checks the native capability contract and retrieves the key by
+hash. Its user, team and managed operation metadata must match the prepared
+application. It can then call native `/key/block` using only the hash. A changed
+model allowlist or unsafe client credential policy does not prevent emergency
+blocking of an owned key. Unrelated keys are never blocked. Every block attempt
+is journaled before sending, and ambiguous outcomes are reconciled without
+repeating the mutation. The command never unblocks, deletes or creates a key
+
+The result separates the stored state from enforcement. `status: blocked` means
+that the native key row is recorded as revoked with `blocked: true`.
+`status: deleted` means the native deletion archive was returned. Both include
+`enforcement: not_verified`: neither a database row nor a successful native block
+response proves denial in every worker's authentication cache. CLI exit zero
+confirms this recorded state only. Missing keys, conflicting ownership and
+unknown outcomes never become a claim of verified runtime denial
+
+The inspected native gateway evicts locally and schedules a best-effort Redis
+broadcast. It does not acknowledge every worker, and backend or broadcast failure
+can leave stale authentication entries until their TTL. Proving denial across
+all serving workers and handling in-flight requests remain deployment acceptance
+requirements. Previously delivered files remain in place; the controller does
+not silently alter an application's mounted secret. Rotation and controlled
+re-enablement require their own lifecycle implementation

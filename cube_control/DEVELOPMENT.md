@@ -201,3 +201,29 @@ local HTTP CLI test. The application controller's statement coverage remains
 Ruff; wheel and source distributions build. No native source changed in this
 step, and the existing native subset was not rerun. No production service,
 application, gateway key or provider account was changed
+
+
+## Recorded application revocation acceptance
+
+The new revoke command persists intent before contacting the gateway and disables
+preparation, provisioning and delivery from that state. Ownership checks use the
+managed application operation, user and team. Blocking sends only the key hash
+and is not prevented by widened model permissions or unsafe creation policies.
+A journaled attempt is never repeated after a timeout; subsequent calls reconcile
+its readback. The result distinguishes blocked/deleted database state from
+runtime enforcement, which remains explicitly not_verified
+
+Six new behavior tests cover normal/idempotent blocking and the local interlock,
+timeout after commit, uncertain outcomes without replay, foreign ownership,
+emergency blocking with changed permissions and unsafe policies, durable intent
+during outages, and absent/archived key results. The local HTTP CLI test now
+performs delivery followed by revocation, checking administrative authentication,
+secret-free output, the stored result and exactly one hash-only block request
+
+The full companion suite passes 137 tests on isolated PostgreSQL. A final focused
+run covers the modified prepare interlock. Changed controller, CLI and tests pass
+strict type checking and Ruff. A separate inert contract probe validates the
+actual block request against native BlockKeyRequest and is_valid_api_key.
+The existing native cache-eviction failure regression passes with repository
+conftests and network sockets disabled (392 tests deselected), confirming the
+best-effort limitation. No full native suite or live gateway revocation is claimed

@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from hashlib import sha256
 from pathlib import Path
 from typing import Final
 
@@ -17,6 +18,7 @@ from cube_control.application_access import (
     deliver_application_access,
     prepare_application_access,
     provision_application_access,
+    revoke_application_access,
 )
 
 SPEC: Final = ApplicationAccessSpec(
@@ -53,6 +55,10 @@ class GatewayFixture:
                     self.user = body
                 elif path == "/key/generate":
                     self.key = body | {"status": "active"}
+                elif path == "/key/block":
+                    if self.key is None or body.get("key") != sha256(str(self.key["key"]).encode()).hexdigest():
+                        return httpx.Response(404)
+                    self.key = self.key | {"blocked": True, "status": "revoked"}
             if path == self.timeout_path:
                 raise httpx.ReadTimeout("inert upstream error may contain secrets", request=request)
             return httpx.Response(200, json={})
@@ -102,6 +108,141 @@ class GatewayFixture:
 
 
 class ApplicationAccessTests(unittest.TestCase):
+    def test_revocation_blocks_owned_key_by_hash_and_disables_further_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            destination: Final = Path(root) / "consumer"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            result: Final = revoke_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.enforcement, "not_verified")
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate", "/key/block"])
+            assert gateway.key is not None
+            self.assertNotIn(str(gateway.key["key"]), result.model_dump_json())
+            again: Final = revoke_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            self.assertEqual(again, result)
+            prepared: Final = prepare_application_access(SPEC, directory)
+            self.assertEqual(prepared.status, "error")
+            gateway.key["status"] = "active"
+            gateway.key["blocked"] = False
+            provision: Final = provision_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(provision.status, "error")
+            delivered: Final = deliver_application_access(
+                directory, destination, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(delivered.status, "error")
+            self.assertFalse(destination.exists())
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate", "/key/block"])
+
+    def test_revocation_timeout_after_commit_reconciles_without_repeated_block(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            gateway.timeout_path = "/key/block"
+            first: Final = revoke_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            self.assertEqual(first.status, "uncertain")
+            gateway.timeout_path = None
+            after: Final = revoke_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            self.assertEqual(after.status, "blocked")
+            self.assertEqual(after.enforcement, "not_verified")
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate", "/key/block"])
+
+    def test_revocation_unknown_outcome_never_repeats_a_block(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            gateway.fail_creation = True
+            gateway.timeout_path = "/key/block"
+            revoke_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            gateway.timeout_path = None
+            result: Final = revoke_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(result.status, "uncertain")
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate", "/key/block"])
+
+    def test_revocation_requires_ownership_but_can_restrict_widened_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            provision_application_access(directory, SecretStr("inert-master"), httpx.MockTransport(gateway))
+            assert gateway.key is not None
+            gateway.key["user_id"] = "unrelated-owner"
+            foreign: Final = revoke_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(foreign.status, "error")
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate"])
+            gateway.key["user_id"] = SPEC.user_id
+            gateway.key["allowed_routes"] = ["/key/generate"]
+            gateway.override_credentials = True
+            gateway.custom_keys = False
+            emergency: Final = revoke_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(emergency.status, "blocked")
+            self.assertEqual(gateway.posts, ["/user/new", "/key/generate", "/key/block"])
+
+    def test_revocation_records_intent_before_an_unavailable_gateway(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            prepare_application_access(SPEC, directory)
+
+            def unavailable(request: httpx.Request) -> httpx.Response:
+                raise httpx.ReadTimeout("inert-secret-marker", request=request)
+
+            result: Final = revoke_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(unavailable)
+            )
+            self.assertEqual(result.status, "uncertain")
+            self.assertNotIn("inert-secret-marker", result.model_dump_json())
+            state: Final = TypeAdapter(dict[str, object]).validate_json((directory / "state.json").read_bytes())
+            self.assertIs(state["revocation_requested"], True)
+            self.assertIs(state["block_attempted"], False)
+            blocked: Final = provision_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(unavailable)
+            )
+            self.assertEqual(blocked.status, "error")
+
+    def test_missing_or_archived_keys_never_report_verified_enforcement(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "application"
+            prepare_application_access(SPEC, directory)
+            gateway: Final = GatewayFixture()
+            missing: Final = revoke_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(missing.status, "uncertain")
+            self.assertEqual(gateway.posts, [])
+            state: Final = TypeAdapter(dict[str, object]).validate_json((directory / "state.json").read_bytes())
+            gateway.key = {
+                "user_id": SPEC.user_id,
+                "team_id": SPEC.team_id,
+                "metadata": {
+                    "cube_application_id": SPEC.application_id,
+                    "cube_access_operation": state["operation_id"],
+                    "cube_access_manager": "cubellm-v1",
+                },
+                "status": "deleted",
+            }
+            deleted: Final = revoke_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(deleted.status, "deleted")
+            self.assertEqual(deleted.enforcement, "not_verified")
+            self.assertEqual(gateway.posts, [])
+
     def test_scope_rejects_remote_management_wildcards_and_management_routes(self) -> None:
         for changes in (
             {"gateway_origin": "http://localhost:4000"},
@@ -536,7 +677,7 @@ class ApplicationAccessTests(unittest.TestCase):
             self.assertEqual(rejected.status, "error")
             self.assertEqual(os.stat(credential).st_mode & 0o777, 0o644)
 
-    def test_delivery_cli_uses_read_only_gateway_checks_and_never_prints_secrets(self) -> None:
+    def test_application_cli_delivers_read_only_then_records_revocation_without_secret_output(self) -> None:
         gateway: Final = GatewayFixture()
 
         class Handler(BaseHTTPRequestHandler):
@@ -545,6 +686,22 @@ class ApplicationAccessTests(unittest.TestCase):
                     self.send_error(403)
                     return
                 response: Final = gateway(httpx.Request("GET", "http://localhost" + self.path))
+                self._reply(response)
+
+            def do_POST(self) -> None:
+                if self.headers.get("Authorization") != "Bearer inert-master" or self.path != "/key/block":
+                    self.send_error(403)
+                    return
+                response: Final = gateway(
+                    httpx.Request(
+                        "POST",
+                        "http://localhost" + self.path,
+                        content=self.rfile.read(int(self.headers.get("Content-Length", "0"))),
+                    )
+                )
+                self._reply(response)
+
+            def _reply(self, response: httpx.Response) -> None:
                 self.send_response(response.status_code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(response.content)))
@@ -597,6 +754,29 @@ class ApplicationAccessTests(unittest.TestCase):
                 self.assertNotIn("inert-master", result.stdout + result.stderr)
                 self.assertEqual((destination / "api-key").read_text(), str(gateway.key["key"]) + "\n")
                 self.assertEqual(gateway.posts, ["/user/new", "/key/generate"])
+                revoked: Final = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "cube_control",
+                        "revoke-application",
+                        "--state-directory",
+                        str(directory),
+                        "--config",
+                        str(admin),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=20,
+                    env={name: value for name, value in os.environ.items() if name != "CUBE_CONTROL_DATABASE_URL"},
+                )
+                self.assertEqual(revoked.returncode, 0, revoked.stderr)
+                self.assertIn('"status":"blocked"', revoked.stdout)
+                self.assertIn('"enforcement":"not_verified"', revoked.stdout)
+                self.assertNotIn(str(gateway.key["key"]), revoked.stdout + revoked.stderr)
+                self.assertNotIn("inert-master", revoked.stdout + revoked.stderr)
+                self.assertEqual(gateway.posts, ["/user/new", "/key/generate", "/key/block"])
             finally:
                 server.shutdown()
                 thread.join(timeout=5)

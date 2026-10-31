@@ -66,6 +66,8 @@ class ApplicationAccessState(FrozenModel):
     token: SecretStr
     user_attempted: bool = False
     key_attempted: bool = False
+    revocation_requested: bool = False
+    block_attempted: bool = False
 
     @property
     def key_hash(self) -> str:
@@ -83,6 +85,13 @@ class ApplicationAccessState(FrozenModel):
 class ApplicationAccessResult(FrozenModel):
     application_id: str
     status: Literal["prepared", "provisioned", "delivered", "uncertain", "error"]
+    message: str
+
+
+class ApplicationRevocationResult(FrozenModel):
+    application_id: str
+    status: Literal["blocked", "deleted", "uncertain", "error"]
+    enforcement: Literal["not_verified"] = "not_verified"
     message: str
 
 
@@ -151,6 +160,12 @@ def prepare_application_access(spec: ApplicationAccessSpec, directory: Path) -> 
             if existing is not None and existing.spec != spec:
                 return ApplicationAccessResult(
                     application_id=spec.application_id, status="error", message="State scope conflicts"
+                )
+            if existing is not None and existing.revocation_requested:
+                return ApplicationAccessResult(
+                    application_id=spec.application_id,
+                    status="error",
+                    message="Application revocation was requested",
                 )
             if existing is None:
                 _save(
@@ -294,6 +309,8 @@ def _provision(
     def result(status: Literal["provisioned", "uncertain", "error"], message: str) -> ApplicationAccessResult:
         return ApplicationAccessResult(application_id=state.spec.application_id, status=status, message=message)
 
+    if state.revocation_requested:
+        return result("error", "Application revocation was requested; provisioning and delivery are disabled")
     caps_code, caps_raw = _request(client, "GET", "/cube_control/capabilities")
     if caps_code != 200:
         return result("error", "Gateway provisioning capabilities unavailable")
@@ -489,4 +506,93 @@ def deliver_application_access(
             application_id="unknown",
             status="error",
             message="Application verification or private delivery failed",
+        )
+
+
+class _RevocationCapabilities(BaseModel):
+    schema_version: Literal[1]
+    application_identity: Literal["authenticated_object_v1"]
+    virtual_key_log_redaction: Literal[True]
+
+
+class _OwnedKey(BaseModel):
+    user_id: str
+    team_id: str
+    metadata: dict[str, str]
+    status: Literal["active", "expired", "revoked", "deleted"]
+    blocked: bool | None = None
+
+
+class _OwnedKeyInfo(BaseModel):
+    info: _OwnedKey
+
+
+def _revoke(client: httpx.Client, descriptor: int, state: ApplicationAccessState) -> ApplicationRevocationResult:
+    def result(
+        status: Literal["blocked", "deleted", "uncertain", "error"], message: str
+    ) -> ApplicationRevocationResult:
+        return ApplicationRevocationResult(application_id=state.spec.application_id, status=status, message=message)
+
+    capabilities_code, capabilities_raw = _request(client, "GET", "/cube_control/capabilities")
+    if capabilities_code != 200:
+        return result("error", "Gateway capabilities unavailable; revocation intent remains recorded")
+    _RevocationCapabilities.model_validate_json(capabilities_raw)
+    key_code, key_raw = _request(client, "GET", "/key/info", params={"key": state.key_hash})
+    if key_code != 200:
+        return result("uncertain", "Application key cannot be inspected; runtime denial is unverified")
+    key: Final = _OwnedKeyInfo.model_validate_json(key_raw).info
+    if key.user_id != state.spec.user_id or key.team_id != state.spec.team_id or key.metadata != state.metadata:
+        return result("error", "Key ownership conflicts with the prepared application; no key changed")
+    if key.status == "deleted":
+        return result("deleted", "Key deletion is recorded; cached authentication denial is unverified")
+    if key.status == "revoked" and key.blocked is True:
+        return result("blocked", "Key block is recorded; cached authentication denial is unverified")
+    if key.blocked is True or key.status == "revoked":
+        return result("error", "Gateway key status is inconsistent")
+    if state.block_attempted:
+        return result("uncertain", "Previous block requires reconciliation; no mutation repeated")
+    attempted: Final = state.model_copy(update={"block_attempted": True})
+    _save(descriptor, attempted)
+    code, _ = _request(client, "POST", "/key/block", {"key": state.key_hash})
+    if code not in (200, 201):
+        return result("uncertain", "Key block requires reconciliation; runtime denial is unverified")
+    return _revoke(client, descriptor, attempted)
+
+
+def revoke_application_access(
+    directory: Path,
+    master_key: SecretStr,
+    transport: httpx.BaseTransport | None = None,
+) -> ApplicationRevocationResult:
+    try:
+        with _locked_directory(directory) as descriptor:
+            existing: Final = _load(descriptor)
+            if existing is None:
+                return ApplicationRevocationResult(
+                    application_id="unknown",
+                    status="error",
+                    message="Application state is missing",
+                )
+            requested: Final = existing.model_copy(update={"revocation_requested": True})
+            _save(descriptor, requested)
+            with httpx.Client(
+                base_url=requested.spec.gateway_origin,
+                headers={"Authorization": "Bearer " + master_key.get_secret_value()},
+                timeout=20,
+                follow_redirects=False,
+                trust_env=False,
+                transport=transport,
+            ) as client:
+                return _revoke(client, descriptor, requested)
+    except httpx.HTTPError:
+        return ApplicationRevocationResult(
+            application_id="unknown",
+            status="uncertain",
+            message="Gateway request failed; reconcile the recorded revocation",
+        )
+    except (OSError, ValueError):
+        return ApplicationRevocationResult(
+            application_id="unknown",
+            status="error",
+            message="Application state or gateway revocation response rejected",
         )

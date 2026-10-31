@@ -17,6 +17,7 @@ from cube_control.application_access import (
     deliver_application_access,
     prepare_application_access,
     provision_application_access,
+    revoke_application_access,
 )
 from cube_control.edge import GatewayEdgeSpec, render_gateway_edge
 from cube_control.gateway import GatewayProjectionBatch, prepare_gateway
@@ -59,6 +60,9 @@ def main() -> int:
     provision_access_parser: Final = sub.add_parser("provision-application")
     provision_access_parser.add_argument("--state-directory", required=True, type=Path)
     provision_access_parser.add_argument("--config", required=True, type=Path)
+    revoke_access_parser: Final = sub.add_parser("revoke-application")
+    revoke_access_parser.add_argument("--state-directory", required=True, type=Path)
+    revoke_access_parser.add_argument("--config", required=True, type=Path)
     deliver_access_parser: Final = sub.add_parser("deliver-application")
     deliver_access_parser.add_argument("--state-directory", required=True, type=Path)
     deliver_access_parser.add_argument("--destination-directory", required=True, type=Path)
@@ -105,11 +109,15 @@ def main() -> int:
         application_prepared: Final = prepare_application_access(application_spec, args.state_directory)
         print(application_prepared.model_dump_json())
         return 0 if application_prepared.status == "prepared" else 1
-    if args.command in ("provision-application", "deliver-application"):
+    if args.command in ("provision-application", "deliver-application", "revoke-application"):
         master_key: Final = read_private_key(args.config, "LITELLM_MASTER_KEY", "Gateway")
         if isinstance(master_key, Unavailable):
             print(master_key.message, file=sys.stderr)
             return 2
+        if args.command == "revoke-application":
+            application_revoked: Final = revoke_application_access(args.state_directory, master_key)
+            print(application_revoked.model_dump_json())
+            return 0 if application_revoked.status in ("blocked", "deleted") else 1
         if args.command == "deliver-application":
             application_delivered: Final = deliver_application_access(
                 args.state_directory,
