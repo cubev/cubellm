@@ -37,7 +37,17 @@ class Account(FrozenModel):
 class Observation(FrozenModel):
     account_id: Identifier
     external_id: Identifier
-    metric: Literal["spend", "budget", "balance", "limit", "recurring_cost", "usage", "spending_cap"]
+    metric: Literal[
+        "spend",
+        "budget",
+        "balance",
+        "limit",
+        "recurring_cost",
+        "usage",
+        "spending_cap",
+        "quota_limit",
+        "quota_remaining",
+    ]
     window: Annotated[str, Field(min_length=1, max_length=80)]
     status: Literal["known", "manual", "estimated", "unknown", "error", "not_configured"]
     source: Literal["provider_api", "local_collector", "manual", "import"]
@@ -45,7 +55,12 @@ class Observation(FrozenModel):
     observed_at: AwareDatetime
     collected_at: AwareDatetime
     value: Decimal | None = None
-    unit: Literal["USD", "EUR", "credits", "tokens", "minutes", "ratio", "characters"] | None = None
+    unit: (
+        Literal[
+            "USD", "EUR", "credits", "tokens", "minutes", "ratio", "characters", "requests", "points", "quota_units"
+        ]
+        | None
+    ) = None
     period: Annotated[str, Field(max_length=80)] = ""
     resets_at: AwareDatetime | None = None
     expires_at: AwareDatetime | None = None

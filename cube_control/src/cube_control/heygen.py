@@ -2,16 +2,14 @@ from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from hashlib import sha256
-from io import BytesIO
-import json
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self
 
 import httpx
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from cube_control.models import Account, ImportBatch, Observation, Provider
-from cube_control.provider_access import Unavailable, read_private_key
+from cube_control.provider_access import Unavailable, fetch_report, read_private_key
 
 Amount = Annotated[Decimal, Field(allow_inf_nan=False)]
 NonnegativeAmount = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
@@ -68,28 +66,15 @@ ProfileResult = BillingProfile | Unavailable
 
 
 def fetch_profile(key: SecretStr, transport: httpx.BaseTransport | None = None) -> ProfileResult:
-    try:
-        with httpx.Client(transport=transport, timeout=20, follow_redirects=False, trust_env=False) as client:
-            with client.stream(
-                "GET", "https://api.heygen.com/v3/users/me", headers={"X-Api-Key": key.get_secret_value()}
-            ) as response:
-                if response.status_code != 200:
-                    message: Final = {
-                        401: "HeyGen-Zugang ungültig oder abgelaufen",
-                        403: "HeyGen-Kontobericht benötigt account:read",
-                        429: "HeyGen-Abfragelimit erreicht",
-                    }.get(response.status_code, "HeyGen-Kontobericht nicht verfügbar")
-                    return Unavailable("error", message)
-                raw: Final = BytesIO()
-                for chunk in response.iter_bytes(chunk_size=65536):
-                    if raw.tell() + len(chunk) > 1_000_000:
-                        return Unavailable("error", "HeyGen-Kontobericht überschreitet Größenlimit")
-                    raw.write(chunk)
-                return ProfileResponse.model_validate(json.loads(raw.getvalue(), parse_float=Decimal)).data
-    except (ValidationError, json.JSONDecodeError, UnicodeError):
-        return Unavailable("error", "HeyGen-Kontobericht unvollständig oder ungültig")
-    except httpx.HTTPError:
-        return Unavailable("error", "HeyGen-Netzwerkfehler oder Zeitüberschreitung")
+    result: Final = fetch_report(
+        "https://api.heygen.com/v3/users/me",
+        {"X-Api-Key": key.get_secret_value()},
+        ProfileResponse,
+        "HeyGen",
+        "HeyGen-Kontobericht benötigt account:read",
+        transport,
+    )
+    return result.data if isinstance(result, ProfileResponse) else result
 
 
 def reading(

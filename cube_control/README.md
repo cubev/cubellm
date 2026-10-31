@@ -361,3 +361,41 @@ Independent scopes and unscoped observations retain their separate lifetimes.
 Source-wide failures and browser recovery checks use the same scope boundary.
 The schema is additive and does not reclassify legacy rows; readers accepting
 the field must be deployed before scoped producers are enabled
+
+## GitHub quota reader
+
+`collect-github --config /private/github.env` reads `GITHUB_TOKEN` through the
+same private-file checks as the other collectors. Optional `--account-id` and
+`--account-name` select an independent catalogue identity. The command only emits
+an import batch; it does not mutate GitHub or install a resident collector
+
+The reader calls only `GET https://api.github.com/rate_limit`, using API version
+2026-03-10. It preserves each resource's used, limit and remaining counters as
+separate measurements, with nulls unknown and explicit zeroes intact. REST core
+and search counters use request units, GraphQL uses points, and unclassified
+resource families retain provider-unit labels. There is no derived invoice,
+monthly spend, request history or per-application attribution in this endpoint
+
+Complete response headers override the corresponding resource's body values.
+Malformed or incomplete rate-limit headers make the report unavailable instead
+of presenting potentially conflicting counts. Other resource families remain
+from the body. Reset timestamps expire their measurements. Complete report scopes
+retire removed resources and old outages without affecting other report families
+
+GitHub documents that user quotas can be shared across credentials. Do not add
+these snapshots across keys or treat the quota's used counter as this key's own
+request count. Response headers on the actual application request govern its
+allowance; this reader provides a periodic overview, not admission control
+
+The contract was checked on 2026-10-31 against the official
+[rate-limit endpoint](https://docs.github.com/en/rest/rate-limit/rate-limit) and
+[GraphQL limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
+A real authenticated read and exact PostgreSQL/HTTP round trip were verified
+locally without exporting the token. This is not a production collector rollout
+or evidence that applications already use CubeLLM for GitHub traffic
+
+The shared provider HTTP reader bounds streamed reports, rejects redirects,
+disables environment proxies and parses numeric JSON directly into Decimal.
+Deploy readers accepting `snapshot_scope`, the quota metrics and their units
+before enabling this producer. Register custom accounts before importing
+failure-only reports

@@ -3,10 +3,12 @@ const $ = (id) => document.getElementById(id);
 const labels = {active:"Aktiv",paused:"Pausiert",cancelled:"Beendet",unknown:"Status offen",not_configured:"Nicht angebunden"};
 const sources = {provider_api:"Anbieterbericht",local_collector:"Subscription-Collector",manual:"Manuell erfasst",import:"Import"};
 const names = {openai:"OpenAI",anthropic:"Anthropic",openrouter:"OpenRouter",xai:"xAI",heygen:"HeyGen",suno:"Suno",elevenlabs:"ElevenLabs"};
+const readingLabels={balance:"Guthaben",recurring_cost:"Abokosten",usage:"Nutzung",spending_cap:"Anbieter-Ausgabenlimit",quota_limit:"Anbieter-Kontingent",quota_remaining:"Verfügbares Kontingent"};
+const unitLabels={characters:"Zeichen (Anbieter-Zähler)",requests:"Anfragen",points:"Punkte",quota_units:"Anbieter-Einheiten"};
 let accounts = [], filter = "all";
 function element(tag, cls, text) { const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e; }
 function age(value) { const seconds=(Date.now()-Date.parse(value))/1000; if(!Number.isFinite(seconds))return "Zeit unbekannt"; if(seconds< -60)return "Uhrzeit prüfen"; if(seconds<60)return "gerade eben"; if(seconds<3600)return `vor ${Math.floor(seconds/60)} Min`; if(seconds<86400)return `vor ${Math.floor(seconds/3600)} Std`; return `vor ${Math.floor(seconds/86400)} Tagen`; }
-function number(value, unit) { if(value===null||value===undefined)return "unbekannt";const label=unit==="characters"?"Zeichen (Anbieter-Zähler)":unit;if(typeof value==="string")return value+" "+label;if(unit==="USD"||unit==="EUR")return new Intl.NumberFormat("de-DE",{style:"currency",currency:unit}).format(value);return new Intl.NumberFormat("de-DE",{maximumFractionDigits:2}).format(value)+" "+label; }
+function number(value, unit) { if(value===null||value===undefined)return "unbekannt";const label=unitLabels[unit]||unit;if(typeof value==="string")return value+" "+label;if(unit==="USD"||unit==="EUR")return new Intl.NumberFormat("de-DE",{style:"currency",currency:unit}).format(value);return new Intl.NumberFormat("de-DE",{maximumFractionDigits:2}).format(value)+" "+label; }
 function metric(card,label,value,small=false) { const row=element("div","metric");row.append(element("span","",label),element("strong",small?"small":"",value));card.append(row); }
 function isFresh(reading) {
  const delta=(Date.now()-Date.parse(reading.observed_at))/1000;
@@ -63,7 +65,7 @@ function renderAccounts() {
     metric(card,(organization?(remaining<0?"Organisationslimit überschritten um":"Bis zum Organisationslimit"):(remaining<0?"Budget überschritten um":"Verbleibendes Monatsbudget"))+" (gerundet)",number(Math.abs(remaining),r.unit));
    }
   }
-  for(const v of current.filter(v=>["balance","recurring_cost","usage","spending_cap"].includes(v.reading.metric))) {const r=v.reading;metric(card,`${r.metric==="balance"?"Guthaben":r.metric==="recurring_cost"?"Abokosten":r.metric==="spending_cap"?"Anbieter-Ausgabenlimit":"Nutzung"}${r.window?" · "+r.window:""}`,number(r.value,r.unit));}
+  for(const v of current.filter(v=>Object.hasOwn(readingLabels,v.reading.metric))) {const r=v.reading;metric(card,`${readingLabels[r.metric]}${r.window?" · "+r.window:""}`,number(r.value,r.unit));}
   if(!current.length&&!spend)card.append(element("p","empty","Noch keine verifizierten aktuellen Werte"));
   for(const [currency,value] of Object.entries(data.proxy_amounts)) {metric(card,"Beobachteter Proxy-Verbrauch",number(value,currency),true);card.append(element("p","explanation","Separat erfasst. Wird nicht zum Anbieterbericht addiert."));}
   for(const [unit,value] of Object.entries(data.open_reservations))metric(card,"Für laufende Aufträge reserviert",number(value,unit),true);

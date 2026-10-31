@@ -1,16 +1,53 @@
 import os
 import stat
+import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from typing import Final, Literal
 
-from pydantic import SecretStr
+import httpx
+from pydantic import BaseModel, SecretStr
 
 
 @dataclass(frozen=True, slots=True)
 class Unavailable:
     status: Literal["error", "not_configured"]
     message: str
+
+
+def fetch_report[Report: BaseModel](
+    endpoint: str,
+    headers: Mapping[str, str],
+    response_type: type[Report],
+    provider: str,
+    forbidden: str,
+    transport: httpx.BaseTransport | None = None,
+    transform: Callable[[Report, Mapping[str, str]], Report] | None = None,
+) -> Report | Unavailable:
+    try:
+        with httpx.Client(transport=transport, timeout=20, follow_redirects=False, trust_env=False) as client:
+            with client.stream("GET", endpoint, headers=headers) as response:
+                if response.status_code != 200:
+                    message: Final = {
+                        401: f"{provider}-Zugang ungültig oder abgelaufen",
+                        403: forbidden,
+                        429: f"{provider}-Abfragelimit erreicht",
+                    }.get(response.status_code, f"{provider}-Kontobericht nicht verfügbar")
+                    return Unavailable("error", message)
+                raw: Final = BytesIO()
+                for chunk in response.iter_bytes(chunk_size=65536):
+                    if raw.tell() + len(chunk) > 1_000_000:
+                        return Unavailable("error", f"{provider}-Kontobericht überschreitet Größenlimit")
+                    raw.write(chunk)
+                report: Final = response_type.model_validate(json.loads(raw.getvalue(), parse_float=Decimal))
+                return transform(report, response.headers) if transform is not None else report
+    except ValueError:
+        return Unavailable("error", f"{provider}-Kontobericht unvollständig oder ungültig")
+    except httpx.HTTPError:
+        return Unavailable("error", f"{provider}-Netzwerkfehler oder Zeitüberschreitung")
 
 
 def read_private_key(path: Path, variable: str, provider: str) -> SecretStr | Unavailable:

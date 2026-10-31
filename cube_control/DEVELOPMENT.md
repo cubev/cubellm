@@ -70,3 +70,19 @@ server. This fix covers the existing guard, not every protocol or custom auth
 implementation. The complete native auth module did not finish in this harness;
 only the relevant guard subset is claimed as passed. Native gateway changes need
 a gateway rollout, independently of a companion release
+
+## GitHub quota acceptance
+
+The read-only GitHub collector preserves independent resource counters and reset
+times, with response-header precedence and explicit request/point/unknown units.
+Complete provider scopes supersede removed resources and outages. Seven new
+collector tests cover null/zero/large integers, malformed data, credential safety,
+header conflicts, redirects, account isolation, recovery and the actual CLI
+
+The full companion suite passes 105 tests on the isolated PostgreSQL host. The
+Chromium regression includes large GitHub request counts, a zero point balance,
+unknown provider units and mobile layout. A real authenticated GET /rate_limit
+was followed by an exact metadata-only import and curl readback from the local
+HTTP companion backed by the dedicated test database. No provider token was
+exported and no production service or account was changed. This verifies quota
+observation, not per-request attribution or application routing

@@ -12,6 +12,7 @@ from playwright.sync_api import expect, sync_playwright
 
 from cube_control.api import create_app
 from cube_control.gateway_store import GatewayRepository
+from cube_control.github import RateLimits, quota_readings
 from cube_control.models import Account, GatewayBatch, GatewayRecord, GatewayScan, ImportBatch, Observation
 from cube_control.store import PostgresRepository
 from cube_control.usage import PostgresUsageReader
@@ -62,6 +63,22 @@ def main() -> None:
         )
     ).ok:
         raise RuntimeError("Exact billing fixture import failed")
+    github_account: Final = Account(
+        id="ui-" + uuid4().hex, provider="github", name="GitHub quotas " + uuid4().hex, kind="api"
+    )
+    quotas: Final = RateLimits.model_validate(
+        {
+            "resources": {
+                "core": {"used": 9007199254740993, "limit": 9007199254740999, "remaining": 6},
+                "graphql": {"used": 2, "remaining": 0},
+                "future_pool": {"used": 3},
+            }
+        }
+    )
+    if not repository.import_batch(
+        ImportBatch(accounts=(github_account,), observations=quota_readings(github_account.id, quotas, checked))
+    ).ok:
+        raise RuntimeError("Quota fixture import failed")
     now: Final = datetime(2026, 1, 15, tzinfo=UTC)
     records: Final = tuple(
         GatewayRecord(
@@ -124,6 +141,11 @@ def main() -> None:
                 account_card: Final = page.locator("#accounts .card").filter(has_text=account.name)
                 expect(account_card).to_contain_text(exact_value + " USD")
                 expect(account_card).to_contain_text("Anbieter-Ausgabenlimit")
+                quota_card: Final = page.locator("#accounts .card").filter(has_text=github_account.name)
+                expect(quota_card).to_contain_text("9007199254740993 Anfragen")
+                expect(quota_card).to_contain_text("0 Punkte")
+                expect(quota_card).to_contain_text("3 Anbieter-Einheiten")
+                expect(quota_card).to_contain_text("Verfügbares Kontingent")
                 page.locator("#usage-period").fill("2026-01")
                 page.locator("#usage-provider").fill(provider)
                 page.get_by_role("button", name="Aufrufe laden", exact=True).click()

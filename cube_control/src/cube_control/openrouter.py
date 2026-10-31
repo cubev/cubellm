@@ -1,5 +1,4 @@
 from collections.abc import Callable
-import json
 from datetime import datetime
 from decimal import Decimal, localcontext
 from hashlib import sha256
@@ -7,10 +6,10 @@ from pathlib import Path
 from typing import Annotated, Final, Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from cube_control.models import Account, ImportBatch, Observation, Provider
-from cube_control.provider_access import Unavailable, read_private_key
+from cube_control.provider_access import Unavailable, fetch_report, read_private_key
 
 
 class Credits(BaseModel):
@@ -32,25 +31,15 @@ def read_management_key(path: Path) -> SecretStr | Unavailable:
 
 
 def fetch_credits(key: SecretStr, transport: httpx.BaseTransport | None = None) -> CreditsResult:
-    try:
-        with httpx.Client(transport=transport, timeout=20, follow_redirects=False, trust_env=False) as client:
-            response: Final[httpx.Response] = client.get(
-                "https://openrouter.ai/api/v1/credits", headers={"Authorization": "Bearer " + key.get_secret_value()}
-            )
-        if response.status_code != 200:
-            message: Final[str] = {
-                401: "OpenRouter-Zugang ungültig oder abgelaufen",
-                403: "OpenRouter-Kontoguthaben benötigt Management-Berechtigung",
-                429: "OpenRouter-Abfragelimit erreicht",
-            }.get(response.status_code, "OpenRouter-Kontobericht nicht verfügbar")
-            return Unavailable("error", message)
-        if len(response.content) > 1_000_000:
-            return Unavailable("error", "OpenRouter-Kontobericht überschreitet Größenlimit")
-        return CreditsResponse.model_validate(json.loads(response.content, parse_float=Decimal)).data
-    except (ValidationError, json.JSONDecodeError, UnicodeError):
-        return Unavailable("error", "OpenRouter-Kontobericht unvollständig oder ungültig")
-    except httpx.HTTPError:
-        return Unavailable("error", "OpenRouter-Netzwerkfehler oder Zeitüberschreitung")
+    result: Final = fetch_report(
+        "https://openrouter.ai/api/v1/credits",
+        {"Authorization": "Bearer " + key.get_secret_value()},
+        CreditsResponse,
+        "OpenRouter",
+        "OpenRouter-Kontoguthaben benötigt Management-Berechtigung",
+        transport,
+    )
+    return result.data if isinstance(result, CreditsResponse) else result
 
 
 def observation(
