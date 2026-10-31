@@ -83,6 +83,7 @@ from litellm.proxy.common_request_processing import (
     open_sse_before_first_byte,
     resolve_litellm_call_id,
 )
+from litellm.proxy.common_utils.application_identity import application_id_from_key_metadata
 from litellm.proxy.common_utils.error_body_call_id import JSON_OBJECT, error_body_call_id, with_call_id
 from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
@@ -122,6 +123,7 @@ from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, Usage
 from .account_credentials import (
     AccountHeaderCredential,
     AccountRouteBinding,
+    account_application_allowed,
     resolve_account_credential,
     validate_account_request,
     validate_account_route,
@@ -2155,6 +2157,14 @@ def create_pass_through_route(
                 AccountHeaderCredential.model_validate(account_policy_raw) if account_policy_raw is not None else None
             )
             if account_policy is not None:
+                application_id: Final = (
+                    application_id_from_key_metadata(cast(Mapping[str, object] | None, user_api_key_dict.metadata))
+                    if isinstance(user_api_key_dict, UserAPIKeyAuth)
+                    else None
+                )
+                key_hash: Final = user_api_key_dict.token if isinstance(user_api_key_dict, UserAPIKeyAuth) else None
+                if not account_application_allowed(account_policy, application_id, key_hash, path, request.method):
+                    raise HTTPException(status_code=403, detail="Application is not granted this account route method")
                 try:
                     validate_account_request(account_policy, request.headers, tuple(request.query_params.keys()))
                 except ValueError:

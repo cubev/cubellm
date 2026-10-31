@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ from litellm.proxy._types import LiteLLMRoutes, PassThroughGenericEndpoint, Prox
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.pass_through_endpoints import pass_through_endpoints as relay
 from litellm.proxy.pass_through_endpoints.account_credentials import (
+    AccountApplicationGrant,
     AccountHeaderCredential,
     AccountRouteBinding,
     CredentialHeader,
@@ -5328,7 +5330,7 @@ async def test_account_bound_passthrough_never_replays_provider_credentials_on_r
                 request=request,
                 target="https://vendor.example/check",
                 custom_headers={"VendorAccess": "inert-provider-secret-canary"},
-                user_api_key_dict=UserAPIKeyAuth(api_key="inert-app-key"),
+                user_api_key_dict=UserAPIKeyAuth(api_key="sk-inert-app-key"),
                 stream=mode in {"stream", "multipart-stream"},
                 account_binding=AccountRouteBinding(account_id="fixture-account", credential_name="fixture-credential"),
             )
@@ -7751,7 +7753,42 @@ POLICY: Final = AccountHeaderCredential(
     credential_name="fixture credential",
     headers=(CredentialHeader(name="X-Vendor-Credential", field="access value", prefix="Bearer "),),
     allowed_query_parameters=("page",),
+    application_grants=tuple(
+        AccountApplicationGrant(
+            application_id="fixture-app",
+            key_hash=hashlib.sha256(b"sk-inert-app-key").hexdigest(),
+            account_id="fixture-account",
+            path=path,
+            methods=("GET",),
+        )
+        for path in ("/account-fixture", "/account-wire-fixture")
+    ),
 )
+
+
+@pytest.mark.usefixtures("isolated_routes")
+async def test_account_route_denies_ungranted_application_before_credential_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app: Final = FastAPI()
+    monkeypatch.setattr(litellm, "credential_list", [])
+
+    async def auth() -> UserAPIKeyAuth:
+        return UserAPIKeyAuth(api_key="sk-inert-app-key", metadata={"cube_application_id": "fixture-app"})
+
+    app.dependency_overrides[user_api_key_auth] = auth
+    ungranted: Final = AccountHeaderCredential.model_validate(POLICY.model_dump(exclude={"application_grants"}))
+    endpoint: Final = PassThroughGenericEndpoint(
+        id="fixture-ungranted-route",
+        path="/account-ungranted",
+        target="https://vendor.example/check",
+        account_credential=ungranted,
+        methods=["GET"],
+    )
+    await register_route(endpoint, app, False, set())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+        response: Final = await client.get("/account-ungranted")
+    assert response.status_code == 403
 
 
 def credential(
@@ -7815,6 +7852,75 @@ def isolated_routes(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
 
 
 @pytest.mark.usefixtures("isolated_routes")
+@pytest.mark.parametrize("application_id", ("grant-matrix-app", "another-app", None))
+@pytest.mark.parametrize("key", ("sk-inert-app-key", "sk-another-app-key"))
+@pytest.mark.parametrize(("method", "suffix"), (("GET", ""), ("POST", ""), ("GET", "/child")))
+async def test_account_route_grants_enforce_application_method_and_exact_path_before_relay(
+    monkeypatch: pytest.MonkeyPatch, application_id: str | None, key: str, method: str, suffix: str
+) -> None:
+    app: Final = FastAPI()
+    requests: Final[list[httpx.Request]] = []
+    monkeypatch.setattr(litellm, "credential_list", [credential()])
+    scoped_policy: Final = AccountHeaderCredential.model_validate(
+        POLICY.model_dump()
+        | {
+            "application_grants": [
+                grant.model_dump() | {"application_id": "grant-matrix-app"} for grant in POLICY.application_grants
+            ]
+        }
+    )
+
+    async def auth() -> UserAPIKeyAuth:
+        return UserAPIKeyAuth(
+            api_key=key,
+            metadata={"cube_application_id": application_id} if application_id else {},
+        )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"remaining": 7})
+
+    app.dependency_overrides[user_api_key_auth] = auth
+    endpoint: Final = PassThroughGenericEndpoint(
+        id="fixture-granted-route",
+        path="/account-fixture",
+        target="https://vendor.example/check",
+        account_credential=scoped_policy,
+        methods=["GET", "POST"],
+        include_subpath=True,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as outbound:
+
+        def client_factory(llm_provider: object = None, params: Mapping[str, object] | None = None) -> ClientFixture:
+            return ClientFixture(outbound)
+
+        monkeypatch.setattr(relay, "get_async_httpx_client", client_factory)
+        await register_route(endpoint, app, False, set())
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+            response: Final = await client.request(
+                method,
+                "/account-fixture" + suffix,
+                json={
+                    "custom_body": {
+                        "metadata": {"cube_application_id": "grant-matrix-app", "provider_account_id": "fixture-account"},
+                        "user_api_key_auth": {
+                            "token": hashlib.sha256(b"sk-inert-app-key").hexdigest(),
+                            "metadata": {"cube_application_id": "grant-matrix-app"},
+                        },
+                    }
+                },
+            )
+    allowed: Final = (
+        application_id == "grant-matrix-app" and key == "sk-inert-app-key" and method == "GET" and suffix == ""
+    )
+    assert response.status_code == (200 if allowed else 403)
+    assert len(requests) == (1 if allowed else 0)
+    if allowed:
+        assert requests[0].headers["X-Vendor-Credential"] == "Bearer inert-provider-canary"
+        assert requests[0].url == httpx.URL("https://vendor.example/check")
+
+
+@pytest.mark.usefixtures("isolated_routes")
 async def test_registered_routes_capture_the_selected_native_credential_and_follow_rotations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7822,7 +7928,7 @@ async def test_registered_routes_capture_the_selected_native_credential_and_foll
     seen: Final[list[Relayed]] = []
 
     async def auth() -> UserAPIKeyAuth:
-        return UserAPIKeyAuth(api_key="inert-app-key", metadata={"cube_application_id": "fixture-app"})
+        return UserAPIKeyAuth(api_key="sk-inert-app-key", metadata={"cube_application_id": "fixture-app"})
 
     async def upstream(
         request: Request,
@@ -7873,7 +7979,13 @@ async def test_registered_routes_capture_the_selected_native_credential_and_foll
         )
         assert envelope_query.status_code == 400
         changed_policy: Final = AccountHeaderCredential.model_validate(
-            POLICY.model_dump() | {"account_id": "second-account"}
+            POLICY.model_dump()
+            | {
+                "account_id": "second-account",
+                "application_grants": [
+                    grant.model_dump() | {"account_id": "second-account"} for grant in POLICY.application_grants
+                ],
+            }
         )
         changed_endpoint: Final = PassThroughGenericEndpoint(
             id="fixture-route",
@@ -7910,7 +8022,7 @@ async def test_native_relay_and_async_spend_callback_retain_both_identities(monk
     monkeypatch.setattr(litellm, "credential_list", [credential()])
 
     async def auth() -> UserAPIKeyAuth:
-        return UserAPIKeyAuth(api_key="inert-app-key", metadata={"cube_application_id": "fixture-app"})
+        return UserAPIKeyAuth(api_key="sk-inert-app-key", metadata={"cube_application_id": "fixture-app"})
 
     def upstream(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-Vendor-Credential"] == "Bearer inert-provider-canary"

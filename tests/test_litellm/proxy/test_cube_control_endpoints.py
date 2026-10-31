@@ -61,6 +61,7 @@ async def test_capabilities_reports_running_policy_without_configuration_secrets
         "passthrough_account_binding": "configured_credential_v1",
         "credential_values_full_masking": True,
         "passthrough_account_provider": "credential_metadata_v1",
+        "passthrough_account_grants": "application_account_path_method_v1",
         "virtual_key_log_redaction": True,
         "custom_keys_allowed": disable_custom_keys not in (True, "true"),
         "client_side_credentials_allowed": allow_client_credentials,

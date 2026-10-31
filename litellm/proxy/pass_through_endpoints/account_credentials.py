@@ -39,15 +39,38 @@ class CredentialHeader(BaseModel):
         return self
 
 
+class AccountApplicationGrant(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    application_id: Identifier
+    key_hash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    account_id: Identifier
+    path: Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^/[A-Za-z0-9._~!$&'()+,;=:@/-]*$")]
+    methods: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[!#$%&'+.^_`|~0-9A-Z-]{1,32}$")], ...],
+        Field(min_length=1, max_length=16),
+    ]
+
+    @model_validator(mode="after")
+    def validate_grant(self) -> Self:
+        if "//" in self.path or any(segment in {".", ".."} for segment in self.path.split("/")):
+            raise ValueError("Application grants require exact canonical paths")
+        if len(set(self.methods)) != len(self.methods):
+            raise ValueError("Application grant methods must be unique")
+        return self
+
+
 class AccountHeaderCredential(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     account_id: Identifier
     credential_name: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
     headers: Annotated[tuple[CredentialHeader, ...], Field(min_length=1, max_length=8)]
     allowed_query_parameters: tuple[Annotated[str, Field(min_length=1, max_length=128)], ...] = ()
+    application_grants: Annotated[tuple[AccountApplicationGrant, ...], Field(max_length=256)] = ()
 
     @model_validator(mode="after")
     def validate_policy(self) -> Self:
+        if any(grant.account_id != self.account_id for grant in self.application_grants):
+            raise ValueError("Application grant account must match its credential policy")
         if len({header.name.lower() for header in self.headers}) != len(self.headers):
             raise ValueError("Credential headers must be unique")
         if len(set(self.allowed_query_parameters)) != len(self.allowed_query_parameters):
@@ -58,6 +81,23 @@ class AccountHeaderCredential(BaseModel):
         ):
             raise ValueError("Header credential routes cannot accept query credentials")
         return self
+
+
+def account_application_allowed(
+    policy: AccountHeaderCredential,
+    application_id: str | None,
+    key_hash: str | None,
+    path: str,
+    method: str,
+) -> bool:
+    return application_id is not None and key_hash is not None and any(
+        grant.application_id == application_id
+        and grant.key_hash == key_hash
+        and grant.account_id == policy.account_id
+        and grant.path == path
+        and method in grant.methods
+        for grant in policy.application_grants
+    )
 
 
 @dataclass(frozen=True, slots=True)

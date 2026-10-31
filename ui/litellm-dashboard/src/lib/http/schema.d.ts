@@ -23846,6 +23846,19 @@ export interface components {
             /** Description */
             description?: string | null;
         };
+        /** AccountApplicationGrant */
+        AccountApplicationGrant: {
+            /** Account Id */
+            account_id: string;
+            /** Application Id */
+            application_id: string;
+            /** Key Hash */
+            key_hash: string;
+            /** Methods */
+            methods: string[];
+            /** Path */
+            path: string;
+        };
         /** AccountHeaderCredential */
         AccountHeaderCredential: {
             /** Account Id */
@@ -23855,6 +23868,11 @@ export interface components {
              * @default []
              */
             allowed_query_parameters: string[];
+            /**
+             * Application Grants
+             * @default []
+             */
+            application_grants: components["schemas"]["AccountApplicationGrant"][];
             /** Credential Name */
             credential_name: string;
             /** Headers */
@@ -29381,6 +29399,12 @@ export interface components {
              * @constant
              */
             passthrough_account_binding: "configured_credential_v1";
+            /**
+             * Passthrough Account Grants
+             * @default application_account_path_method_v1
+             * @constant
+             */
+            passthrough_account_grants: "application_account_path_method_v1";
             /**
              * Passthrough Account Provider
              * @default credential_metadata_v1

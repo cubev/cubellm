@@ -581,7 +581,7 @@ Native capabilities expose `passthrough_application_identity` and
 `passthrough_header_isolation` for controllers that need these installed
 contracts. The named account binding below adds request-time credential and origin
 attribution; live account ownership still requires provider verification.
-Query-based credentials, signatures, application route grants, per-provider usage/cost parsing and actual account enrollment require
+Query-based credentials, signatures, automated account-route provisioning, per-provider usage/cost parsing and actual account enrollment require
 their own implementation and acceptance. The generic gateway's configured
 per-request price must not be treated as an authoritative provider bill
 
@@ -610,7 +610,14 @@ configuration/management endpoint with an explicit method list:
   "account_credential": {
     "account_id": "example-account",
     "credential_name": "example stored credential",
-    "headers": [{"name":"Authorization","field":"api_key","prefix":"Bearer "}]
+    "headers": [{"name":"Authorization","field":"api_key","prefix":"Bearer "}],
+    "application_grants": [{
+      "application_id": "example-app",
+      "key_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account_id": "example-account",
+      "path": "/example-account/quota",
+      "methods": ["GET"]
+    }]
   }
 }
 ```
@@ -633,6 +640,24 @@ inherit pooled client authentication, cookies, default headers or parameters and
 does not follow redirects. Native credential read endpoints mask all value fields,
 including arbitrary vendor field names; bound debug headers expose no characters.
 
+Named account routes require an explicit application grant matching the actual
+authenticated key's `cube_application_id` and SHA-256 token hash, the configured
+account, exact proxy path and HTTP method. Replace the example hash with the
+managed application key's native hash. Grants contain no raw application key.
+Binding to that hash prevents another key from inheriting access by setting the
+same application metadata. Missing or empty `application_grants` deny every caller,
+including administrator keys, with 403 before credential resolution. Existing
+account policies must add grants before activating this gateway version. Existing
+key/team route permissions are required in addition to this account gate
+
+Grant paths use the actual ASGI route with the deployment root prefix removed.
+Host headers and JSON identity claims cannot replace that path or application.
+Paths have no wildcard or implicit subpath matching; ambiguous dot, percent-encoded,
+duplicate-slash and pattern paths are rejected in configuration. Methods are
+explicit, uppercase and unique. A grant names its account, so retargeting a policy
+to a different account also requires replacing the old grants. The native
+administrator-only configuration update path owns these grants
+
 Stored native spend metadata contains `provider_account_id`,
 `provider_account_provider`, `provider_origin`,
 `provider_account_source: configured_credential` and `provider_cost_status: unverified`.
@@ -643,9 +668,10 @@ credential selection, not provider ownership or invoice accuracy. Controllers ca
 check `passthrough_account_binding: configured_credential_v1` and
 `credential_values_full_masking` in the native capability response. The additional
 `passthrough_account_provider: credential_metadata_v1` flag identifies the captured
-provider-label contract.
+provider-label contract. `passthrough_account_grants: application_account_path_method_v1`
+identifies the additional request-time application/account/path/method gate
 
-Actual account enrollment, application route grants, provider-specific usage and
+Actual account enrollment, automated account-route/key provisioning, provider-specific usage and
 billing reconciliation, signed/query/OAuth credentials, mTLS and WebSocket account
 binding remain open. Native JSON envelope/body handling still applies; arbitrary
 API payload compatibility needs protocol tests. No production routes or LAN/Tailscale

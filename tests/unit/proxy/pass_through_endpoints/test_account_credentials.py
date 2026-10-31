@@ -7,8 +7,10 @@ from pydantic import SecretStr, ValidationError
 from litellm.models.credentials import CredentialItem
 from litellm.proxy._types import PassThroughGenericEndpoint
 from litellm.proxy.pass_through_endpoints.account_credentials import (
+    AccountApplicationGrant,
     AccountHeaderCredential,
     CredentialHeader,
+    account_application_allowed,
     credential_origin,
     resolve_account_credential,
     validate_account_request,
@@ -24,6 +26,69 @@ POLICY: Final = AccountHeaderCredential(
     headers=(CredentialHeader(name="X-Vendor-Credential", field="access value", prefix="Bearer "),),
     allowed_query_parameters=("page",),
 )
+
+
+GRANTED_POLICY: Final = AccountHeaderCredential.model_validate(
+    POLICY.model_dump()
+    | {
+        "application_grants": [
+            {
+                "application_id": "fixture-app",
+                "key_hash": "a" * 64,
+                "account_id": "fixture-account",
+                "path": "/reports/usage",
+                "methods": ["GET"],
+            }
+        ]
+    }
+)
+
+
+@pytest.mark.parametrize(
+    ("application_id", "path", "method", "allowed"),
+    (
+        ("fixture-app", "/reports/usage", "GET", True),
+        (None, "/reports/usage", "GET", False),
+        ("other-app", "/reports/usage", "GET", False),
+        ("fixture-app", "/reports/usage", "HEAD", False),
+        ("fixture-app", "/reports/usage", "POST", False),
+        ("fixture-app", "/reports/usage", "get", False),
+        ("fixture-app", "/reports", "GET", False),
+        ("fixture-app", "/reports/usage/detailed", "GET", False),
+        ("fixture-app", "/reports/usage/", "GET", False),
+        ("fixture-app", "/reports/other/../usage", "GET", False),
+    ),
+)
+def test_account_application_grants_require_every_scope_dimension(
+    application_id: str | None, path: str, method: str, allowed: bool
+) -> None:
+    assert account_application_allowed(GRANTED_POLICY, application_id, "a" * 64, path, method) is allowed
+
+
+def test_account_application_grants_deny_empty_policy_and_cannot_survive_account_retargeting() -> None:
+    assert not account_application_allowed(POLICY, "fixture-app", "a" * 64, "/reports/usage", "GET")
+    with pytest.raises(ValidationError):
+        AccountHeaderCredential.model_validate(GRANTED_POLICY.model_dump() | {"account_id": "another-account"})
+
+
+@pytest.mark.parametrize("key_hash", (None, "b" * 64, "raw-key", "A" * 64))
+def test_account_application_grants_require_the_authenticated_key_hash(key_hash: str | None) -> None:
+    assert not account_application_allowed(GRANTED_POLICY, "fixture-app", key_hash, "/reports/usage", "GET")
+
+
+@pytest.mark.parametrize(
+    "path",
+    ("//host", "/a//b", "/a/../b", "/a/./b", "/a?x=1", "/a#frag", "/a%2fb", "/a\\b", "/a/*", "/{rest:path}"),
+)
+def test_account_application_grants_reject_ambiguous_or_pattern_paths(path: str) -> None:
+    with pytest.raises(ValidationError):
+        AccountApplicationGrant.model_validate(GRANTED_POLICY.application_grants[0].model_dump() | {"path": path})
+
+
+@pytest.mark.parametrize("methods", (("get",), ("*",), ("GET", "GET"), (), ("GET\r\nHost",)))
+def test_account_application_grants_require_unique_explicit_methods(methods: tuple[str, ...]) -> None:
+    with pytest.raises(ValidationError):
+        AccountApplicationGrant.model_validate(GRANTED_POLICY.application_grants[0].model_dump() | {"methods": methods})
 
 
 def credential(

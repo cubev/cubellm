@@ -20,6 +20,7 @@ class CubeControlCapabilities(BaseModel):
     passthrough_header_isolation: Literal[True] = True
     passthrough_account_binding: Literal["configured_credential_v1"] = "configured_credential_v1"
     passthrough_account_provider: Literal["credential_metadata_v1"] = "credential_metadata_v1"
+    passthrough_account_grants: Literal["application_account_path_method_v1"] = "application_account_path_method_v1"
     credential_values_full_masking: Literal[True] = True
     virtual_key_log_redaction: Literal[True] = True
     custom_keys_allowed: bool

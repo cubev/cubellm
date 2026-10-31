@@ -495,3 +495,50 @@ These corrections and the image proof do not complete account enrollment,
 application method/account grants, authoritative provider usage and billing,
 LAN/Tailscale activation, credential rotation or distributed revocation. No
 production image, service, provider credential, collector or application has changed
+
+
+## Request-time application account grants
+
+Named HTTP account routes now require an explicit application grant before the
+gateway resolves a provider credential. Each grant matches the authenticated
+application ID, native application-key hash, account, exact proxy path and HTTP
+method. Binding the native key hash prevents self-service application metadata
+from adopting another key's access. Client JSON identity/hash claims do not supply
+this authenticated value. The existing native route permissions still apply
+
+Missing grants deny callers with 403, including administrator keys. Existing
+named-account routes must receive explicit grants before this version is
+activated. Grant configuration rejects ambiguous paths and repeated or implicit
+methods. Retargeting a policy to another account requires updating its grants.
+The ASGI route helper supplies the path with deployment root stripping; Host
+headers do not select the grant path. Configuration writes retain the existing
+proxy-admin gate. Native capabilities expose the versioned grant contract, and
+the dashboard schema is regenerated from the backend
+
+The initial missing-grant regression returned 503 from credential lookup before
+the fix and now returns 403 first. The combined native account, capability,
+credential, relay, logging and provenance selection passes 164 tests, with 1153
+unrelated tests deselected. Eighteen ASGI/recording-transport combinations verify
+application ID, actual key hash, method and exact path, including forged request
+metadata and zero upstream calls after denial. A previous test event shared an
+application ID with the audit fixture; the new matrix now owns a separate ID,
+preserving the audit fixture's exact-one-record assertion
+
+All nine targeted security mutations are detected, covering application/key/path/
+method checks, default denial, account retargeting, path/method validation and the
+runtime gate. Restored source passes the combined selection. Strict Python 3.10
+checking of the pure policy, capability module and mapped policy tests passes;
+Ruff passes for every changed Python file. Existing AsyncMock and blocked fake
+telemetry warnings remain visible. No lint/type budget changed
+
+Direct dashboard tsc reports 957 diagnostics both with the previous generated
+schema and with this schema, at identical locations and error codes. One diagnostic
+differs in its truncated type display, so exact diagnostic text identity is not
+claimed. The generated schema is restored after comparison and includes the
+required key_hash. This is not a clean repository-wide UI type check
+
+This is source acceptance. The previously built image still represents a0724de
+and does not include these new grants. Automated non-LLM key/route provisioning,
+dynamic-resource scopes, real account/application acceptance, the next packaged
+image and coordinated native/control/collector activation remain open. No live
+route, application key, provider credential or production service was changed
