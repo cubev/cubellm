@@ -3705,6 +3705,23 @@ export interface paths {
         patch: operations["update_credential_credentials__credential_name__patch"];
         trace?: never;
     };
+    "/cube_control/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cube Control Capabilities */
+        get: operations["cube_control_capabilities_cube_control_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cursor/chat/completions": {
         parameters: {
             query?: never;
@@ -23829,6 +23846,20 @@ export interface components {
             /** Description */
             description?: string | null;
         };
+        /** AccountHeaderCredential */
+        AccountHeaderCredential: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Allowed Query Parameters
+             * @default []
+             */
+            allowed_query_parameters: string[];
+            /** Credential Name */
+            credential_name: string;
+            /** Headers */
+            headers: components["schemas"]["CredentialHeader"][];
+        };
         /**
          * AcknowledgedSafetyCheck
          * @description A pending safety check for the computer call.
@@ -29301,6 +29332,18 @@ export interface components {
         CreateSearchToolRequest: {
             search_tool: components["schemas"]["SearchTool"];
         };
+        /** CredentialHeader */
+        CredentialHeader: {
+            /** Field */
+            field: string;
+            /** Name */
+            name: string;
+            /**
+             * Prefix
+             * @default
+             */
+            prefix: string;
+        };
         /** CredentialItem */
         CredentialItem: {
             /** Credential Info */
@@ -29313,6 +29356,61 @@ export interface components {
             credential_values: {
                 [key: string]: unknown;
             };
+        };
+        /** CubeControlCapabilities */
+        CubeControlCapabilities: {
+            /**
+             * Application Identity
+             * @default authenticated_object_v1
+             * @constant
+             */
+            application_identity: "authenticated_object_v1";
+            /** Client Side Credentials Allowed */
+            client_side_credentials_allowed: boolean;
+            /**
+             * Credential Values Full Masking
+             * @default true
+             * @constant
+             */
+            credential_values_full_masking: true;
+            /** Custom Keys Allowed */
+            custom_keys_allowed: boolean;
+            /**
+             * Passthrough Account Binding
+             * @default configured_credential_v1
+             * @constant
+             */
+            passthrough_account_binding: "configured_credential_v1";
+            /**
+             * Passthrough Account Provider
+             * @default credential_metadata_v1
+             * @constant
+             */
+            passthrough_account_provider: "credential_metadata_v1";
+            /**
+             * Passthrough Application Identity
+             * @default authenticated_object_v1
+             * @constant
+             */
+            passthrough_application_identity: "authenticated_object_v1";
+            /**
+             * Passthrough Header Isolation
+             * @default true
+             * @constant
+             */
+            passthrough_header_isolation: true;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Virtual Key Log Redaction
+             * @default true
+             * @constant
+             */
+            virtual_key_log_redaction: true;
         };
         /** CustomDimension */
         CustomDimension: {
@@ -37504,6 +37602,7 @@ export interface components {
         };
         /** PassThroughGenericEndpoint */
         PassThroughGenericEndpoint: {
+            account_credential?: components["schemas"]["AccountHeaderCredential"] | null;
             /**
              * Auth
              * @description Whether authentication is required for the pass-through endpoint. Defaults to True so a pass-through silently created without an explicit value still requires a valid LiteLLM API key — set to False only if the endpoint is meant to be a public forwarder (e.g. an unauthenticated webhook target).
@@ -52742,6 +52841,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_capabilities_cube_control_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CubeControlCapabilities"];
                 };
             };
         };
