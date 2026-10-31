@@ -391,3 +391,58 @@ The existing resident producer still uses its older projection until a coordinat
 native/companion/source activation. Actual enrollment, vendor billing/usage parsers,
 real media jobs, LAN/Tailscale, rotation and verified distributed revocation remain
 open under the full all-account goal.
+
+
+## Native SDK release artifact acceptance
+
+The pinned Rust workspace is now checked out and builds with Rust 1.98.0 and
+Maturin 1.15.0. The Rustup installer and backend wheel were checksum-verified,
+and the release build used the unchanged Cargo lockfile and release profile.
+The result is a cp310-abi3 manylinux_2_39_x86_64 SDK wheel with a 39.58 MB native
+extension, below the existing 40 MB limit. Release stripping, importability,
+absence of the panic test hook and tokenizer vocabulary checks pass
+
+The existing Linux verifier previously rejected every manylinux filename even
+when all its other checks passed. It now accepts Linux x86_64 and standardized
+manylinux tags, including compressed aliases, and compares their declared libc
+floor with the numeric GLIBC requirements observed by readelf. ABI, architecture,
+metadata, debug and size checks remain enforced. Eight new acceptance cases fail
+before the fix; all 28 verifier cases pass afterward. Nine rejection cases cover
+understated libc versions, missing measurements and unsupported platforms.
+Bypassing the libc comparison makes five of those regressions fail. Compatibility
+tag definitions follow [PEP 600](https://peps.python.org/pep-0600/)
+
+The new account policy imported typing.Self despite the SDK's Python 3.10 floor.
+It now uses typing_extensions.Self, already supplied by the SDK dependencies.
+Strict checking of that module targeting Python 3.10 changes from four errors
+to none. This is a source compatibility check, not a claim that every SDK route
+was executed on Python 3.10
+
+A fresh environment installs the wheel while reusing the isolated test dependency
+set. Its interpreter runs with -I; a provenance check before collection and after
+tests requires both the SDK and native module to reside in that installed
+environment. All 115 selected account, capability, identity and gateway security
+tests pass there. The actual native tokenizer suite passes 17 tests with network
+sockets disabled and checksum-verified reference data prepared beforehand. A
+minimal asynchronous counter times out in the restricted command runner and
+passes in a normal local process; the native suite uses that normal environment.
+No Rust runtime change is inferred or introduced for this runner difference
+
+The repository's standalone native wheel route check also passes against its
+local recording server, covering synchronous and asynchronous requests, rate
+limits, 32 concurrent calls and cancellation by SIGINT. These use synthetic
+credentials and make no real provider requests. Changed verifier code and tests
+pass strict typing and Ruff. No lint/type budget was modified
+
+A read-only inspection of the existing gateway observes CPython 3.13, x86_64 and
+a GIL-enabled interpreter. Its deployed schema file and all 189 applied migration
+checksums match this checkout, with no unfinished, rolled-back or missing
+migration and all required spend projection columns present. No account records,
+provider credentials or spend rows were read, and no schema was applied. These
+checks establish the inspected schema prerequisites, not complete runtime parity
+
+The SDK wheel contains no compiled native Admin UI bundle. A complete gateway
+image with a UI built from the same source and execution on its target Python
+3.13 runtime remains open. No production image, service, collector, application
+or credential was changed. The full all-account, precise-usage and LAN/Tailscale
+objective remains active

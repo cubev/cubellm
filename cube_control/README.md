@@ -693,3 +693,18 @@ requires Pydantic 2.12 or later for that field option; see the
 These are source/artifact contracts and local acceptance results. Central account
 enrollment, source activation, provider ownership/billing verification and application
 LAN/Tailscale rollout still require their respective acceptance steps.
+
+
+## Native artifact verification
+
+The release wheel is built with the repository's pinned Rust/Maturin toolchain
+and unchanged release profile. The Linux verifier checks its Python ABI,
+architecture, matching wheel metadata and actual ELF glibc requirements, together
+with the existing import, stripping, vocabulary and size checks. Run the SDK
+acceptance tests from a fresh installed wheel with isolated imports so source
+files cannot hide a missing or stale native extension
+
+Native SDK artifact acceptance now includes the account/gateway subset, real
+native tokenizer execution and the local recording-server route checks. The
+complete gateway image, rebuilt native Admin UI, target-runtime execution and
+coordinated production/source activation remain separate required steps
