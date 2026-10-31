@@ -3,7 +3,7 @@ import json
 import os
 import secrets
 import stat
-from collections.abc import Generator, Mapping
+from collections.abc import Generator
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
@@ -12,8 +12,15 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, JsonValue, SecretStr, field_validator, model_validator
 
+from cube_control.application_accounts import (
+    AccountCapabilities,
+    AccountRouteScope,
+    ensure_account_grants,
+    inspect_account_routes,
+)
+from cube_control.application_gateway import request_gateway as _request
 from cube_control.models import FrozenModel, Identifier
 
 InferenceRoute = Literal[
@@ -32,8 +39,9 @@ class ApplicationAccessSpec(FrozenModel):
     application_id: Identifier
     team_id: Identifier
     gateway_origin: str
-    models: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=100)]
-    routes: Annotated[tuple[InferenceRoute, ...], Field(min_length=1, max_length=8)]
+    models: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
+    routes: Annotated[tuple[InferenceRoute, ...], Field(max_length=8)] = ()
+    account_routes: Annotated[tuple[AccountRouteScope, ...], Field(max_length=32)] = ()
 
     @model_validator(mode="after")
     def validate_scope(self) -> Self:
@@ -53,7 +61,19 @@ class ApplicationAccessSpec(FrozenModel):
             raise ValueError("Application models and routes must be unique")
         if "all-proxy-models" in self.models:
             raise ValueError("Application models must be explicit model aliases")
+        if bool(self.models) != bool(self.routes) or not (self.routes or self.account_routes):
+            raise ValueError("Application scope requires paired inference models/routes or account routes")
+        if len(set(self.account_paths)) != len(self.account_paths):
+            raise ValueError("Account route paths must be unique")
         return self
+
+    @property
+    def account_paths(self) -> tuple[str, ...]:
+        return tuple(scope.path for scope in self.account_routes)
+
+    @property
+    def key_routes(self) -> tuple[str, ...]:
+        return (*self.routes, *("exact:" + path for path in self.account_paths))
 
     @property
     def user_id(self) -> str:
@@ -66,6 +86,7 @@ class ApplicationAccessState(FrozenModel):
     token: SecretStr
     user_attempted: bool = False
     key_attempted: bool = False
+    account_grants_attempted: bool = False
     revocation_requested: bool = False
     block_attempted: bool = False
 
@@ -81,10 +102,18 @@ class ApplicationAccessState(FrozenModel):
             "cube_access_manager": "cubellm-v1",
         }
 
+    @property
+    def key_metadata(self) -> dict[str, JsonValue]:
+        return {
+            **self.metadata,
+            **({"allowed_passthrough_routes": list(self.spec.account_paths)} if self.spec.account_routes else {}),
+        }
+
 
 class ApplicationAccessResult(FrozenModel):
     application_id: str
     status: Literal["prepared", "provisioned", "delivered", "uncertain", "error"]
+    enforcement: Literal["not_verified"] = "not_verified"
     message: str
 
 
@@ -137,11 +166,15 @@ def _load(descriptor: int) -> ApplicationAccessState | None:
 
 def _save(descriptor: int, state: ApplicationAccessState) -> None:
     name: Final = ".state-" + secrets.token_hex(16)
-    raw: Final = state.model_dump(mode="json") | {"token": state.token.get_secret_value()}
+    raw: Final = json.dumps(
+        state.model_dump(mode="json") | {"token": state.token.get_secret_value()}, separators=(",", ":")
+    )
+    if len(raw) > 65536:
+        raise ValueError("Application state exceeds size limit")
     state_fd: Final = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=descriptor)
     try:
         with os.fdopen(state_fd, "w", encoding="utf-8") as stream:
-            json.dump(raw, stream, separators=(",", ":"))
+            stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, "state.json", src_dir_fd=descriptor, dst_dir_fd=descriptor)
@@ -245,7 +278,7 @@ class _Key(BaseModel):
     team_id: str
     models: tuple[str, ...]
     allowed_routes: tuple[str, ...]
-    metadata: dict[str, str]
+    metadata: dict[str, JsonValue]
     status: Literal["active"]
     blocked: Literal[False] | None = None
     expires: None = None
@@ -258,22 +291,6 @@ class _Key(BaseModel):
 
 class _KeyInfo(BaseModel):
     info: _Key
-
-
-def _request(
-    client: httpx.Client,
-    method: str,
-    path: str,
-    body: Mapping[str, object] | None = None,
-    params: Mapping[str, str] | None = None,
-) -> tuple[int, bytes]:
-    with client.stream(method, path, json=body, params=params) as response:
-        content: Final = bytearray()
-        for chunk in response.iter_bytes():
-            if len(content) + len(chunk) > 1_000_000:
-                raise ValueError("Gateway response exceeds size limit")
-            content.extend(chunk)
-        return response.status_code, bytes(content)
 
 
 def _matches_user(state: ApplicationAccessState, raw: bytes) -> bool:
@@ -292,9 +309,9 @@ def _matches_key(state: ApplicationAccessState, raw: bytes) -> bool:
         key.user_id == state.spec.user_id
         and key.team_id == state.spec.team_id
         and key.models == state.spec.models
-        and key.allowed_routes == state.spec.routes
-        and key.metadata == state.metadata
-        and not key.allowed_passthrough_routes
+        and key.allowed_routes == state.spec.key_routes
+        and key.metadata == state.key_metadata
+        and key.allowed_passthrough_routes in (None, state.spec.account_paths)
         and not key.aliases
         and not key.config
     )
@@ -315,25 +332,33 @@ def _provision(
     if caps_code != 200:
         return result("error", "Gateway provisioning capabilities unavailable")
     _Capabilities.model_validate_json(caps_raw)
+    if state.spec.account_routes:
+        AccountCapabilities.model_validate_json(caps_raw)
+        account_preflight: Final = inspect_account_routes(
+            client, state.spec.account_routes, state.spec.application_id, state.key_hash
+        )
+        if account_preflight is not None:
+            return result(account_preflight.status, account_preflight.message)
     team_code, team_raw = _request(client, "GET", "/team/info", params={"team_id": state.spec.team_id})
     if team_code != 200:
         return result("error", "Application team is unavailable")
     team: Final = _TeamInfo.model_validate_json(team_raw).team_info
     if team.team_id != state.spec.team_id or (team.models and not set(state.spec.models).issubset(team.models)):
         return result("error", "Application models are outside the team's explicit scope")
-    models_code, models_raw = _request(client, "GET", "/model/info")
-    if models_code != 200:
-        return result("error", "Configured application models cannot be inspected")
-    model_info: Final = _ModelInfo.model_validate_json(models_raw)
-    configured: Final = frozenset(model.model_name for model in model_info.data)
-    if not set(state.spec.models).issubset(configured):
-        return result("error", "Application models are not configured gateway aliases")
-    if any(
-        bool(model.litellm_params.configurable_clientside_auth_params)
-        for model in model_info.data
-        if model.model_name in state.spec.models
-    ):
-        return result("error", "Application models allow client credential overrides")
+    if state.spec.models:
+        models_code, models_raw = _request(client, "GET", "/model/info")
+        if models_code != 200:
+            return result("error", "Configured application models cannot be inspected")
+        model_info: Final = _ModelInfo.model_validate_json(models_raw)
+        configured: Final = frozenset(model.model_name for model in model_info.data)
+        if not set(state.spec.models).issubset(configured):
+            return result("error", "Application models are not configured gateway aliases")
+        if any(
+            bool(model.litellm_params.configurable_clientside_auth_params)
+            for model in model_info.data
+            if model.model_name in state.spec.models
+        ):
+            return result("error", "Application models allow client credential overrides")
     user_code, user_raw = _request(client, "GET", "/user/info", params={"user_id": state.spec.user_id})
     if user_code == 404:
         if not allow_creation:
@@ -368,11 +393,20 @@ def _provision(
         return result("uncertain", "Application team membership requires reconciliation; no key created or changed")
     key_code, key_raw = _request(client, "GET", "/key/info", params={"key": state.key_hash})
     if key_code == 200:
-        return (
-            result("provisioned", "Application credential and scope verified")
-            if _matches_key(state, key_raw)
-            else result("error", "Application key conflicts with the prepared scope")
-        )
+        if not _matches_key(state, key_raw):
+            return result("error", "Application key conflicts with the prepared scope")
+        if state.spec.account_routes:
+            if allow_creation and not state.account_grants_attempted:
+                _save(descriptor, state.model_copy(update={"account_grants_attempted": True}))
+            account_result: Final = ensure_account_grants(
+                client, state.spec.account_routes, state.spec.application_id, state.key_hash, allow_creation
+            )
+            if account_result is not None:
+                return result(account_result.status, account_result.message)
+            return result(
+                "provisioned", "Application credential and account grants stored; runtime enforcement unverified"
+            )
+        return result("provisioned", "Application credential and scope verified")
     if key_code != 404:
         return result("error", "Application key cannot be inspected")
     if not allow_creation:
@@ -390,9 +424,9 @@ def _provision(
             "user_id": state.spec.user_id,
             "team_id": state.spec.team_id,
             "models": list(state.spec.models),
-            "allowed_routes": list(state.spec.routes),
+            "allowed_routes": list(state.spec.key_routes),
             "key_type": "default",
-            "metadata": state.metadata,
+            "metadata": state.key_metadata,
             "send_invite_email": False,
             "auto_rotate": False,
         },
@@ -518,7 +552,7 @@ class _RevocationCapabilities(BaseModel):
 class _OwnedKey(BaseModel):
     user_id: str
     team_id: str
-    metadata: dict[str, str]
+    metadata: dict[str, JsonValue]
     status: Literal["active", "expired", "revoked", "deleted"]
     blocked: bool | None = None
 
@@ -541,7 +575,7 @@ def _revoke(client: httpx.Client, descriptor: int, state: ApplicationAccessState
     if key_code != 200:
         return result("uncertain", "Application key cannot be inspected; runtime denial is unverified")
     key: Final = _OwnedKeyInfo.model_validate_json(key_raw).info
-    if key.user_id != state.spec.user_id or key.team_id != state.spec.team_id or key.metadata != state.metadata:
+    if key.user_id != state.spec.user_id or key.team_id != state.spec.team_id or key.metadata != state.key_metadata:
         return result("error", "Key ownership conflicts with the prepared application; no key changed")
     if key.status == "deleted":
         return result("deleted", "Key deletion is recorded; cached authentication denial is unverified")

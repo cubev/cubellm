@@ -2,23 +2,32 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 import unittest
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from hashlib import sha256
+from pathlib import Path
 from typing import Final, cast
 from uuid import uuid4
 
 import httpx
 import psycopg
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from psycopg import sql
 from psycopg.types.json import Jsonb
+from pydantic import JsonValue, SecretStr, TypeAdapter
 from typing_extensions import LiteralString
 
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.management_endpoints.cube_control_endpoints import account_grant_database, router
-from litellm.proxy.pass_through_endpoints.account_credentials import AccountApplicationGrant
+from litellm.proxy.pass_through_endpoints.account_credentials import (
+    AccountApplicationGrant,
+    AccountHeaderCredential,
+    account_application_allowed,
+)
 from litellm.proxy.pass_through_endpoints.account_grants import (
     LOCK_SETTINGS_SQL,
     READ_SETTINGS_SQL,
@@ -99,6 +108,67 @@ class PostgresDatabase:
             await connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
             self.connections.put_nowait(connection.info.backend_pid)
             yield PostgresTransaction(connection, self.entered, self.release)
+
+
+class ManagementContractTransport(httpx.BaseTransport):
+    def __init__(self, client: httpx.AsyncClient, loop: asyncio.AbstractEventLoop, user_id: str, team_id: str) -> None:
+        self.client: Final = client
+        self.loop: Final = loop
+        self.user_id: Final = user_id
+        self.team_id: Final = team_id
+        self.user: dict[str, JsonValue] | None = None
+        self.key: dict[str, JsonValue] | None = None
+        self.key_hash: str | None = None
+        self.grant_writes = 0
+
+    async def native_request(self, request: httpx.Request) -> httpx.Response:
+        response: Final = await self.client.request(
+            request.method,
+            request.url.path,
+            content=request.content,
+            headers={"Content-Type": request.headers.get("content-type", "application/json")},
+        )
+        assert response.status_code == 200, (request.url.path, response.status_code, response.text)
+        return response
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        path: Final = request.url.path
+        if path.startswith("/cube_control/"):
+            if request.method == "POST":
+                self.grant_writes += 1
+            response: Final = asyncio.run_coroutine_threadsafe(self.native_request(request), self.loop).result(
+                timeout=10
+            )
+            return httpx.Response(response.status_code, content=response.content, headers=response.headers)
+        if request.method == "POST":
+            body: Final = TypeAdapter(dict[str, JsonValue]).validate_json(request.content)
+            if path == "/user/new":
+                self.user = body
+            elif path == "/key/generate":
+                token: Final = body.get("key")
+                if not isinstance(token, str):
+                    return httpx.Response(422)
+                self.key_hash = sha256(token.encode()).hexdigest()
+                self.key = {name: value for name, value in body.items() if name != "key"} | {"status": "active"}
+            else:
+                return httpx.Response(404)
+            return httpx.Response(200, json={})
+        if path == "/team/info":
+            return httpx.Response(
+                200,
+                json={
+                    "team_info": {
+                        "team_id": self.team_id,
+                        "models": [],
+                        "members_with_roles": [{"user_id": self.user_id, "role": "user"}] if self.user else [],
+                    }
+                },
+            )
+        if path == "/user/info":
+            return httpx.Response(200, json={"user_info": self.user}) if self.user else httpx.Response(404)
+        if path == "/key/info":
+            return httpx.Response(200, json={"info": self.key}) if self.key else httpx.Response(404)
+        return httpx.Response(404)
 
 
 @unittest.skipUnless(DSN, "A dedicated local PostgreSQL integration database is required")
@@ -212,7 +282,9 @@ class AccountGrantTransactions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.grants, ())
         stored: Final = await append_account_grant(self.database, "fixture-route", self.command())
         self.assertIsInstance(stored, AccountGrantReceipt)
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.application()), base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.application()), base_url="http://test"
+        ) as client:
             existing: Final = await client.post(
                 "/cube_control/account_routes/fixture-route/grants", json=outside.model_dump(mode="json")
             )
@@ -300,3 +372,80 @@ class AccountGrantTransactions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, GrantFailure("not_found"))
         count: Final = await (await self.connection.execute('SELECT count(*) FROM "LiteLLM_Config"')).fetchone()
         self.assertEqual(count, (0,))
+
+    async def test_controller_stores_native_grant_and_native_gates_enforce_its_scope(self) -> None:
+        from cube_control.application_access import (
+            ApplicationAccessSpec,
+            deliver_application_access,
+            prepare_application_access,
+            provision_application_access,
+        )
+        from cube_control.application_accounts import AccountRouteScope
+
+        await self.connection.execute(
+            'UPDATE "LiteLLM_Config" SET param_value=jsonb_set(param_value, %s, %s::jsonb)',
+            (["pass_through_endpoints", "0", "path"], json.dumps("/cube_api/fixture/quota")),
+        )
+        route: Final = await read_account_route(self.database, "fixture-route")
+        assert isinstance(route, AccountRouteDescriptor)
+        scope: Final = AccountRouteScope(
+            route_id=route.route_id,
+            account_id=route.account_id,
+            path=route.path,
+            expected_fingerprint=route.fingerprint,
+            methods=("GET",),
+        )
+        spec: Final = ApplicationAccessSpec(
+            application_id="fixture-controller-app",
+            team_id="fixture-controller-team",
+            gateway_origin="http://127.0.0.1:4000",
+            account_routes=(scope,),
+        )
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "state"
+            destination: Final = Path(root) / "consumer"
+            self.assertEqual(prepare_application_access(spec, directory).status, "prepared")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=self.application()), base_url="http://test"
+            ) as client:
+                bridge: Final = ManagementContractTransport(
+                    client, asyncio.get_running_loop(), spec.user_id, spec.team_id
+                )
+                provisioned: Final = await asyncio.to_thread(
+                    provision_application_access,
+                    directory,
+                    SecretStr("inert-controller-master"),
+                    bridge,
+                )
+                self.assertEqual(provisioned.status, "provisioned", provisioned.message)
+                self.assertEqual(bridge.grant_writes, 1)
+                delivered: Final = await asyncio.to_thread(
+                    deliver_application_access,
+                    directory,
+                    destination,
+                    SecretStr("inert-controller-master"),
+                    bridge,
+                )
+                self.assertEqual(delivered.status, "delivered")
+                self.assertEqual(bridge.grant_writes, 1)
+            row: Final = await (await self.connection.execute('SELECT param_value FROM "LiteLLM_Config"')).fetchone()
+            assert row is not None and bridge.key is not None and bridge.key_hash is not None
+            stored: Final = TypeAdapter(dict[str, JsonValue]).validate_python(row[0])
+            routes: Final = TypeAdapter(tuple[dict[str, JsonValue], ...]).validate_python(
+                stored["pass_through_endpoints"]
+            )
+            policy: Final = AccountHeaderCredential.model_validate(routes[0]["account_credential"])
+            token: Final = UserAPIKeyAuth.model_validate(bridge.key | {"token": bridge.key_hash})
+            self.assertTrue(RouteChecks.is_virtual_key_allowed_to_call_route(scope.path, token))
+            self.assertTrue(RouteChecks.check_passthrough_route_access(scope.path, token))
+            self.assertTrue(
+                account_application_allowed(policy, spec.application_id, bridge.key_hash, scope.path, "GET")
+            )
+            self.assertFalse(
+                account_application_allowed(policy, spec.application_id, bridge.key_hash, scope.path, "POST")
+            )
+            self.assertFalse(account_application_allowed(policy, spec.application_id, "b" * 64, scope.path, "GET"))
+            with self.assertRaises(HTTPException) as denied:
+                RouteChecks.is_virtual_key_allowed_to_call_route(scope.path + "/child", token)
+            self.assertEqual(denied.exception.status_code, 403)
+            self.assertNotIn((destination / "api-key").read_text().strip(), policy.model_dump_json())

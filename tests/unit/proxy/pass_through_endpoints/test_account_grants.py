@@ -133,6 +133,9 @@ def test_account_grant_can_name_one_concrete_registered_subpath_without_granting
     plan: Final = plan_account_grant(settings, "fixture-route", command(settings, child))
     assert isinstance(plan, GrantPlan)
     assert plan.descriptor.grants == (child,)
+    assert plan.descriptor.include_subpath
+    exact: Final = describe_account_route(SETTINGS, "fixture-route")
+    assert isinstance(exact, AccountRouteDescriptor) and not exact.include_subpath
     sibling: Final = GRANT.model_copy(update={"path": "/fixture/quota-extra/child"})
     assert plan_account_grant(settings, "fixture-route", command(settings, sibling)) == GrantFailure("invalid")
 

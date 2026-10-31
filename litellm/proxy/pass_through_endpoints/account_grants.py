@@ -47,6 +47,7 @@ class AccountRouteDescriptor(BaseModel):
     account_id: str
     path: str
     methods: tuple[str, ...]
+    include_subpath: bool = False
     origin: str
     fingerprint: str
     grants: tuple[AccountApplicationGrant, ...]
@@ -124,6 +125,7 @@ def describe_account_route(settings: Mapping[str, JsonValue], route_id: str) -> 
             account_id=route.account_credential.account_id,
             path=route.path,
             methods=route.methods,
+            include_subpath=route.include_subpath,
             origin=credential_origin(route.target),
             fingerprint=sha256(json.dumps(stable, sort_keys=True, allow_nan=False).encode()).hexdigest(),
             grants=route.account_credential.application_grants,

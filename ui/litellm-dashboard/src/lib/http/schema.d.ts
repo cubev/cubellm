@@ -23942,6 +23942,11 @@ export interface components {
             fingerprint: string;
             /** Grants */
             grants: components["schemas"]["AccountApplicationGrant"][];
+            /**
+             * Include Subpath
+             * @default false
+             */
+            include_subpath: boolean;
             /** Methods */
             methods: string[];
             /** Origin */

@@ -611,3 +611,34 @@ bypass an existing inference-only key's explicit route list. Direct execution of
 the native key gate returns 403 despite the team's exact passthrough grant.
 That suspicion was disproved and the unnecessary team-rejection experiment was
 removed. No existing team is rejected by this change
+
+
+## Application controller account routes
+
+`ApplicationAccessSpec` accepts `account_routes` next to models and inference
+routes, so a key can be account-only or mixed. The controller pins each route to
+its prepared fingerprint, checks the account capabilities and route descriptors
+before any user or key mutation, issues `exact:/cube_api/...` key routes plus the
+matching passthrough metadata and then stores grants through the atomic native API.
+A journal flag marks the first grant attempt; only the idempotent grant step is
+retried after a timeout. Delivery stays read only and revocation compares the
+actual key metadata. The native route descriptor now reports `include_subpath`,
+and the dashboard schema was regenerated for it. Results report
+`enforcement: not_verified`. Bounded gateway HTTP reads moved unchanged into a
+shared helper module
+
+The full companion suite passes 163 tests with the dedicated non-administrator
+PostgreSQL role, and all 9 native PostgreSQL grant tests pass. One of them drives
+the real controller against the real native grant API, isolated database schemas
+and the native key and account gates. User and key management in that test is a
+clearly named contract transport, so it does not prove native user/key persistence
+or complete gateway acceptance. Its first run failed with 422 because the test
+transport dropped the JSON content type; that was a test bug, not a product fix
+
+43 targeted mutations of the new controller, account and native descriptor code
+are all detected after adding tests for route ID drift, subpath boundaries, foreign
+grants of other keys, misplaced grants on another route, receipts without the grant,
+passthrough list drift and revocation metadata drift. Ruff and basedpyright report
+no findings for the changed modules and tests. Automatic route creation, complete
+account inventory, provider billing reconciliation, further auth protocols, the
+next complete image and real LAN/Tailscale application acceptance remain open

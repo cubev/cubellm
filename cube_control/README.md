@@ -483,7 +483,9 @@ invitations, verifies ordinary team membership, and creates one key with the
 specified model and inference-route restrictions. It checks the resulting row
 again before reporting `provisioned`. Existing unrelated or privileged users,
 changed permissions, blocked/expired keys, passthrough grants and key-level
-alias/config overrides fail closed. It never updates an existing principal or key
+alias/config overrides fail closed. Passthrough routes are accepted only when they
+equal the specification's own account routes (see below). It never updates an
+existing principal or key
 
 The state directory must be owned by the current user with mode 0700, and its
 files must have mode 0600. It contains the application key, never the master or
@@ -497,8 +499,7 @@ scope is rejected. Results and validation errors do not print raw credentials
 `provisioned` verifies the native credential and its scope. It does not prove
 provider billing-account ownership, request accounting, successful inference,
 application wiring or network publication. Remote application installation,
-rotation, runtime revocation verification and non-LLM application grants remain
-separate work. This
+rotation and runtime revocation verification remain separate work. This
 command does not provide a generic passthrough permission or transfer provider
 credentials to applications. The new native capability endpoint must be deployed
 before provisioning can succeed
@@ -690,8 +691,8 @@ The versioned capability `application_exact_routes: exact_path_v1` lets controll
 require this support before issuing a restricted key. Exact key paths still need
 the native role/passthrough permission and, for named account routes, the separate
 application/key/account/path/method grant. They do not grant provider ownership or
-promise worker-wide reload. The current application controller still uses its
-existing inference-only specification; account-route enrollment remains open
+promise worker-wide reload. The application controller issues these entries for
+its account routes, described in the next sections
 
 
 ## Atomic account grant management
@@ -723,9 +724,67 @@ configuration representations are supported
 
 A successful receipt reports `stored: true` and `enforcement: not_verified`.
 The existing native configuration cache is invalidated, but this does not prove
-that every worker has reloaded or that a provider request succeeds. Automatic
-controller enrollment of non-LLM application routes remains open, as do dynamic
-resource scopes, a new complete gateway image and real application acceptance
+that every worker has reloaded or that a provider request succeeds. Dynamic
+resource scopes, automatic route creation, a new complete gateway image and real
+application acceptance remain open
+
+
+## Application account routes
+
+An application specification can name existing named HTTP account routes in
+addition to, or instead of, inference models and routes. Models and inference
+routes still have to be given together, and a specification with neither inference
+scope nor account routes is rejected:
+
+```json
+{
+  "application_id": "example-app",
+  "team_id": "existing-team",
+  "gateway_origin": "http://127.0.0.1:4000",
+  "account_routes": [{
+    "route_id": "example-route",
+    "account_id": "example-account",
+    "expected_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "path": "/cube_api/example-account/quota",
+    "methods": ["GET"]
+  }]
+}
+```
+
+Take `expected_fingerprint` from `GET /cube_control/account_routes/{route_id}`.
+Managed account paths must live under the dedicated `/cube_api/` gateway namespace,
+so they cannot collide with native administration or inference paths. Paths are
+concrete and canonical: no wildcards, percent encoding, dot segments, duplicate
+slashes or the bare namespace. Methods are explicit, uppercase and unique. Each
+path may appear once. A route with `include_subpath` can be used for several
+concrete child paths, each with its own methods, without granting its siblings.
+One key can use routes of several accounts, each pinned to its own fingerprint
+
+With account routes, provisioning additionally requires the capabilities
+`application_exact_routes`, `passthrough_account_grants`,
+`passthrough_account_grant_management`, `passthrough_account_binding`,
+`passthrough_header_isolation` and `credential_values_full_masking`. Before any
+user or key is created it reads every route descriptor and stops if the route ID,
+account, fingerprint, method subset or path boundary differ from the prepared
+scope, or if a grant for the prepared key hash already exceeds it. Grants of other
+applications and keys on the same route are left untouched
+
+The key gets one `exact:/cube_api/...` entry per account path in `allowed_routes`
+and the same paths in `metadata.allowed_passthrough_routes`. After the key row is
+verified, the journal records `account_grants_attempted` and the controller appends
+missing grants through the atomic grant API. Grants already stored are read back
+instead of being posted again. Because that API is idempotent, a timeout during
+grant storage only retries the grant operation; it never repeats an uncertain user
+or key creation. A final read confirms that every prepared grant is really stored.
+Delivery is read only: it delivers nothing if a grant is missing or a stored grant,
+fingerprint, key metadata or passthrough list has drifted. Revocation compares the
+key's actual metadata, including the passthrough list, before blocking it
+
+Results carry `enforcement: not_verified`, also after storage and delivery. This
+shows the stored native state, not worker reload, a successful provider call or
+LAN/Tailnet reachability. The journal is size-checked before any temporary state
+file is created, so an oversized specification leaves no unreadable state behind.
+Routes are not created by the controller; they must already exist in the database
 
 
 ## Account provenance in the usage audit
