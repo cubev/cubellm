@@ -23,7 +23,7 @@ Run `node tests/ui_errors.cjs` for the browser source-error regression. Run Ruff
 
 ## Current increment
 
-Prioritize the gateway audit surface and reliable application/account attribution. Expose request-level records, reporting periods, model and counter details, missing values and correction history. Provider billing and gateway-reported charges remain separate. Application identity must come from authenticated gateway identity, and account identity from a confirmed server-controlled deployment mapping. Model names, arbitrary client metadata and the existence of one account at a provider do not prove account attribution
+Prioritize the gateway audit surface and reliable application/account attribution. Expose request-level records, reporting periods, model and counter details, missing values and correction history. Provider billing and gateway-reported charges remain separate. Application identity must come from an explicit authenticated key binding, and account identity from a confirmed server-controlled deployment mapping. Model names, arbitrary client metadata and the existence of one account at a provider do not prove account attribution
 
 Media job record management now uses stable command identities, expected revisions and immutable history. Submitted reservations remain held past their local deadline. Provider submission, polling and billing reconciliation remain separate open work; record management alone is not a functioning HeyGen integration
 
@@ -99,3 +99,34 @@ exponents without changing the caller's context. An HTTP regression compares the
 account total with the SQL audit total; Chromium verifies the full budget
 remainder string and mobile layout. The full companion suite passes 109 tests
 on the isolated PostgreSQL host. No provider or production account was changed
+
+
+## Application binding writer acceptance
+
+Native project management is license-gated in the inspected source. Explicit
+key-metadata binding provides application attribution independently of project
+creation. A read-only inert-object probe in the deployed gateway confirmed that
+authenticated metadata replaces client claims and absence clears them. No key
+was created or changed by this probe
+
+The new writer adds only the validated `user_api_key_application_id` scalar to
+standard/spend metadata. Persistence derives it from the actual authenticated
+key object, rejecting bare client scalars and JSON imitations even when a path
+bypasses the pre-call sanitizer. Management target metadata cannot reassign the
+calling application's identity. Key metadata is not immutable; issuance policy,
+management-route restrictions and cache invalidation remain part of application
+provisioning acceptance. No full application rollout is claimed
+
+The local read-only producer now uses this scalar and leaves project-only rows
+without an application assignment. No current key-table join is introduced.
+Previously reported project-based assignments may be corrected on a future scan;
+source history remains retained. This producer is not installed. Its original
+project-as-app shortcut is superseded because a project may group several apps
+
+The native identity/redaction subset passes 98 tests with network sockets disabled,
+including request-time metadata snapshots after a later key edit. Five temporary-
+PostgreSQL producer tests pass. Ruff passes and the shared identifier validator
+passes strict type checking. A separate read-only baseline probe confirmed that
+the deployed writer does not yet know this field and no stored nonempty value
+exists there. This confirms the deployment dependency; the new attribution is not
+live. The Opus /simplify consultation was conceptual, not a file or full-path audit

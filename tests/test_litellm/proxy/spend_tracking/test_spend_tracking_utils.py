@@ -74,6 +74,87 @@ def _get_additional_usage_values_for_usage(usage: litellm.Usage) -> dict:
     return metadata["additional_usage_values"]
 
 
+@pytest.mark.parametrize(
+    "binding,expected",
+    [
+        ("application-one", "application-one"),
+        (None, None),
+        (True, None),
+        ({"nested": "application"}, None),
+        ("invalid/application", None),
+        ("a" * 129, None),
+    ],
+)
+def test_authenticated_application_binding_is_stamped_and_retained_without_other_key_metadata(
+    binding: object,
+    expected: str | None,
+) -> None:
+    auth: Final = UserAPIKeyAuth(
+        api_key="inert-fixture",
+        metadata={
+            "cube_application_id": binding,
+            "opaque_vendor_value": "private-key-metadata-canary",
+        },
+    )
+    request: Final = {"metadata": {"user_api_key_application_id": "forged-by-client"}}
+    result: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(request, auth, "metadata")
+    assert result["metadata"]["user_api_key_application_id"] == expected
+    standard: Final = StandardLoggingPayloadSetup.get_standard_logging_metadata(result["metadata"])
+    stored: Final = _get_spend_logs_metadata(dict(standard), user_api_key_auth=auth)
+    assert stored.get("user_api_key_application_id") == expected
+    assert "private-key-metadata-canary" not in json.dumps(stored)
+    assert auth.metadata["cube_application_id"] == binding
+
+
+def test_management_target_metadata_cannot_reassign_the_calling_application() -> None:
+    auth: Final = UserAPIKeyAuth(api_key="inert-fixture", metadata={"cube_application_id": "calling-app"})
+    request: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+        {"metadata": {}}, auth, "metadata"
+    )
+    merged: Final = LiteLLMProxyRequestSetup.add_management_endpoint_metadata_to_request_metadata(
+        request, {"cube_application_id": "target-app"}, "metadata"
+    )
+    standard: Final = StandardLoggingPayloadSetup.get_standard_logging_metadata(merged["metadata"])
+    stored: Final = _get_spend_logs_metadata(dict(standard), user_api_key_auth=auth)
+    assert stored.get("user_api_key_application_id") == "calling-app"
+    assert auth.metadata["cube_application_id"] == "calling-app"
+
+
+@pytest.mark.parametrize("authenticated", [True, False])
+def test_application_binding_requires_an_authenticated_object_at_the_spend_writer(authenticated: bool) -> None:
+    auth: Final = UserAPIKeyAuth(api_key="inert-fixture", metadata={"cube_application_id": "server-app",
+                                                                  "opaque_vendor_value":"private-key-metadata-canary"})
+    metadata: Final = {
+        "user_api_key_application_id": "forged-by-client",
+        "user_api_key_auth": auth if authenticated else auth.model_dump(),
+    }
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={"model": "gpt-4o-mini", "litellm_params": {"metadata": metadata}},
+        response_obj=litellm.ModelResponse(
+            id="fixture", choices=[], usage=litellm.Usage(prompt_tokens=1, completion_tokens=1)
+        ),
+        start_time=now,
+        end_time=now,
+    )
+    stored: Final = json.loads(payload["metadata"])
+    assert stored.get("user_api_key_application_id") == ("server-app" if authenticated else None)
+    assert "private-key-metadata-canary" not in safe_dumps(payload)
+
+
+def test_application_binding_keeps_request_snapshot_after_key_metadata_changes() -> None:
+    auth: Final = UserAPIKeyAuth(api_key="inert-fixture",metadata={"cube_application_id":"original-app"})
+    request: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata({"metadata":{}},auth,"metadata")
+    auth.metadata["cube_application_id"] = "later-app"
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={"model":"gpt-4o-mini","litellm_params":{"metadata":request["metadata"]}},
+        response_obj=litellm.ModelResponse(id="fixture",choices=[],usage=litellm.Usage(prompt_tokens=1,completion_tokens=1)),
+        start_time=now,end_time=now,
+    )
+    assert json.loads(payload["metadata"]).get("user_api_key_application_id") == "original-app"
+
+
 @pytest.mark.parametrize("store_prompts,redact", [(True, False), (False, False), (True, True)])
 def test_classifier_audit_spend_storage_obeys_privacy_and_truncation(monkeypatch, store_prompts, redact):
     from litellm.proxy import proxy_server

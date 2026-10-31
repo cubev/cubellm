@@ -415,3 +415,27 @@ currency and period. Missing reports, outages and currency mismatches yield no
 remainder. The browser displays the server's decimal string and does not subtract
 binary floating-point values. A remainder based on estimated costs stays labelled
 as such. Older readers without this field simply omit that optional calculation
+
+
+## Request-time application identity
+
+The native gateway can bind a key to an explicit application through operator
+metadata `cube_application_id`. Only a bounded identifier is accepted. The
+pre-call sanitizer overwrites `user_api_key_application_id`, including clearing
+client claims when the key has no valid binding. The spend writer independently
+derives this scalar from an actual authenticated UserAPIKeyAuth object. A plain
+JSON dictionary or a client-supplied scalar cannot establish an application
+
+Only the scalar enters the spend metadata. Full key metadata is not copied into
+the audit. The native project grouping stays separate and must not be presented
+as proof of an individual application. Binding edits affect later authenticated
+requests and do not rewrite stored history or infer identities from today's key
+records. A logging path without the authenticated object remains unassigned
+
+This is attribution, not a grant to use models or provider accounts. Application
+credentials must have narrowly scoped inference routes and no management routes,
+including metadata updates; operators own provisioning and binding changes.
+Actual key issuance, application wiring and protocol coverage still need their
+own verification. Deploy the gateway writer and verify its stored scalar before
+enabling the revised application projection. A companion rollout alone does not
+install this native writer

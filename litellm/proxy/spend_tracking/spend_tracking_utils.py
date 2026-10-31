@@ -44,7 +44,8 @@ from litellm.litellm_core_utils.litellm_logging import (
 )
 from litellm.litellm_core_utils.ptu_pricing import azure_spillover
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps, strip_null_bytes
-from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload, SpendLogsRouterMetadata
+from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload, SpendLogsRouterMetadata, UserAPIKeyAuth
+from litellm.proxy.common_utils.application_identity import application_id_from_key_metadata
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
 from litellm.proxy.utils import PrismaClient, hash_token
@@ -154,6 +155,7 @@ _STAMPED_METADATA_KEYS: Final = frozenset(
         "autorouter_savings",
         "autorouter_savings_estimate",
         "autorouter_baseline_observation",
+        "user_api_key_application_id",
     )
 )
 
@@ -178,9 +180,14 @@ def _get_spend_logs_metadata(
     autorouter_baseline_observation: str | None = None,
     router_metadata: SpendLogsRouterMetadata | None = None,
     azure_spillover: AzureSpillover | None = None,
+    user_api_key_auth: UserAPIKeyAuth | None = None,
 ) -> SpendLogsMetadata:
+    application_id: Final = application_id_from_key_metadata(
+        user_api_key_auth.metadata if user_api_key_auth is not None else None
+    )
     if metadata is None:
         return SpendLogsMetadata(
+            user_api_key_application_id=application_id,
             user_api_key=None,
             user_api_key_alias=None,
             user_api_key_team_id=None,
@@ -232,6 +239,7 @@ def _get_spend_logs_metadata(
         **MappingProxyType(
             {key: metadata.get(key) for key in SpendLogsMetadata.__annotations__ if key not in _STAMPED_METADATA_KEYS}
         ),
+        user_api_key_application_id=application_id,
         autorouter_savings=autorouter_savings,
         autorouter_savings_estimate=autorouter_savings_estimate,
         autorouter_baseline_observation=autorouter_baseline_observation,
@@ -639,8 +647,11 @@ def get_logging_payload(
     )
 
     # clean up litellm metadata
+    metadata_snapshot: Final[Mapping[str, object]] = metadata
+    auth_object: Final = metadata_snapshot.get("user_api_key_auth")
     clean_metadata = _get_spend_logs_metadata(
         persisted_metadata,
+        user_api_key_auth=auth_object if isinstance(auth_object,UserAPIKeyAuth) else None,
         applied_guardrails=(
             standard_logging_payload["metadata"].get("applied_guardrails", None)
             if standard_logging_payload is not None
