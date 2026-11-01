@@ -7,7 +7,14 @@ from typing_extensions import Self
 from litellm._logging import verbose_proxy_logger
 
 from .account_credentials import AccountHeaderCredential, Identifier
-from .account_grants import GrantDatabase, GrantTransaction
+from .account_grants import (
+    LOCK_SETTINGS_SQL,
+    GrantDatabase,
+    GrantFailure,
+    GrantTransaction,
+    describe_account_policy,
+    settings_from_rows,
+)
 from .account_resources import ResourcePathMatch, ResourceTypeName, canonical_resource_id, find_resource
 
 _COLUMNS: Final = '"account_id", "resource_type", "resource_id", "route_id", "owner_application_id", "provenance"'
@@ -75,30 +82,36 @@ async def _read(
     return rows[0] if len(rows) == 1 else None
 
 
+async def record_in_transaction(
+    transaction: GrantTransaction, claim: ResourceClaim
+) -> OwnershipRecorded | OwnershipConflict:
+    key: Final = (
+        claim.account_id,
+        claim.resource_type,
+        claim.resource_id,
+        claim.route_id,
+        claim.owner_application_id,
+    )
+    inserted: Final = (
+        await transaction.execute_raw(CLAIM_CREATED_SQL, *key, claim.creator_key_hash)
+        if claim.creator_key_hash is not None
+        else await transaction.execute_raw(CLAIM_ADOPTED_SQL, *key)
+    )
+    if inserted not in (0, 1):
+        raise RuntimeError("Resource ownership claim changed an unexpected number of rows")
+    stored: Final = await _read(transaction, claim.account_id, claim.resource_type, claim.resource_id)
+    if stored is None:
+        raise RuntimeError("Resource ownership could not be read back")
+    if stored.owner_application_id == claim.owner_application_id and stored.route_id == claim.route_id:
+        return OwnershipRecorded(stored, inserted == 1)
+    if inserted == 1:
+        raise RuntimeError("Resource ownership readback does not match the new claim")
+    return OwnershipConflict(stored)
+
+
 async def record_ownership(database: GrantDatabase, claim: ResourceClaim) -> OwnershipRecorded | OwnershipConflict:
     async with database.tx() as transaction:
-        key: Final = (
-            claim.account_id,
-            claim.resource_type,
-            claim.resource_id,
-            claim.route_id,
-            claim.owner_application_id,
-        )
-        inserted: Final = (
-            await transaction.execute_raw(CLAIM_CREATED_SQL, *key, claim.creator_key_hash)
-            if claim.creator_key_hash is not None
-            else await transaction.execute_raw(CLAIM_ADOPTED_SQL, *key)
-        )
-        if inserted not in (0, 1):
-            raise RuntimeError("Resource ownership claim changed an unexpected number of rows")
-        stored: Final = await _read(transaction, claim.account_id, claim.resource_type, claim.resource_id)
-        if stored is None:
-            raise RuntimeError("Resource ownership could not be read back")
-        if stored.owner_application_id == claim.owner_application_id and stored.route_id == claim.route_id:
-            return OwnershipRecorded(stored, inserted == 1)
-        if inserted == 1:
-            raise RuntimeError("Resource ownership readback does not match the new claim")
-        return OwnershipConflict(stored)
+        return await record_in_transaction(transaction, claim)
 
 
 async def read_ownership(
@@ -157,3 +170,53 @@ async def proxy_ownership_lookup(account_id: str, resource_type: str, resource_i
         GrantDatabase, proxy_server.prisma_client
     )
     return await read_ownership(database, account_id, resource_type, resource_id)
+
+
+class ResourceAdoptionCommand(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    expected_fingerprint: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    resource_type: ResourceTypeName
+    resource_id: Annotated[str, Field(min_length=1, max_length=256)]
+    application_id: Identifier
+
+    @model_validator(mode="after")
+    def validate_adoption(self) -> Self:
+        if not canonical_resource_id(self.resource_id):
+            raise ValueError("Resource ids must be one canonical path segment")
+        return self
+
+
+class AccountResourceReceipt(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    stored: Literal[True] = True
+    inserted: bool
+    enforcement: Literal["not_verified"] = "not_verified"
+    ownership: ResourceOwnership
+
+
+async def adopt_resource(
+    database: GrantDatabase, route_id: str, command: ResourceAdoptionCommand
+) -> OwnershipRecorded | OwnershipConflict | GrantFailure:
+    async with database.tx() as transaction:
+        settings: Final = settings_from_rows(await transaction.query_raw(LOCK_SETTINGS_SQL, "general_settings"))
+        if isinstance(settings, GrantFailure):
+            return settings
+        described: Final = describe_account_policy(settings, route_id)
+        if isinstance(described, GrantFailure):
+            return described
+        descriptor, policy = described
+        if descriptor.fingerprint != command.expected_fingerprint:
+            return GrantFailure("conflict")
+        if command.resource_type not in frozenset(resource.name for resource in policy.resource_types):
+            return GrantFailure("invalid")
+        return await record_in_transaction(
+            transaction,
+            ResourceClaim(
+                account_id=policy.account_id,
+                resource_type=command.resource_type,
+                resource_id=command.resource_id,
+                route_id=route_id,
+                owner_application_id=command.application_id,
+                provenance="adopted",
+            ),
+        )

@@ -136,6 +136,18 @@ def describe_account_route(settings: Mapping[str, JsonValue], route_id: str) -> 
         return GrantFailure("invalid")
 
 
+def describe_account_policy(
+    settings: Mapping[str, JsonValue], route_id: str
+) -> tuple[AccountRouteDescriptor, AccountHeaderCredential] | GrantFailure:
+    descriptor: Final = describe_account_route(settings, route_id)
+    if isinstance(descriptor, GrantFailure):
+        return descriptor
+    raw: Final = _route(settings, route_id)
+    if isinstance(raw, GrantFailure):
+        return raw
+    return descriptor, _Route.model_validate(raw).account_credential
+
+
 def plan_account_grant(
     settings: Mapping[str, JsonValue], route_id: str, command: AccountGrantCommand
 ) -> GrantPlan | GrantFailure:

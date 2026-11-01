@@ -10,17 +10,27 @@ from uuid import uuid4
 
 import psycopg
 from psycopg import sql
+from psycopg.types.json import Jsonb
+from pydantic import JsonValue
 from typing_extensions import LiteralString
 
-from litellm.proxy.pass_through_endpoints.account_grants import GrantTransaction
+from litellm.proxy.pass_through_endpoints.account_grants import (
+    LOCK_SETTINGS_SQL,
+    AccountRouteDescriptor,
+    GrantFailure,
+    GrantTransaction,
+    describe_account_route,
+)
 from litellm.proxy.pass_through_endpoints.account_ownership import (
     CLAIM_ADOPTED_SQL,
     CLAIM_CREATED_SQL,
     READ_OWNERSHIP_SQL,
     OwnershipConflict,
     OwnershipRecorded,
+    ResourceAdoptionCommand,
     ResourceClaim,
     ResourceOwnership,
+    adopt_resource,
     read_ownership,
     record_ownership,
 )
@@ -31,6 +41,23 @@ MIGRATION: Final = (
     / "litellm-proxy-extras/litellm_proxy_extras/migrations/20261101120000_add_account_resource_ownership/migration.sql"
 )
 CREATOR: Final = "a" * 64
+ROUTE: Final[dict[str, JsonValue]] = {
+    "id": "fixture-route",
+    "path": "/cube_api/media",
+    "target": "https://vendor.example/v1",
+    "methods": ["GET", "POST"],
+    "include_subpath": True,
+    "auth": True,
+    "forward_headers": False,
+    "account_credential": {
+        "account_id": "fixture-account",
+        "credential_name": "fixture-credential",
+        "headers": [{"name": "X-Api-Key", "field": "api_key", "prefix": ""}],
+        "allowed_query_parameters": [],
+        "resource_types": [{"name": "video-job", "item_paths": ["/cube_api/media/jobs/{resource_id}"]}],
+    },
+}
+SETTINGS: Final[dict[str, JsonValue]] = {"pass_through_endpoints": [ROUTE]}
 ROTATED: Final = "b" * 64
 
 
@@ -50,7 +77,7 @@ def claim(**changes: str | None) -> ResourceClaim:
 
 
 def postgres_query(query: str) -> sql.SQL:
-    if query not in {CLAIM_CREATED_SQL, CLAIM_ADOPTED_SQL, READ_OWNERSHIP_SQL}:
+    if query not in {CLAIM_CREATED_SQL, CLAIM_ADOPTED_SQL, READ_OWNERSHIP_SQL, LOCK_SETTINGS_SQL}:
         raise ValueError("Unexpected SQL outside the ownership transaction contract")
     return sql.SQL(
         cast(
@@ -123,7 +150,16 @@ class AccountOwnershipTransactions(unittest.IsolatedAsyncioTestCase):
         await self.connection.execute(
             sql.SQL(cast(LiteralString, MIGRATION.read_text()))  # cast-ok: the repository's own migration file
         )
+        await self.connection.execute(
+            'CREATE TABLE "LiteLLM_Config" (param_name text PRIMARY KEY, param_value jsonb NOT NULL)'
+        )
+        await self.connection.execute(
+            'INSERT INTO "LiteLLM_Config" VALUES (%s, %s)', ("general_settings", Jsonb(SETTINGS))
+        )
         self.database = PostgresDatabase(self.schema)
+        descriptor: Final = describe_account_route(SETTINGS, "fixture-route")
+        assert isinstance(descriptor, AccountRouteDescriptor)
+        self.fingerprint = descriptor.fingerprint
 
     async def asyncTearDown(self) -> None:
         try:
@@ -234,3 +270,127 @@ class AccountOwnershipTransactions(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             await read_ownership(PostgresDatabase("missing-schema"), "fixture-account", "video-job", "a/b")
         )
+
+    def adoption(self, **changes: str) -> ResourceAdoptionCommand:
+        return ResourceAdoptionCommand.model_validate(
+            {
+                "expected_fingerprint": self.fingerprint,
+                "resource_type": "video-job",
+                "resource_id": "legacy_7",
+                "application_id": "fixture-app",
+            }
+            | changes
+        )
+
+    async def test_adoption_binds_an_existing_resource_to_the_application_once(self) -> None:
+        first: Final = await adopt_resource(self.database, "fixture-route", self.adoption())
+        repeated: Final = await adopt_resource(self.database, "fixture-route", self.adoption())
+        expected: Final = ResourceOwnership(
+            route_id="fixture-route", owner_application_id="fixture-app", provenance="adopted", creator_key_hash=None
+        )
+        self.assertEqual((first, repeated), (OwnershipRecorded(expected, True), OwnershipRecorded(expected, False)))
+        self.assertEqual(await self.rows(), [("legacy_7", "fixture-app", "adopted", None)])
+
+    async def test_adoption_against_a_stale_or_mismatched_route_writes_nothing(self) -> None:
+        for route_id, command, failure in (
+            ("fixture-route", self.adoption(expected_fingerprint="0" * 64), GrantFailure("conflict")),
+            ("fixture-route", self.adoption(resource_type="audio-job"), GrantFailure("invalid")),
+            ("missing-route", self.adoption(), GrantFailure("not_found")),
+        ):
+            with self.subTest(route_id=route_id, command=command):
+                self.assertEqual(await adopt_resource(self.database, route_id, command), failure)
+        self.assertEqual(await self.rows(), [])
+
+    async def test_adoption_never_takes_over_a_resource_of_another_application(self) -> None:
+        await record_ownership(self.database, claim(resource_id="legacy_7"))
+        result: Final = await adopt_resource(self.database, "fixture-route", self.adoption(application_id="other-app"))
+        self.assertIsInstance(result, OwnershipConflict)
+        self.assertEqual(await self.rows(), [("legacy_7", "fixture-app", "created", CREATOR)])
+
+    async def test_adoption_waits_for_a_competing_route_change_and_then_refuses_the_stale_fingerprint(self) -> None:
+        writer: Final = await psycopg.AsyncConnection.connect(DSN)
+        try:
+            await writer.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
+            await writer.execute(
+                'SELECT param_value FROM "LiteLLM_Config" WHERE param_name = %s FOR UPDATE', ("general_settings",)
+            )
+            await writer.execute(
+                'UPDATE "LiteLLM_Config" SET param_value = jsonb_set(param_value, %s, %s::jsonb)',
+                (["pass_through_endpoints", "0", "target"], '"https://vendor.example/v2"'),
+            )
+            adoption_database: Final = PostgresDatabase(self.schema)
+            adoption: Final = asyncio.create_task(adopt_resource(adoption_database, "fixture-route", self.adoption()))
+            backend: Final = await asyncio.wait_for(adoption_database.connections.get(), timeout=5)
+            for _ in range(100):
+                self.assertFalse(adoption.done(), "Adoption read configuration that a writer still held")
+                waiting = await (
+                    await self.connection.execute(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (backend,)
+                    )
+                ).fetchone()
+                if waiting == ("Lock",):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("Adoption did not wait on the configuration row lock")
+            await writer.commit()
+            self.assertEqual(await adoption, GrantFailure("conflict"))
+        finally:
+            await writer.close()
+        self.assertEqual(await self.rows(), [])
+
+    async def test_a_route_change_waits_until_a_running_adoption_has_committed(self) -> None:
+        entered: Final = asyncio.Event()
+        release: Final = asyncio.Event()
+        adoption: Final = asyncio.create_task(
+            adopt_resource(
+                PostgresDatabase(self.schema, entered=entered, release=release), "fixture-route", self.adoption()
+            )
+        )
+        writer: Final = await psycopg.AsyncConnection.connect(DSN)
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await writer.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
+            change: Final = asyncio.create_task(
+                writer.execute(
+                    'UPDATE "LiteLLM_Config" SET param_value = jsonb_set(param_value, %s, %s::jsonb)',
+                    (["pass_through_endpoints", "0", "target"], '"https://vendor.example/v2"'),
+                )
+            )
+            for _ in range(100):
+                self.assertFalse(change.done(), "Route change passed configuration still locked by the adoption")
+                waiting = await (
+                    await self.connection.execute(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (writer.info.backend_pid,)
+                    )
+                ).fetchone()
+                if waiting == ("Lock",):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("Route change did not wait for the adoption transaction")
+            release.set()
+            recorded: Final = await adoption
+            await change
+            await writer.commit()
+        finally:
+            release.set()
+            await writer.close()
+            if not adoption.done():
+                adoption.cancel()
+        self.assertIsInstance(recorded, OwnershipRecorded)
+        self.assertEqual(await self.rows(), [("legacy_7", "fixture-app", "adopted", None)])
+        target: Final = await (
+            await self.connection.execute(
+                "SELECT param_value #>> '{pass_through_endpoints,0,target}' FROM \"LiteLLM_Config\""
+            )
+        ).fetchone()
+        self.assertEqual(target, ("https://vendor.example/v2",))
+        stale: Final = await adopt_resource(self.database, "fixture-route", self.adoption(resource_id="legacy_8"))
+        self.assertEqual(stale, GrantFailure("conflict"))
+        self.assertEqual(await self.rows(), [("legacy_7", "fixture-app", "adopted", None)])
+
+    async def test_an_unverifiable_adoption_is_rolled_back(self) -> None:
+        with self.assertRaises(RuntimeError):
+            await adopt_resource(PostgresDatabase(self.schema, hide_readback=True), "fixture-route", self.adoption())
+        self.assertEqual(await self.rows(), [])
