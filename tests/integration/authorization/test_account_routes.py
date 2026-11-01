@@ -1,8 +1,10 @@
 import json
 import os
+import socket
 import subprocess
 import sys
 import uuid
+from contextlib import ExitStack
 from hashlib import sha256
 from pathlib import Path
 from typing import Final
@@ -11,7 +13,7 @@ import httpx
 import pytest
 from integration._support.upstream import delete_scenario, register_scenario
 from integration.cost_calculation.cost_tracking_case import JsonResponse, RoutedResponse
-from pydantic import JsonValue
+from pydantic import JsonValue, TypeAdapter
 
 from tests.integration._support.client import (
     JSON_OBJECT,
@@ -795,3 +797,181 @@ def test_account_inventory_reports_stored_bindings_to_admins_only_without_secret
             )
             for (inventory, sibling), key in zip(denials, keys, strict=True)
         ] == [((401, "auth_error"), (401, "auth_error"), False)] * 2, [item.text for pair in denials for item in pair]
+
+
+def _control_process(arguments: list[str], database_url: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "cube_control", *arguments],
+        text=True,
+        capture_output=True,
+        env=os.environ
+        | {
+            "PYTHONPATH": os.pathsep.join((str(CUBE_CONTROL_SOURCE), *sys.path)),
+            "CUBE_CONTROL_DATABASE_URL": database_url,
+        },
+        timeout=120,
+        check=False,
+    )
+
+
+def _inventory_rows(origin: str) -> list[dict[str, JsonValue]]:
+    return read_rows(
+        "SELECT attempt::text AS attempt, coalesce(last_good::text, '') AS last_good "
+        "FROM cube_control.gateway_inventories WHERE gateway_origin = %s",
+        (origin,),
+    )
+
+
+def _restore_inventory_row(origin: str, prior: list[dict[str, JsonValue]]) -> None:
+    if prior:
+        write_rows(
+            "INSERT INTO cube_control.gateway_inventories (gateway_origin, attempt, last_good) "
+            "VALUES (%s, %s::jsonb, NULLIF(%s, '')::jsonb) ON CONFLICT (gateway_origin) DO UPDATE "
+            "SET attempt = EXCLUDED.attempt, last_good = EXCLUDED.last_good",
+            (origin, string_value(prior[0]["attempt"]), string_value(prior[0]["last_good"])),
+        )
+    else:
+        write_rows("DELETE FROM cube_control.gateway_inventories WHERE gateway_origin = %s", (origin,))
+    assert _inventory_rows(origin) == prior
+
+
+SOCKET_ADDRESS: Final = TypeAdapter(tuple[str, int])
+
+
+def _stop(process: subprocess.Popen[bytes]) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=15)
+
+
+def _serve_control(cleanup: ExitStack, database_url: str, log: Path) -> str:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        _, port = SOCKET_ADDRESS.validate_python(probe.getsockname())
+    stderr: Final = cleanup.enter_context(log.open("w"))
+    process: Final = subprocess.Popen(
+        [sys.executable, "-m", "cube_control", "serve", "--host", "127.0.0.1", "--port", str(port)],
+        env=os.environ
+        | {
+            "PYTHONPATH": os.pathsep.join((str(CUBE_CONTROL_SOURCE), *sys.path)),
+            "CUBE_CONTROL_DATABASE_URL": database_url,
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=stderr,
+    )
+    cleanup.callback(_stop, process)
+    base: Final = f"http://127.0.0.1:{port}"
+
+    def health() -> int:
+        assert process.poll() is None, "controller exited before it became ready"
+        try:
+            return httpx.get(f"{base}/healthz", timeout=2, trust_env=False).status_code
+        except httpx.TransportError:
+            return 0
+
+    eventually(health, lambda status: status == 200, seconds=60)
+    return base
+
+
+def test_controller_collects_the_native_inventory_and_reports_the_failed_retry(
+    gateway: Gateway, tmp_path: Path
+) -> None:
+    origin: Final = _admin_origin(gateway)
+    if origin is None:
+        pytest.skip("The controller only administers a gateway reached over a loopback HTTP origin with a port")
+    database_url: Final = os.environ["DATABASE_URL"]
+    if read_rows("SELECT current_database() AS name", ()) != [{"name": "cubecontrol_test"}]:
+        pytest.skip("The controller acceptance only writes to the dedicated cubecontrol_test database")
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-collected-{marker}"
+    canary: Final = f"sk-collected-canary-{marker}"
+    wrong_key: Final = f"sk-wrong-{marker}"
+    initialized: Final = _control_process(["init"], database_url)
+    assert initialized.returncode == 0, initialized.stderr
+    prior: Final = _inventory_rows(origin)
+    with gateway.scenario() as scenario, ExitStack() as cleanup:
+        cleanup.callback(_restore_inventory_row, origin, prior)
+        handle: Final = register_scenario(marker, JsonResponse(content_type="application/json", body={"ok": True}))
+        scenario.cleanups.callback(delete_scenario, handle)
+        bound: Final = _credential(gateway, scenario, account, canary)
+        route_id: Final = f"integration-collected-route-{marker}"
+        gateway.post(
+            "/cube_control/account_routes",
+            {
+                "route": {
+                    "id": route_id,
+                    "path": f"/cube_api/integration-{marker}/collected",
+                    "target": f"{handle.api_base()}/v1/collected",
+                    "methods": ["GET"],
+                    "account_credential": {
+                        "account_id": account,
+                        "credential_name": bound,
+                        "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+                    },
+                }
+            },
+        )
+        scenario.cleanups.callback(_delete_route_if_present, gateway, route_id)
+        admin: Final = tmp_path / "admin.env"
+        admin.write_text(f"LITELLM_MASTER_KEY={gateway.key}\n")
+        admin.chmod(0o600)
+        wrong: Final = tmp_path / "wrong.env"
+        wrong.write_text(f"LITELLM_MASTER_KEY={wrong_key}\n")
+        wrong.chmod(0o600)
+        arguments: Final = ["collect-gateway-inventory", "--gateway-origin", origin, "--config"]
+        collected: Final = _control_process([*arguments, str(admin)], database_url)
+        retried: Final = _control_process([*arguments, str(wrong)], database_url)
+        control: Final = _serve_control(cleanup, database_url, tmp_path / "control.log")
+        response: Final = httpx.get(f"{control}/api/v1/inventory", timeout=30, trust_env=False)
+
+    outputs: Final = (
+        collected.stdout
+        + collected.stderr
+        + retried.stdout
+        + retried.stderr
+        + response.text
+        + (tmp_path / "control.log").read_text()
+    )
+    assert not any(secret in outputs for secret in (canary, gateway.key, wrong_key)), (
+        "controller output leaked a secret"
+    )
+    assert [
+        (result.returncode, object_value(JSON_OBJECT.validate_json(result.stdout))["status"])
+        for result in (collected, retried)
+    ] == [(0, "collected"), (1, "error")], collected.stderr + retried.stderr
+    assert response.status_code == 200, response.text
+    report: Final = object_value(JSON_OBJECT.validate_json(response.content))
+    gateways: Final = [
+        item
+        for item in map(object_value, report["gateways"] if isinstance(report["gateways"], list) else [])
+        if item["gateway_origin"] == origin
+    ]
+    assert [
+        (item["state"], item["last_attempt_status"], item["last_good_observed_at"] is not None) for item in gateways
+    ] == [("last_attempt_failed", "error", True)], gateways
+    entry: Final = next(
+        item
+        for item in map(object_value, report["accounts"] if isinstance(report["accounts"], list) else [])
+        if item["account_id"] == account
+    )
+    credentials: Final = [
+        object_value(item)
+        for item in (entry["credentials"] if isinstance(entry["credentials"], list) else [])
+        if object_value(item)["gateway_origin"] == origin
+    ]
+    assert ("database", bound, "bound") in [
+        (
+            object_value(item["credential"])["origin"],
+            object_value(item["credential"])["credential_name"],
+            object_value(item["credential"])["binding"],
+        )
+        for item in credentials
+    ], credentials
+    routes: Final = entry["routes"] if isinstance(entry["routes"], list) else []
+    assert ("database", route_id) in [
+        (object_value(object_value(item)["route"])["origin"], object_value(object_value(item)["route"])["route_id"])
+        for item in routes
+    ], routes
