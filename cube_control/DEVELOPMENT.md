@@ -639,6 +639,52 @@ transport dropped the JSON content type; that was a test bug, not a product fix
 are all detected after adding tests for route ID drift, subpath boundaries, foreign
 grants of other keys, misplaced grants on another route, receipts without the grant,
 passthrough list drift and revocation metadata drift. Ruff and basedpyright report
-no findings for the changed modules and tests. Automatic route creation, complete
+no findings for the changed modules and tests. Route creation (see next section), complete
 account inventory, provider billing reconciliation, further auth protocols, the
 next complete image and real LAN/Tailscale application acceptance remain open
+
+
+## Automatic account route creation
+
+Added `POST /cube_control/account_routes` and the controller command
+`provision-account-route`. The native transaction inserts a missing settings row,
+locks it, appends one grantless route through JSONB and verifies the readback,
+including the exact route count, unchanged earlier routes and the stored content of
+the new route. Identical retries make no write. The endpoint checks the named
+credential for account and origin before writing and invalidates the configuration
+cache only after a real creation
+
+Route conflicts are decided with the real Starlette path patterns. An independent
+review reproduced that the first prefix-based planner accepted
+`/cube_api/review/quota` below an existing `/cube_api/{rest:path}` route. The
+planner now evaluates stored routes and the routes of the application that serves
+the request (`request.scope["app"]`), handles `:path` converters segment by
+segment and rejects patterns it cannot evaluate. A regression suite registers the
+existing and new routes on a real FastAPI router and checks with HTTP requests
+that every allowed route really answers its own path and children. The proxy's own
+parameter routes such as `/{mcp_server_name}/mcp` also block matching paths.
+Against the 567 routes of the real proxy application, ordinary exact and subpath
+routes such as `/cube_api/example/quota` remain allowed, while `/cube_api/mcp` and
+`/cube_api/v1/batches` are rejected because native parameter routes would capture them
+
+Further review findings were fixed: `httpx.InvalidURL` is now a validation error,
+so the CLI rejects such input with exit code 2 before reading credentials or
+contacting the gateway. Blank and control characters in targets are rejected also
+after percent decoding of the host, without a host allow-list, so internal host
+names and IPv6 zones remain usable. The same check applies natively
+
+Evidence: 781 native tests in the affected selection (route and grant units,
+endpoint tests, 21 PostgreSQL transaction tests and the route-check suite) and the
+complete companion suite with 172 tests pass. The PostgreSQL tests cover concurrent
+distinct, identical and same-path creations waiting on the real row lock,
+concurrent creation of a missing settings row, rollback, string-encoded settings,
+exact decimals and an end-to-end controller run that creates a route through the
+native API and then grants an application on it. 62 targeted mutations of the
+native module, endpoint, controller and CLI are all detected by assertion
+failures; per-mutant pytest output is kept for review. basedpyright reports no
+findings (Python 3.12, native module also 3.10), Ruff is clean and the new native
+module has no type-discipline findings. The dashboard schema was regenerated
+
+User and key management in the end-to-end test still uses the contract transport,
+so this is not proof of native user/key persistence. No production route,
+credential or service was changed

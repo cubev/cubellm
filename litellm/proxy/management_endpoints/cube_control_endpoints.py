@@ -1,12 +1,15 @@
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Final, Literal, NoReturn, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from pydantic import BaseModel, ConfigDict, JsonValue
 
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+from litellm.models.credentials import CredentialItem
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.config_resolvers.settings_rules import coerce_bool
+from litellm.proxy.pass_through_endpoints.account_credentials import resolve_account_credential
 from litellm.proxy.pass_through_endpoints.account_grants import (
     AccountGrantCommand,
     AccountGrantReceipt,
@@ -15,6 +18,12 @@ from litellm.proxy.pass_through_endpoints.account_grants import (
     GrantFailure,
     append_account_grant,
     read_account_route,
+)
+from litellm.proxy.pass_through_endpoints.account_routes import (
+    AccountRouteCreateCommand,
+    AccountRouteReceipt,
+    create_account_route,
+    serving_route_patterns,
 )
 
 router: Final = APIRouter()
@@ -32,6 +41,7 @@ class CubeControlCapabilities(BaseModel):
     passthrough_account_provider: Literal["credential_metadata_v1"] = "credential_metadata_v1"
     passthrough_account_grants: Literal["application_account_path_method_v1"] = "application_account_path_method_v1"
     passthrough_account_grant_management: Literal["atomic_append_v1"] = "atomic_append_v1"
+    passthrough_account_route_management: Literal["atomic_create_v1"] = "atomic_create_v1"
     credential_values_full_masking: Literal[True] = True
     virtual_key_log_redaction: Literal[True] = True
     custom_keys_allowed: bool
@@ -61,6 +71,16 @@ async def account_grant_database(
     return cast(GrantDatabase, proxy_server.prisma_client)
 
 
+def account_credential_lookup() -> Callable[[str], CredentialItem | None]:
+    return CredentialAccessor.find_credential
+
+
+def account_config_invalidator() -> Callable[[str], Awaitable[None]]:
+    from litellm.proxy.utils import invalidate_config_param
+
+    return invalidate_config_param
+
+
 def _raise_grant_failure(failure: GrantFailure) -> NoReturn:
     raise HTTPException(
         status_code={"not_found": 404, "conflict": 409, "invalid": 400}[failure.kind],
@@ -80,6 +100,33 @@ async def cube_control_account_route(
         raise HTTPException(status_code=503, detail="Account grant database request failed") from None
     if isinstance(result, GrantFailure):
         _raise_grant_failure(result)
+    return result
+
+
+@router.post("/cube_control/account_routes", response_model=AccountRouteReceipt)
+async def cube_control_create_account_route(
+    command: AccountRouteCreateCommand,
+    request: Request,
+    _admin: Annotated[UserAPIKeyAuth, Depends(_require_account_admin)],
+    database: Annotated[GrantDatabase, Depends(account_grant_database)],
+    find_credential: Annotated[Callable[[str], CredentialItem | None], Depends(account_credential_lookup)],
+    invalidate: Annotated[Callable[[str], Awaitable[None]], Depends(account_config_invalidator)],
+) -> AccountRouteReceipt:
+    policy: Final = command.route.account_credential
+    try:
+        _ = resolve_account_credential(policy, find_credential(policy.credential_name), command.route.target)
+    except ValueError:
+        raise HTTPException(
+            status_code=422, detail="Named account credential is unavailable for this account and origin"
+        ) from None
+    try:
+        result: Final = await create_account_route(database, command, serving_route_patterns(request.scope))
+    except Exception:
+        raise HTTPException(status_code=503, detail="Account route database request failed") from None
+    if isinstance(result, GrantFailure):
+        _raise_grant_failure(result)
+    if result.created:
+        await invalidate("general_settings")
     return result
 
 

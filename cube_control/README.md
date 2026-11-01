@@ -582,7 +582,7 @@ Native capabilities expose `passthrough_application_identity` and
 `passthrough_header_isolation` for controllers that need these installed
 contracts. The named account binding below adds request-time credential and origin
 attribution; live account ownership still requires provider verification.
-Query-based credentials, signatures, automated account-route provisioning, per-provider usage/cost parsing and actual account enrollment require
+Query-based credentials, signatures, per-provider usage/cost parsing and actual account enrollment require
 their own implementation and acceptance. The generic gateway's configured
 per-request price must not be treated as an authoritative provider bill
 
@@ -672,7 +672,7 @@ check `passthrough_account_binding: configured_credential_v1` and
 provider-label contract. `passthrough_account_grants: application_account_path_method_v1`
 identifies the additional request-time application/account/path/method gate
 
-Actual account enrollment, automated account-route/key provisioning, provider-specific usage and
+Actual account enrollment, provider-specific usage and
 billing reconciliation, signed/query/OAuth credentials, mTLS and WebSocket account
 binding remain open. Native JSON envelope/body handling still applies; arbitrary
 API payload compatibility needs protocol tests. No production routes or LAN/Tailscale
@@ -725,8 +725,8 @@ configuration representations are supported
 A successful receipt reports `stored: true` and `enforcement: not_verified`.
 The existing native configuration cache is invalidated, but this does not prove
 that every worker has reloaded or that a provider request succeeds. Dynamic
-resource scopes, automatic route creation, a new complete gateway image and real
-application acceptance remain open
+resource scopes, a new complete gateway image and real application acceptance
+remain open
 
 
 ## Application account routes
@@ -784,7 +784,67 @@ Results carry `enforcement: not_verified`, also after storage and delivery. This
 shows the stored native state, not worker reload, a successful provider call or
 LAN/Tailnet reachability. The journal is size-checked before any temporary state
 file is created, so an oversized specification leaves no unreadable state behind.
-Routes are not created by the controller; they must already exist in the database
+Create missing routes first with `provision-account-route`, described next
+
+
+## Account route creation
+
+Proxy administrators can create a named HTTP account route with
+`POST /cube_control/account_routes`. The capability
+`passthrough_account_route_management: atomic_create_v1` identifies the contract.
+The body is `{"route": {...}}` with `id`, a concrete `path` under `/cube_api/`,
+`target`, explicit uppercase `methods`, optional `include_subpath` and an
+`account_credential` without grants. The gateway stores the route with
+`auth: true` and `forward_headers: false`. Grants are appended separately
+
+Before storing, the named credential must be usable for the account and target
+origin on the serving gateway: it must exist, carry the matching `cube_account_id`
+and allow the origin, and its header fields must resolve. Otherwise the request
+returns 422 and nothing is written. Targets with blank or control characters,
+also after percent decoding of the host, are rejected. Internal host names,
+IPv6 zone identifiers and percent-encoded path data stay valid
+
+A new path must not be captured by, or capture, any other route. The check uses
+the real Starlette path patterns of every stored pass-through route and of every
+route on the application that serves the request, including parameter routes such
+as `/{mcp_server_name}/mcp` and `:path` converters. A subpath route also conflicts
+with any pattern that could match one of its children. Patterns that cannot be
+evaluated safely, unknown router entries and the same path with other methods are
+rejected conservatively. Conflicts return 409 and write nothing
+
+The transaction inserts an empty `general_settings` row when none exists, locks the
+row, appends exactly one route with a server-side JSONB update and reads it back
+before committing. Unrelated settings and exact decimal values are preserved. An
+identical retry returns the existing route with `created: false` and writes nothing,
+even after grants were added. A different definition under the same ID conflicts.
+The configuration cache is invalidated only after a real creation. The receipt
+carries the route descriptor, its fingerprint and `enforcement: not_verified`
+
+From the controller, run `provision-account-route --config ADMIN_ENV` with the
+route specification on stdin:
+
+```json
+{
+  "gateway_origin": "http://127.0.0.1:4000",
+  "route_id": "example-route",
+  "account_id": "example-account",
+  "credential_name": "example stored credential",
+  "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+  "target": "https://api.example.com/v1/quota",
+  "path": "/cube_api/example-account/quota",
+  "methods": ["GET"]
+}
+```
+
+The command rejects invalid input with exit code 2 before it reads the
+administrator file or contacts the gateway. It checks the capability, posts the
+definition and verifies that the receipt matches route ID, account, path, methods,
+subpath flag, target origin and grant accounts. It prints `created` or `existing`
+with the fingerprint to use as `expected_fingerprint` in the application
+specification. Definite rejections (400, 409, 422) are errors. Other outcomes are
+`uncertain`, and repeating the identical command is safe because creation is
+idempotent. The worker that serves the request registers the route when the
+configuration reloads; worker-wide registration and provider access are not verified
 
 
 ## Account provenance in the usage audit

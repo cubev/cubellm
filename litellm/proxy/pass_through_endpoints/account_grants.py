@@ -172,7 +172,7 @@ def plan_account_grant(
     return GrantPlan(descriptor.model_copy(update={"grants": updated_policy.application_grants}), True, route_index)
 
 
-def _settings(rows: object) -> Mapping[str, JsonValue] | GrantFailure:
+def settings_from_rows(rows: object) -> Mapping[str, JsonValue] | GrantFailure:
     try:
         parsed: Final = TypeAdapter(tuple[_ConfigRow, ...]).validate_python(rows)
         if len(parsed) != 1:
@@ -187,7 +187,7 @@ def _settings(rows: object) -> Mapping[str, JsonValue] | GrantFailure:
 
 async def read_account_route(database: GrantDatabase, route_id: str) -> AccountRouteDescriptor | GrantFailure:
     async with database.tx() as transaction:
-        settings: Final = _settings(await transaction.query_raw(READ_SETTINGS_SQL, "general_settings"))
+        settings: Final = settings_from_rows(await transaction.query_raw(READ_SETTINGS_SQL, "general_settings"))
         return settings if isinstance(settings, GrantFailure) else describe_account_route(settings, route_id)
 
 
@@ -195,7 +195,7 @@ async def append_account_grant(
     database: GrantDatabase, route_id: str, command: AccountGrantCommand
 ) -> AccountGrantReceipt | GrantFailure:
     async with database.tx() as transaction:
-        settings: Final = _settings(await transaction.query_raw(LOCK_SETTINGS_SQL, "general_settings"))
+        settings: Final = settings_from_rows(await transaction.query_raw(LOCK_SETTINGS_SQL, "general_settings"))
         if isinstance(settings, GrantFailure):
             return settings
         plan: Final = plan_account_grant(settings, route_id, command)
@@ -210,7 +210,7 @@ async def append_account_grant(
             )
             if count != 1:
                 raise RuntimeError("Account grant transaction did not update exactly one configuration row")
-            stored: Final = _settings(await transaction.query_raw(READ_SETTINGS_SQL, "general_settings"))
+            stored: Final = settings_from_rows(await transaction.query_raw(READ_SETTINGS_SQL, "general_settings"))
             verified: Final = stored if isinstance(stored, GrantFailure) else describe_account_route(stored, route_id)
             if (
                 isinstance(verified, GrantFailure)

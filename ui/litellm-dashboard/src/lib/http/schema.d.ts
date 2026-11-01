@@ -3705,6 +3705,23 @@ export interface paths {
         patch: operations["update_credential_credentials__credential_name__patch"];
         trace?: never;
     };
+    "/cube_control/account_routes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cube Control Create Account Route */
+        post: operations["cube_control_create_account_route_cube_control_account_routes_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cube_control/account_routes/{route_id}": {
         parameters: {
             query?: never;
@@ -23934,6 +23951,27 @@ export interface components {
             /** Headers */
             headers: components["schemas"]["CredentialHeader"][];
         };
+        /** AccountRouteCreateCommand */
+        AccountRouteCreateCommand: {
+            route: components["schemas"]["AccountRouteDefinition"];
+        };
+        /** AccountRouteDefinition */
+        AccountRouteDefinition: {
+            account_credential: components["schemas"]["AccountHeaderCredential"];
+            /** Id */
+            id: string;
+            /**
+             * Include Subpath
+             * @default false
+             */
+            include_subpath: boolean;
+            /** Methods */
+            methods: string[];
+            /** Path */
+            path: string;
+            /** Target */
+            target: string;
+        };
         /** AccountRouteDescriptor */
         AccountRouteDescriptor: {
             /** Account Id */
@@ -23955,6 +23993,24 @@ export interface components {
             path: string;
             /** Route Id */
             route_id: string;
+        };
+        /** AccountRouteReceipt */
+        AccountRouteReceipt: {
+            /** Created */
+            created: boolean;
+            /**
+             * Enforcement
+             * @default not_verified
+             * @constant
+             */
+            enforcement: "not_verified";
+            route: components["schemas"]["AccountRouteDescriptor"];
+            /**
+             * Stored
+             * @default true
+             * @constant
+             */
+            stored: true;
         };
         /**
          * AcknowledgedSafetyCheck
@@ -29501,6 +29557,12 @@ export interface components {
              * @constant
              */
             passthrough_account_provider: "credential_metadata_v1";
+            /**
+             * Passthrough Account Route Management
+             * @default atomic_create_v1
+             * @constant
+             */
+            passthrough_account_route_management: "atomic_create_v1";
             /**
              * Passthrough Application Identity
              * @default authenticated_object_v1
@@ -52946,6 +53008,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_create_account_route_cube_control_account_routes_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountRouteCreateCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountRouteReceipt"];
                 };
             };
             /** @description Validation Error */

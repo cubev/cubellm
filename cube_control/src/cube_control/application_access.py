@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -20,6 +19,7 @@ from cube_control.application_accounts import (
     ensure_account_grants,
     inspect_account_routes,
 )
+from cube_control.application_gateway import gateway_client, require_admin_origin
 from cube_control.application_gateway import request_gateway as _request
 from cube_control.models import FrozenModel, Identifier
 
@@ -45,18 +45,7 @@ class ApplicationAccessSpec(FrozenModel):
 
     @model_validator(mode="after")
     def validate_scope(self) -> Self:
-        origin: Final = urlsplit(self.gateway_origin)
-        if (
-            origin.scheme != "http"
-            or origin.hostname not in ("127.0.0.1", "::1")
-            or origin.username is not None
-            or origin.password is not None
-            or origin.path not in ("", "/")
-            or origin.query
-            or origin.fragment
-            or origin.port is None
-        ):
-            raise ValueError("Administrative gateway access requires an explicit loopback HTTP origin and port")
+        require_admin_origin(self.gateway_origin)
         if len(set(self.models)) != len(self.models) or len(set(self.routes)) != len(self.routes):
             raise ValueError("Application models and routes must be unique")
         if "all-proxy-models" in self.models:
@@ -448,14 +437,7 @@ def provision_application_access(
                 return ApplicationAccessResult(
                     application_id="unknown", status="error", message="Prepare application state first"
                 )
-            with httpx.Client(
-                base_url=state.spec.gateway_origin,
-                headers={"Authorization": "Bearer " + master_key.get_secret_value()},
-                timeout=20,
-                follow_redirects=False,
-                trust_env=False,
-                transport=transport,
-            ) as client:
+            with gateway_client(state.spec.gateway_origin, master_key, transport) as client:
                 return _provision(client, descriptor, state)
     except httpx.HTTPError:
         return ApplicationAccessResult(
@@ -511,14 +493,7 @@ def deliver_application_access(
                     status="error",
                     message="Prepare and provision application state first",
                 )
-            with httpx.Client(
-                base_url=state.spec.gateway_origin,
-                headers={"Authorization": "Bearer " + master_key.get_secret_value()},
-                timeout=20,
-                follow_redirects=False,
-                trust_env=False,
-                transport=transport,
-            ) as client:
+            with gateway_client(state.spec.gateway_origin, master_key, transport) as client:
                 verified: Final = _provision(client, descriptor, state, allow_creation=False)
             if verified.status != "provisioned":
                 return verified
@@ -609,14 +584,7 @@ def revoke_application_access(
                 )
             requested: Final = existing.model_copy(update={"revocation_requested": True})
             _save(descriptor, requested)
-            with httpx.Client(
-                base_url=requested.spec.gateway_origin,
-                headers={"Authorization": "Bearer " + master_key.get_secret_value()},
-                timeout=20,
-                follow_redirects=False,
-                trust_env=False,
-                transport=transport,
-            ) as client:
+            with gateway_client(requested.spec.gateway_origin, master_key, transport) as client:
                 return _revoke(client, descriptor, requested)
     except httpx.HTTPError:
         return ApplicationRevocationResult(

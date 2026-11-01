@@ -16,6 +16,13 @@ AccountMethods = Annotated[
 ]
 
 
+def require_managed_path(path: str) -> None:
+    if "//" in path or any(part in {".", ".."} for part in path.split("/")):
+        raise ValueError("Account scopes require canonical concrete paths")
+    if not path.startswith("/cube_api/") or path == "/cube_api/":
+        raise ValueError("Managed account scopes require the dedicated /cube_api/ namespace")
+
+
 class AccountRouteScope(FrozenModel):
     route_id: Identifier
     account_id: Identifier
@@ -25,10 +32,7 @@ class AccountRouteScope(FrozenModel):
 
     @model_validator(mode="after")
     def concrete_scope(self) -> Self:
-        if "//" in self.path or any(part in {".", ".."} for part in self.path.split("/")):
-            raise ValueError("Account scopes require canonical concrete paths")
-        if not self.path.startswith("/cube_api/") or self.path == "/cube_api/":
-            raise ValueError("Managed account scopes require the dedicated /cube_api/ namespace")
+        require_managed_path(self.path)
         if len(set(self.methods)) != len(self.methods):
             raise ValueError("Account scope methods must be unique")
         return self

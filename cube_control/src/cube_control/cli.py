@@ -11,6 +11,7 @@ import psycopg
 import uvicorn
 from pydantic import ValidationError
 
+from cube_control.account_routes import AccountRouteSpec, ensure_account_route
 from cube_control.api import create_app
 from cube_control.application_access import (
     ApplicationAccessSpec,
@@ -66,6 +67,8 @@ def main() -> int:
     revoke_access_parser: Final = sub.add_parser("revoke-application")
     revoke_access_parser.add_argument("--state-directory", required=True, type=Path)
     revoke_access_parser.add_argument("--config", required=True, type=Path)
+    route_parser: Final = sub.add_parser("provision-account-route")
+    route_parser.add_argument("--config", required=True, type=Path)
     deliver_access_parser: Final = sub.add_parser("deliver-application")
     deliver_access_parser.add_argument("--state-directory", required=True, type=Path)
     deliver_access_parser.add_argument("--destination-directory", required=True, type=Path)
@@ -112,6 +115,22 @@ def main() -> int:
         application_prepared: Final = prepare_application_access(application_spec, args.state_directory)
         print(application_prepared.model_dump_json())
         return 0 if application_prepared.status == "prepared" else 1
+    if args.command == "provision-account-route":
+        raw_route: Final = sys.stdin.read(65537)
+        try:
+            if len(raw_route) > 65536:
+                raise ValueError("Account route specification exceeds size limit")
+            route_spec: Final = AccountRouteSpec.model_validate_json(raw_route)
+        except ValueError:
+            print("Account route specification rejected; input values are not logged", file=sys.stderr)
+            return 2
+        route_key: Final = read_private_key(args.config, "LITELLM_MASTER_KEY", "Gateway")
+        if isinstance(route_key, Unavailable):
+            print(route_key.message, file=sys.stderr)
+            return 2
+        route_result: Final = ensure_account_route(route_spec, route_key)
+        print(route_result.model_dump_json())
+        return 0 if route_result.status in ("created", "existing") else 1
     if args.command in ("provision-application", "deliver-application", "revoke-application"):
         master_key: Final = read_private_key(args.config, "LITELLM_MASTER_KEY", "Gateway")
         if isinstance(master_key, Unavailable):
