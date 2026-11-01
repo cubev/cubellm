@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Annotated, Final, Literal, Protocol
+from typing import Annotated, Final, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 from typing_extensions import Self
@@ -146,3 +146,14 @@ async def resource_access_allowed(
         verbose_proxy_logger.warning("Account resource ownership lookup failed; access denied")
         return False
     return ownership is not None and ownership.owner_application_id == application_id and ownership.route_id == route_id
+
+
+async def proxy_ownership_lookup(account_id: str, resource_type: str, resource_id: str, /) -> ResourceOwnership | None:
+    from litellm.proxy import proxy_server
+
+    if proxy_server.prisma_client is None:
+        raise RuntimeError("Account resource ownership requires the proxy database")
+    database: Final = cast(  # cast-ok: PrismaClient provides the tx() protocol used for account configuration
+        GrantDatabase, proxy_server.prisma_client
+    )
+    return await read_ownership(database, account_id, resource_type, resource_id)

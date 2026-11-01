@@ -13,6 +13,7 @@ from litellm.proxy._types import (
     LitellmUserRoles,
     UserAPIKeyAuth,
 )
+from litellm.proxy.pass_through_endpoints.account_resources import is_resource_template, resource_id_in_path
 
 from .auth_checks_organization import _user_is_org_admin
 
@@ -604,6 +605,9 @@ class RouteChecks:
         if allowed_route.startswith("exact:"):
             exact_path: Final = allowed_route.removeprefix("exact:")
             return exact_path.startswith("/") and route == exact_path
+        if allowed_route.startswith("resource:"):
+            template: Final = allowed_route.removeprefix("resource:")
+            return is_resource_template(template) and resource_id_in_path(template, route) is not None
 
         # Exact match
         if route == allowed_route:

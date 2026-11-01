@@ -129,6 +129,7 @@ from .account_credentials import (
     validate_account_resources,
     validate_account_route,
 )
+from .account_ownership import proxy_ownership_lookup, resource_access_allowed, resource_path_match
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
@@ -2164,7 +2165,24 @@ def create_pass_through_route(
                     else None
                 )
                 key_hash: Final = user_api_key_dict.token if isinstance(user_api_key_dict, UserAPIKeyAuth) else None
-                if not account_application_allowed(account_policy, application_id, key_hash, path, request.method):
+                resource_match: Final = resource_path_match(account_policy, path)
+                registered_route_id: Final = (
+                    passthrough_params.get("endpoint_id") if passthrough_params is not None else None
+                )
+                account_access: Final = (
+                    await resource_access_allowed(
+                        account_policy,
+                        resource_match,
+                        registered_route_id if isinstance(registered_route_id, str) else None,
+                        application_id,
+                        key_hash,
+                        request.method,
+                        proxy_ownership_lookup,
+                    )
+                    if resource_match is not None
+                    else account_application_allowed(account_policy, application_id, key_hash, path, request.method)
+                )
+                if not account_access:
                     raise HTTPException(status_code=403, detail="Application is not granted this account route method")
                 try:
                     validate_account_request(account_policy, request.headers, tuple(request.query_params.keys()))
