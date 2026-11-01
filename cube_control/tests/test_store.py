@@ -1,11 +1,14 @@
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Final
 from uuid import uuid4
 
+from inventory_fixtures import bound, gateway_inventory, snapshot
+
+from cube_control.gateway_inventory import GatewayInventoryAttempt, GatewayInventoryState
 from cube_control.models import Account, ImportBatch, ManualChange, ManualCommand, Observation, Provider, UsageEvent
 from cube_control.store import PostgresRepository
 from cube_control.summary import account_view
@@ -199,3 +202,69 @@ class StoreTests(unittest.TestCase):
                 pool.map(lambda command: self.repository.manage(command, "owner", self.now), commands)
             )
         self.assertEqual(sorted(result.status for result in results), ["applied", "conflict"])
+
+    def inventory_state(self, origin: str) -> GatewayInventoryState | None:
+        return next(
+            (item for item in self.repository.state().gateway_inventories if item.gateway_origin == origin), None
+        )
+
+    def record_collection(self, origin: str, at: datetime, observed_at: datetime, name: str) -> None:
+        self.repository.record_gateway_inventory(
+            origin,
+            GatewayInventoryAttempt(attempted_at=at, status="collected", message="collected"),
+            snapshot(
+                origin, at, gateway_inventory(observed_at, credentials=(bound("runtime", name, self.account.id),))
+            ),
+        )
+
+    def test_gateway_inventories_coexist_and_survive_a_new_repository(self) -> None:
+        first: Final = f"http://gateway-{uuid4().hex}.test"
+        second: Final = f"http://gateway-{uuid4().hex}.test"
+        self.record_collection(first, self.now, self.now, "first")
+        self.record_collection(second, self.now, self.now, "second")
+        restarted: Final = PostgresRepository(DSN).state().gateway_inventories
+        self.assertEqual(
+            {
+                item.gateway_origin: item.last_good.inventory.credentials[0].credential_name
+                for item in restarted
+                if item.gateway_origin in (first, second) and item.last_good is not None
+            },
+            {first: "first", second: "second"},
+        )
+
+    def test_a_failed_attempt_keeps_the_last_good_snapshot_and_reports_the_failure(self) -> None:
+        origin: Final = f"http://gateway-{uuid4().hex}.test"
+        self.record_collection(origin, self.now, self.now, "kept")
+        failed_at: Final = self.now + timedelta(minutes=5)
+        self.repository.record_gateway_inventory(
+            origin, GatewayInventoryAttempt(attempted_at=failed_at, status="error", message="rejected"), None
+        )
+        state: Final = self.inventory_state(origin)
+        assert state is not None and state.last_good is not None
+        self.assertEqual(
+            (
+                state.attempt.status,
+                state.attempt.attempted_at,
+                state.last_good.inventory.credentials[0].credential_name,
+            ),
+            ("error", failed_at, "kept"),
+        )
+
+    def test_late_deliveries_never_replace_newer_attempts_or_newer_evidence(self) -> None:
+        origin: Final = f"http://gateway-{uuid4().hex}.test"
+        later: Final = self.now + timedelta(minutes=10)
+        self.record_collection(origin, later, later, "newest")
+        self.record_collection(origin, self.now, self.now, "late")
+        after_late: Final = self.inventory_state(origin)
+        self.record_collection(origin, later + timedelta(minutes=1), self.now, "cached")
+        after_cached: Final = self.inventory_state(origin)
+        assert after_late is not None and after_late.last_good is not None
+        assert after_cached is not None and after_cached.last_good is not None
+        self.assertEqual(
+            [
+                (state.attempt.attempted_at, state.last_good.inventory.credentials[0].credential_name)
+                for state in (after_late, after_cached)
+                if state.last_good is not None
+            ],
+            [(later, "newest"), (later + timedelta(minutes=1), "newest")],
+        )

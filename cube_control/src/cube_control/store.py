@@ -4,8 +4,9 @@ from typing import Final, Literal, Protocol
 
 import psycopg
 from psycopg import Connection
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
+from cube_control.gateway_inventory import GatewayInventoryAttempt, GatewayInventorySnapshot, GatewayInventoryState
 from cube_control.gateway_store import SCHEMA as GATEWAY_SCHEMA
 from cube_control.gateway_store import current_records, latest_scans
 from cube_control.media import SCHEMA as MEDIA_SCHEMA
@@ -48,6 +49,10 @@ class StoredState:
     manual_entries: tuple[ManualEntry, ...] = ()
     gateway_records: tuple[GatewayRecord, ...] = ()
     gateway_scans: tuple[GatewayScanView, ...] = ()
+    gateway_inventories: tuple[GatewayInventoryState, ...] = ()
+
+
+INVENTORY_ROW: Final = TypeAdapter(tuple[str, str, str | None])
 
 
 class Repository(Protocol):
@@ -76,6 +81,9 @@ CREATE TABLE IF NOT EXISTS cube_control.manual_commands (
     revision bigint NOT NULL, payload jsonb NOT NULL, UNIQUE(account_id, revision)
 );
 CREATE TABLE IF NOT EXISTS cube_control.fleet (id text PRIMARY KEY CHECK (id = 'current'), payload jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS cube_control.gateway_inventories (
+    gateway_origin text PRIMARY KEY, attempt jsonb NOT NULL, last_good jsonb
+);
 """
 
 
@@ -127,6 +135,22 @@ class PostgresRepository:
             fleet_row: Final[tuple[str, ...] | None] = connection.execute(
                 "SELECT payload::text FROM cube_control.fleet WHERE id='current'"
             ).fetchone()
+            inventories: Final[tuple[GatewayInventoryState, ...]] = tuple(
+                GatewayInventoryState(
+                    gateway_origin=origin,
+                    attempt=GatewayInventoryAttempt.model_validate_json(attempt),
+                    last_good=GatewayInventorySnapshot.model_validate_json(last_good)
+                    if last_good is not None
+                    else None,
+                )
+                for origin, attempt, last_good in map(
+                    INVENTORY_ROW.validate_python,
+                    connection.execute(
+                        "SELECT gateway_origin, attempt::text, last_good::text FROM cube_control.gateway_inventories"
+                        " ORDER BY gateway_origin"
+                    ),
+                )
+            )
             manual_entries: Final[tuple[ManualEntry, ...]] = tuple(
                 ManualEntry.model_validate_json(row[0])
                 for row in connection.execute(
@@ -142,6 +166,27 @@ class PostgresRepository:
                 manual_entries,
                 current_records(connection),
                 latest_scans(connection),
+                inventories,
+            )
+
+    def record_gateway_inventory(
+        self, gateway_origin: str, attempt: GatewayInventoryAttempt, snapshot: GatewayInventorySnapshot | None
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO cube_control.gateway_inventories AS stored (gateway_origin, attempt, last_good) "
+                "VALUES (%s, %s::jsonb, %s::jsonb) ON CONFLICT (gateway_origin) DO UPDATE SET "
+                "attempt = CASE WHEN (EXCLUDED.attempt->>'attempted_at')::timestamptz "
+                "> (stored.attempt->>'attempted_at')::timestamptz THEN EXCLUDED.attempt ELSE stored.attempt END, "
+                "last_good = CASE WHEN EXCLUDED.last_good IS NOT NULL AND (stored.last_good IS NULL OR "
+                "(EXCLUDED.last_good->'inventory'->>'observed_at')::timestamptz "
+                "> (stored.last_good->'inventory'->>'observed_at')::timestamptz) "
+                "THEN EXCLUDED.last_good ELSE stored.last_good END",
+                (
+                    gateway_origin,
+                    attempt.model_dump_json(),
+                    snapshot.model_dump_json() if snapshot is not None else None,
+                ),
             )
 
     def import_batch(self, batch: ImportBatch) -> ImportResult:
