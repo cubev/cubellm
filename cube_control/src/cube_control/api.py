@@ -10,6 +10,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 from starlette.middleware.base import RequestResponseEndpoint
 
+from cube_control.browser_management import add_browser_management
+from cube_control.browser_session import SessionAuthority
 from cube_control.gateway import gateway_metrics
 from cube_control.inventory import AccountInventoryReport, account_inventory
 from cube_control.media import JobHistory, JobReader, JobSnapshot
@@ -54,6 +56,7 @@ class CapabilitiesResponse(BaseModel):
     schema_version: Literal[1] = 1
     gateway_native_account_projection: Literal["credential_snapshot_v1"] = "credential_snapshot_v1"
     account_inventory: Literal["gateway_bindings_v1"] = "gateway_bindings_v1"
+    browser_management: Literal["disabled", "session_v1"] = "disabled"
     gateway_projection_fields: tuple[str, ...] = (
         "account_id",
         "account_evidence",
@@ -70,6 +73,7 @@ def create_app(
     clock: Callable[[], datetime] = utc_now,
     usage_reader: UsageReader | None = None,
     job_reader: JobReader | None = None,
+    authority: SessionAuthority | None = None,
 ) -> FastAPI:
     app: Final[FastAPI] = FastAPI(title="CubeLLM Control", docs_url=None, redoc_url=None, openapi_url=None)
     static: Final[Path] = Path(__file__).parent / "static"
@@ -90,7 +94,7 @@ def create_app(
         return JSONResponse({"status": "ok" if ready else "unavailable"}, status_code=200 if ready else 503)
 
     def capabilities() -> CapabilitiesResponse:
-        return CapabilitiesResponse()
+        return CapabilitiesResponse(browser_management="disabled" if authority is None else "session_v1")
 
     def summary() -> SummaryResponse:
         try:
@@ -192,6 +196,9 @@ def create_app(
     def usage_script() -> FileResponse:
         return FileResponse(static / "usage.js", media_type="application/javascript")
 
+    def manage_script() -> FileResponse:
+        return FileResponse(static / "manage.js", media_type="application/javascript")
+
     app.middleware("http")(response_headers)
     app.add_api_route("/healthz", health, methods=["GET"])
     app.add_api_route("/api/v1/capabilities", capabilities, methods=["GET"], response_model=CapabilitiesResponse)
@@ -208,8 +215,11 @@ def create_app(
     app.add_api_route(
         "/api/v1/usage/{source_id}/{source_key}/history", usage_history, methods=["GET"], response_model=UsageHistory
     )
+    if authority is not None:
+        add_browser_management(app, repository, authority, clock)
     app.add_api_route("/", index, methods=["GET"])
     app.add_api_route("/app.js", script, methods=["GET"])
     app.add_api_route("/style.css", stylesheet, methods=["GET"])
     app.add_api_route("/usage.js", usage_script, methods=["GET"])
+    app.add_api_route("/manage.js", manage_script, methods=["GET"])
     return app

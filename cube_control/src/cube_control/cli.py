@@ -18,6 +18,7 @@ from cube_control.account_routes import (
     ensure_account_route,
 )
 from cube_control.api import create_app
+from cube_control.browser_session import private_authority
 from cube_control.application_access import (
     ApplicationAccessSpec,
     deliver_application_access,
@@ -348,9 +349,37 @@ def main() -> int:
         result: Final = repository.import_batch(import_batch)
         print(json.dumps({"ok": result.ok, "inserted": result.inserted, "message": result.message}))
         return 0 if result.ok else 1
+    token_file: Final = os.environ.get("CUBE_CONTROL_ADMIN_TOKEN_FILE", "")
+    admin_token: Final = (
+        read_private_key(Path(token_file), "CUBE_CONTROL_ADMIN_TOKEN", "Verwaltung") if token_file else None
+    )
+    if isinstance(admin_token, Unavailable):
+        print(admin_token.message, file=sys.stderr)
+        return 2
+    authority: Final = (
+        private_authority(
+            admin_token,
+            os.environ.get("CUBE_CONTROL_MANAGEMENT_ORIGIN", ""),
+            os.environ.get("CUBE_CONTROL_OPERATOR", getpass.getuser()),
+        )
+        if admin_token is not None
+        else None
+    )
+    if admin_token is not None and authority is None:
+        print(
+            "Browser-Verwaltung abgelehnt: Token mit mindestens 32 Zeichen, gültige CUBE_CONTROL_MANAGEMENT_ORIGIN "
+            "(https oder http nur auf Loopback) und gültiger Bedienername erforderlich",
+            file=sys.stderr,
+        )
+        return 2
     repository.initialize()
     uvicorn.run(
-        create_app(repository, usage_reader=PostgresUsageReader(dsn), job_reader=PostgresJobManager(dsn)),
+        create_app(
+            repository,
+            usage_reader=PostgresUsageReader(dsn),
+            job_reader=PostgresJobManager(dsn),
+            authority=authority,
+        ),
         host=args.host,
         port=args.port,
         access_log=False,

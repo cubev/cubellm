@@ -8,3 +8,7 @@
 
 .metric strong{min-width:0;overflow-wrap:anywhere;text-align:right}
 .card-head>div{min-width:0;overflow-wrap:anywhere}
+.management-section,.inventory-section{margin:24px 0}.management-section form,.edit-form,.enroll-form{display:grid;gap:10px;max-width:520px;margin:10px 0}.management-section label,.edit-form label,.enroll-form label{display:grid;gap:4px;font-size:13px}.enroll-form label.confirm{display:flex;gap:8px;align-items:flex-start}input,select{font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px;min-width:0}button.secondary{background:transparent;color:var(--blue);border:1px solid var(--line)}#management-status.error,.explanation.error{color:var(--warning)}.pending-command{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.inventory-gateways,.inventory-accounts{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}.inventory-gateway,.inventory-account{border:1px solid var(--line);border-radius:12px;padding:12px;overflow-wrap:anywhere}.inventory-gateway h3,.inventory-account h3{margin:0 0 6px;font-size:15px}.sources,.bindings{padding-left:18px;font-size:13px}.sources li.warning,.bindings li.retained{color:var(--warning)}
+@media (max-width:600px){.inventory-gateways,.inventory-accounts{grid-template-columns:1fr}.management-section form,.edit-form,.enroll-form{max-width:none}}
+.edit-form[hidden],.enroll-form[hidden],.login-form[hidden]{display:none}
