@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Annotated, Final, Literal, NoReturn, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
@@ -18,6 +19,11 @@ from litellm.proxy.pass_through_endpoints.account_grants import (
     GrantFailure,
     append_account_grant,
     read_account_route,
+)
+from litellm.proxy.pass_through_endpoints.account_inventory import (
+    GatewayAccountInventory,
+    build_inventory,
+    read_stored_rows,
 )
 from litellm.proxy.pass_through_endpoints.account_ownership import (
     AccountResourceReceipt,
@@ -51,6 +57,7 @@ class CubeControlCapabilities(BaseModel):
     passthrough_account_grant_management: Literal["atomic_append_v1"] = "atomic_append_v1"
     passthrough_account_route_management: Literal["atomic_create_v1"] = "atomic_create_v1"
     passthrough_account_resources: Literal["application_ownership_v1"] = "application_ownership_v1"
+    account_inventory: Literal["gateway_bindings_v1"] = "gateway_bindings_v1"
     credential_values_full_masking: Literal[True] = True
     virtual_key_log_redaction: Literal[True] = True
     custom_keys_allowed: bool
@@ -213,6 +220,40 @@ async def cube_control_account_resource(
     if ownership is None or ownership.route_id != route_id:
         raise HTTPException(status_code=404, detail="Account resource is not owned on this route")
     return ownership
+
+
+def account_inventory_database() -> GrantDatabase | None:
+    from litellm.proxy import proxy_server
+
+    return (
+        cast(GrantDatabase, proxy_server.prisma_client)  # cast-ok: PrismaClient provides the tx() protocol
+        if proxy_server.prisma_client is not None
+        else None
+    )
+
+
+def runtime_inventory_sources() -> tuple[tuple[object, ...], object, object]:
+    import litellm
+    from litellm.proxy import proxy_server
+
+    router_models: Final[object] = getattr(proxy_server.llm_router, "model_list", None)
+    return (
+        tuple(litellm.credential_list),
+        proxy_server.proxy_config.settings.get("pass_through_endpoints"),
+        router_models,
+    )
+
+
+@router.get("/cube_control/account_inventory", response_model=GatewayAccountInventory)
+async def cube_control_account_inventory(
+    _admin: Annotated[UserAPIKeyAuth, Depends(_require_account_admin)],
+    database: Annotated[GrantDatabase | None, Depends(account_inventory_database)],
+    runtime: Annotated[tuple[tuple[object, ...], object, object], Depends(runtime_inventory_sources)],
+) -> GatewayAccountInventory:
+    credentials, routes, deployments = runtime
+    return build_inventory(
+        datetime.now(timezone.utc), credentials, routes, deployments, await read_stored_rows(database)
+    )
 
 
 @router.get("/cube_control/capabilities", response_model=CubeControlCapabilities)

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Final, cast
@@ -46,6 +47,14 @@ from litellm.proxy.pass_through_endpoints.account_grants import (
     GrantTransaction,
     append_account_grant,
     read_account_route,
+)
+from litellm.proxy.pass_through_endpoints.account_inventory import (
+    STORED_CREDENTIALS_SQL,
+    STORED_DEPLOYMENTS_SQL,
+    StoredRows,
+    StoredUnavailable,
+    build_inventory,
+    read_stored_rows,
 )
 from litellm.proxy.pass_through_endpoints.account_routes import (
     APPEND_ROUTE_SQL,
@@ -100,6 +109,8 @@ def postgres_query(query: str) -> sql.SQL:
         APPEND_ROUTE_SQL,
         WRITE_ROUTES_SQL,
         DELETE_ROUTE_OWNERSHIP_SQL,
+        STORED_CREDENTIALS_SQL,
+        STORED_DEPLOYMENTS_SQL,
     }:
         raise ValueError("Unexpected SQL outside the account configuration transaction contract")
     marked: Final = re.sub(r"\$(\d+)", r"%(p\1)s", query)
@@ -131,6 +142,9 @@ class PostgresTransaction:
             await self.release.wait()
         if query == READ_SETTINGS_SQL and self.alter_readback:
             return tuple({"param_value": {**cast(dict[str, object], row[0]), "unrelated": "altered"}} for row in rows)
+        if query in (STORED_CREDENTIALS_SQL, STORED_DEPLOYMENTS_SQL):
+            names: Final = tuple(column.name for column in cursor.description or ())
+            return tuple(dict(zip(names, row)) for row in rows)
         return tuple({"param_value": row[0]} for row in rows)
 
     async def execute_raw(self, query: str, *parameters: str) -> int:
@@ -1074,3 +1088,97 @@ class AccountGrantTransactions(unittest.IsolatedAsyncioTestCase):
             | {key: value for key, value in after[0].items() if key not in before[0]},
         )
         self.assertEqual(published.qsize(), 1)
+
+    async def create_inventory_tables(self) -> None:
+        await self.connection.execute(
+            'CREATE TABLE "LiteLLM_CredentialsTable" (credential_name text PRIMARY KEY,'
+            " credential_values jsonb NOT NULL, credential_info jsonb)"
+        )
+        await self.connection.execute(
+            'CREATE TABLE "LiteLLM_ProxyModelTable" (model_id text PRIMARY KEY, model_name text NOT NULL,'
+            " litellm_params jsonb NOT NULL)"
+        )
+
+    async def test_stored_inventory_lists_routes_credentials_and_deployments_before_any_reload(self) -> None:
+        await self.create_inventory_tables()
+        await self.connection.execute(
+            'INSERT INTO "LiteLLM_CredentialsTable" VALUES (%s, %s, %s), (%s, %s, NULL)',
+            (
+                "bound-credential",
+                Jsonb({"api_key": "sk-stored-inventory-canary"}),
+                Jsonb({"cube_account_id": "fixture-account", "cube_allowed_origins": ["https://vendor.example"]}),
+                "plain-credential",
+                Jsonb({"api_key": "sk-stored-inventory-canary"}),
+            ),
+        )
+        await self.connection.execute(
+            'INSERT INTO "LiteLLM_ProxyModelTable" VALUES (%s, %s, %s), (%s, %s, %s)',
+            (
+                "model-1",
+                "stored-alias",
+                Jsonb({"model": "encrypted-model", "api_key": "sk-stored-inventory-canary"}),
+                "model-2",
+                "string-encoded",
+                Jsonb(json.dumps({"model": "encrypted-model", "aws_role_name": "encrypted-role"})),
+            ),
+        )
+        created: Final = await create_account_route(self.database, self.route_command())
+        self.assertIsInstance(created, AccountRouteReceipt)
+        stored: Final = await read_stored_rows(self.database)
+        assert isinstance(stored, StoredRows)
+        result: Final = build_inventory(datetime.now(timezone.utc), (), None, None, stored)
+        self.assertEqual(
+            tuple((item.name, item.status, item.records) for item in result.sources if item.origin == "database"),
+            (("credentials", "complete", 2), ("routes", "complete", 2), ("deployments", "complete", 2)),
+        )
+        self.assertEqual(
+            tuple((item.credential_name, item.account_id, item.binding) for item in result.credentials),
+            (("bound-credential", "fixture-account", "bound"), ("plain-credential", None, "unbound")),
+        )
+        self.assertEqual(
+            tuple((item.route_id, item.account_id, item.binding) for item in result.routes),
+            (("fixture-route", "fixture-account", "account"), ("managed-route", "fixture-account", "account")),
+        )
+        self.assertEqual(
+            tuple((item.model_id, item.auth, item.provider) for item in result.deployments),
+            (("model-1", "stored_api_key", None), ("model-2", "cloud_identity", None)),
+        )
+        self.assertNotIn("sk-stored-inventory-canary", result.model_dump_json())
+        self.assertNotIn("inert-private-value", result.model_dump_json())
+
+    async def stored_inventory_sources(self) -> tuple[tuple[str, str, int, str], ...]:
+        stored: Final = await read_stored_rows(self.database)
+        assert isinstance(stored, StoredRows)
+        result: Final = build_inventory(datetime.now(timezone.utc), (), None, None, stored)
+        return tuple(
+            (item.name, item.status, item.records, item.detail) for item in result.sources if item.origin == "database"
+        )
+
+    async def test_missing_inventory_tables_fail_only_their_own_sources(self) -> None:
+        self.assertEqual(
+            await self.stored_inventory_sources(),
+            (
+                ("credentials", "unavailable", 0, "database_read_failed"),
+                ("routes", "complete", 1, ""),
+                ("deployments", "unavailable", 0, "database_read_failed"),
+            ),
+        )
+
+    async def test_a_failing_deployment_source_keeps_readable_credentials_and_routes(self) -> None:
+        await self.create_inventory_tables()
+        await self.connection.execute('DROP TABLE "LiteLLM_ProxyModelTable"')
+        await self.connection.execute(
+            'INSERT INTO "LiteLLM_CredentialsTable" VALUES (%s, %s, NULL)',
+            ("plain-credential", Jsonb({"api_key": "x"})),
+        )
+        self.assertEqual(
+            await self.stored_inventory_sources(),
+            (
+                ("credentials", "complete", 1, ""),
+                ("routes", "complete", 1, ""),
+                ("deployments", "unavailable", 0, "database_read_failed"),
+            ),
+        )
+
+    async def test_without_a_database_every_stored_source_is_unavailable(self) -> None:
+        self.assertEqual(await read_stored_rows(None), StoredUnavailable("database_unavailable"))

@@ -13,7 +13,9 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.management_endpoints.cube_control_endpoints import (
     account_credential_lookup,
     account_grant_database,
+    account_inventory_database,
     router,
+    runtime_inventory_sources,
 )
 from litellm.proxy.pass_through_endpoints.account_grants import GrantDatabase
 
@@ -174,6 +176,7 @@ async def test_capabilities_reports_running_policy_without_configuration_secrets
         "passthrough_account_grant_management": "atomic_append_v1",
         "passthrough_account_route_management": "atomic_create_v1",
         "passthrough_account_resources": "application_ownership_v1",
+        "account_inventory": "gateway_bindings_v1",
         "virtual_key_log_redaction": True,
         "custom_keys_allowed": disable_custom_keys not in (True, "true"),
         "client_side_credentials_allowed": allow_client_credentials,
@@ -239,3 +242,71 @@ async def test_route_creation_requires_a_usable_credential_for_the_account_and_o
         response: Final = await client.post("/cube_control/account_routes", json=ROUTE_COMMAND)
     assert response.status_code == 422
     assert "inert" not in response.text
+
+
+def inventory_application(role: LitellmUserRoles) -> tuple[FastAPI, list[str]]:
+    app: Final = FastAPI()
+    app.include_router(router)
+    reads: Final[list[str]] = []
+
+    async def identity() -> UserAPIKeyAuth:
+        return UserAPIKeyAuth(user_role=role)
+
+    def runtime() -> tuple[tuple[object, ...], object, object]:
+        reads.append("runtime")
+        return (
+            (
+                CredentialItem(
+                    credential_name="runtime-credential",
+                    credential_info={"cube_account_id": "inventory-account", "cube_allowed_origins": ["https://a"]},
+                    credential_values={"api_key": "sk-inventory-endpoint-canary"},
+                ),
+            ),
+            [{"id": "runtime-route", "path": "/runtime"}],
+            [
+                {
+                    "model_name": "alias",
+                    "litellm_params": {"model": "openai/x", "api_key": "sk-inventory-endpoint-canary"},
+                }
+            ],
+        )
+
+    def database() -> GrantDatabase | None:
+        reads.append("database")
+        return None
+
+    app.dependency_overrides[user_api_key_auth] = identity
+    app.dependency_overrides[runtime_inventory_sources] = runtime
+    app.dependency_overrides[account_inventory_database] = database
+    return app, reads
+
+
+@pytest.mark.parametrize("role", (LitellmUserRoles.INTERNAL_USER, LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY))
+async def test_account_inventory_is_admin_only(role: LitellmUserRoles) -> None:
+    app, reads = inventory_application(role)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response: Final = await client.get("/cube_control/account_inventory")
+    assert response.status_code == 403, response.text
+    assert reads == []
+    assert "sk-inventory-endpoint-canary" not in response.text
+
+
+async def test_account_inventory_reports_runtime_bindings_and_an_unavailable_database_without_secrets() -> None:
+    app, reads = inventory_application(LitellmUserRoles.PROXY_ADMIN)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response: Final = await client.get("/cube_control/account_inventory")
+    assert response.status_code == 200, response.text
+    body: Final = response.json()
+    assert [(item["name"], item["origin"], item["status"], item["detail"]) for item in body["sources"]] == [
+        ("credentials", "runtime", "complete", ""),
+        ("routes", "runtime", "complete", ""),
+        ("deployments", "runtime", "complete", ""),
+        ("credentials", "database", "unavailable", "database_unavailable"),
+        ("routes", "database", "unavailable", "database_unavailable"),
+        ("deployments", "database", "unavailable", "database_unavailable"),
+    ]
+    assert [(item["credential_name"], item["account_id"]) for item in body["credentials"]] == [
+        ("runtime-credential", "inventory-account")
+    ]
+    assert [item["auth"] for item in body["deployments"]] == ["inline_api_key"]
+    assert "sk-inventory-endpoint-canary" not in response.text
