@@ -288,17 +288,15 @@ def test_created_and_adopted_resources_are_reachable_only_by_the_owning_applicat
             },
         )
         assert (adoption["inserted"], object_value(adoption["ownership"])["provenance"]) == (True, "adopted")
-        assert _ownership_rows(account) == [
-            *created_rows,
-            {
-                "resource_type": "file",
-                "resource_id": adopted_id,
-                "route_id": route_id,
-                "owner_application_id": owner_app,
-                "provenance": "adopted",
-                "creator_key_hash": None,
-            },
-        ]
+        adopted_row: Final[dict[str, JsonValue]] = {
+            "resource_type": "file",
+            "resource_id": adopted_id,
+            "route_id": route_id,
+            "owner_application_id": owner_app,
+            "provenance": "adopted",
+            "creator_key_hash": None,
+        }
+        assert _ownership_rows(account) == [created_rows[0], adopted_row, created_rows[1]]
 
         owner_reads: Final = {path: gateway.request("GET", path, key=owner_key) for path in item_bodies}
         assert {path: (response.status_code, response.json()) for path, response in owner_reads.items()} == {
