@@ -3705,6 +3705,23 @@ export interface paths {
         patch: operations["update_credential_credentials__credential_name__patch"];
         trace?: never;
     };
+    "/cube_control/account_inventory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cube Control Account Inventory */
+        get: operations["cube_control_account_inventory_cube_control_account_inventory_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cube_control/account_routes": {
         parameters: {
             query?: never;
@@ -29577,6 +29594,12 @@ export interface components {
         /** CubeControlCapabilities */
         CubeControlCapabilities: {
             /**
+             * Account Inventory
+             * @default gateway_bindings_v1
+             * @constant
+             */
+            account_inventory: "gateway_bindings_v1";
+            /**
              * Application Exact Routes
              * @default exact_path_v1
              * @constant
@@ -30862,6 +30885,30 @@ export interface components {
          * @enum {string}
          */
         GUARDRAIL_DEFINITION_LOCATION: "db" | "config";
+        /** GatewayAccountInventory */
+        GatewayAccountInventory: {
+            /** Credentials */
+            credentials: components["schemas"]["InventoryCredential"][];
+            /** Deployments */
+            deployments: components["schemas"]["InventoryDeployment"][];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Rejected */
+            rejected: components["schemas"]["InventoryRejection"][];
+            /** Routes */
+            routes: components["schemas"]["InventoryRoute"][];
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Sources */
+            sources: components["schemas"]["InventorySource"][];
+        };
         /**
          * GatewayRequestActivityResponse
          * @description Response for GET /gateway/daily/activity.
@@ -31797,6 +31844,157 @@ export interface components {
             values: {
                 [key: string]: unknown;
             };
+        };
+        /** InventoryCredential */
+        InventoryCredential: {
+            /** Account Id */
+            account_id?: string | null;
+            /**
+             * Allowed Origins
+             * @default []
+             */
+            allowed_origins: string[];
+            /**
+             * Binding
+             * @enum {string}
+             */
+            binding: "bound" | "unbound" | "invalid";
+            /** Credential Name */
+            credential_name: string;
+            /** Llm Provider */
+            llm_provider?: string | null;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /** Provider Id */
+            provider_id?: string | null;
+        };
+        /** InventoryDeployment */
+        InventoryDeployment: {
+            /**
+             * Auth
+             * @enum {string}
+             */
+            auth: "credential_reference" | "environment_reference" | "inline_api_key" | "stored_api_key" | "cloud_identity" | "unknown";
+            /** Credential Name */
+            credential_name?: string | null;
+            /** Model Id */
+            model_id?: string | null;
+            /** Model Name */
+            model_name: string;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /** Provider */
+            provider?: string | null;
+            /** Provider Hint */
+            provider_hint?: string | null;
+        };
+        /** InventoryRejection */
+        InventoryRejection: {
+            /** Index */
+            index: number;
+            /** Name */
+            name?: string | null;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "not_an_object" | "unreadable_fields";
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "credentials" | "routes" | "deployments";
+        };
+        /** InventoryRoute */
+        InventoryRoute: {
+            /** Account Id */
+            account_id?: string | null;
+            /**
+             * Applications
+             * @default []
+             */
+            applications: string[];
+            /**
+             * Binding
+             * @enum {string}
+             */
+            binding: "account" | "unbound" | "invalid";
+            /** Credential Name */
+            credential_name?: string | null;
+            /**
+             * Grant Count
+             * @default 0
+             */
+            grant_count: number;
+            /**
+             * Inline Header Names
+             * @default []
+             */
+            inline_header_names: string[];
+            /**
+             * Methods
+             * @default []
+             */
+            methods: string[];
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /** Path */
+            path?: string | null;
+            /**
+             * Resource Types
+             * @default []
+             */
+            resource_types: string[];
+            /** Route Id */
+            route_id?: string | null;
+        };
+        /** InventorySource */
+        InventorySource: {
+            /**
+             * Detail
+             * @default
+             * @enum {string}
+             */
+            detail: "" | "unreadable" | "database_unavailable" | "database_read_failed";
+            /**
+             * Name
+             * @enum {string}
+             */
+            name: "credentials" | "routes" | "deployments";
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /**
+             * Records
+             * @default 0
+             */
+            records: number;
+            /**
+             * Rejected
+             * @default 0
+             */
+            rejected: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "partial" | "unavailable";
         };
         /** InvitationClaim */
         InvitationClaim: {
@@ -53122,6 +53320,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_account_inventory_cube_control_account_inventory_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayAccountInventory"];
                 };
             };
         };
