@@ -29,6 +29,9 @@ class ForbiddenGrantDatabase:
         ("/cube_control/account_routes", True),
         ("/cube_control/account_routes/fixture-route", True),
         ("/cube_control/account_routes/fixture-route/grants", True),
+        ("/cube_control/account_routes/fixture-route/resources", True),
+        ("/cube_control/account_routes/fixture-route/resources/video-job/vid_1", True),
+        ("/cube_control/account_routes/fixture-route/resources/video-job/vid_1/extra", False),
         ("/cube_control/account_routes/fixture-route/unrelated", False),
     ),
 )
@@ -79,6 +82,8 @@ async def test_account_grant_management_requires_database_backed_runtime_configu
         ("GET", "/cube_control/account_routes/fixture-route"),
         ("POST", "/cube_control/account_routes/fixture-route/grants"),
         ("POST", "/cube_control/account_routes"),
+        ("POST", "/cube_control/account_routes/fixture-route/resources"),
+        ("GET", "/cube_control/account_routes/fixture-route/resources/video-job/vid_1"),
     ),
 )
 async def test_account_grant_management_rejects_non_admins_before_database_access(
@@ -168,6 +173,7 @@ async def test_capabilities_reports_running_policy_without_configuration_secrets
         "passthrough_account_grants": "application_account_path_method_v1",
         "passthrough_account_grant_management": "atomic_append_v1",
         "passthrough_account_route_management": "atomic_create_v1",
+        "passthrough_account_resources": "application_ownership_v1",
         "virtual_key_log_redaction": True,
         "custom_keys_allowed": disable_custom_keys not in (True, "true"),
         "client_side_credentials_allowed": allow_client_credentials,

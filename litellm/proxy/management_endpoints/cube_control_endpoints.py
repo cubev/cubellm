@@ -19,6 +19,14 @@ from litellm.proxy.pass_through_endpoints.account_grants import (
     append_account_grant,
     read_account_route,
 )
+from litellm.proxy.pass_through_endpoints.account_ownership import (
+    AccountResourceReceipt,
+    OwnershipConflict,
+    ResourceAdoptionCommand,
+    ResourceOwnership,
+    adopt_resource,
+    read_ownership,
+)
 from litellm.proxy.pass_through_endpoints.account_routes import (
     AccountRouteCreateCommand,
     AccountRouteReceipt,
@@ -42,6 +50,7 @@ class CubeControlCapabilities(BaseModel):
     passthrough_account_grants: Literal["application_account_path_method_v1"] = "application_account_path_method_v1"
     passthrough_account_grant_management: Literal["atomic_append_v1"] = "atomic_append_v1"
     passthrough_account_route_management: Literal["atomic_create_v1"] = "atomic_create_v1"
+    passthrough_account_resources: Literal["application_ownership_v1"] = "application_ownership_v1"
     credential_values_full_masking: Literal[True] = True
     virtual_key_log_redaction: Literal[True] = True
     custom_keys_allowed: bool
@@ -147,6 +156,49 @@ async def cube_control_append_account_grant(
         _raise_grant_failure(result)
     await invalidate_config_param("general_settings")
     return result
+
+
+@router.post("/cube_control/account_routes/{route_id}/resources", response_model=AccountResourceReceipt)
+async def cube_control_adopt_account_resource(
+    route_id: Annotated[str, Path(min_length=1, max_length=128)],
+    command: ResourceAdoptionCommand,
+    _admin: Annotated[UserAPIKeyAuth, Depends(_require_account_admin)],
+    database: Annotated[GrantDatabase, Depends(account_grant_database)],
+) -> AccountResourceReceipt:
+    try:
+        result: Final = await adopt_resource(database, route_id, command)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Account resource database request failed") from None
+    if isinstance(result, GrantFailure):
+        _raise_grant_failure(result)
+    if isinstance(result, OwnershipConflict):
+        raise HTTPException(status_code=409, detail="Account resource belongs to another application or route")
+    return AccountResourceReceipt(inserted=result.inserted, ownership=result.ownership)
+
+
+@router.get(
+    "/cube_control/account_routes/{route_id}/resources/{resource_type}/{resource_id}",
+    response_model=ResourceOwnership,
+)
+async def cube_control_account_resource(
+    route_id: Annotated[str, Path(min_length=1, max_length=128)],
+    resource_type: Annotated[str, Path(min_length=1, max_length=128)],
+    resource_id: Annotated[str, Path(min_length=1, max_length=256)],
+    _admin: Annotated[UserAPIKeyAuth, Depends(_require_account_admin)],
+    database: Annotated[GrantDatabase, Depends(account_grant_database)],
+) -> ResourceOwnership:
+    try:
+        route: Final = await read_account_route(database, route_id)
+        if isinstance(route, GrantFailure):
+            _raise_grant_failure(route)
+        ownership: Final = await read_ownership(database, route.account_id, resource_type, resource_id)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="Account resource database request failed") from None
+    if ownership is None or ownership.route_id != route_id:
+        raise HTTPException(status_code=404, detail="Account resource is not owned on this route")
+    return ownership
 
 
 @router.get("/cube_control/capabilities", response_model=CubeControlCapabilities)

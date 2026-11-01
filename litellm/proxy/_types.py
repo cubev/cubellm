@@ -704,6 +704,8 @@ class LiteLLMRoutes(enum.Enum):
             "/cube_control/account_routes",
             "/cube_control/account_routes/{route_id}",
             "/cube_control/account_routes/{route_id}/grants",
+            "/cube_control/account_routes/{route_id}/resources",
+            "/cube_control/account_routes/{route_id}/resources/{resource_type}/{resource_id}",
             # user
             "/user/new",
             "/management/v1/users/bulk",

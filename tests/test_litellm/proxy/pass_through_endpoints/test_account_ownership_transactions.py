@@ -8,15 +8,22 @@ from pathlib import Path
 from typing import Final, cast
 from uuid import uuid4
 
+import httpx
 import psycopg
+from fastapi import FastAPI
 from psycopg import sql
 from psycopg.types.json import Jsonb
 from pydantic import JsonValue
 from typing_extensions import LiteralString
 
+from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.management_endpoints.cube_control_endpoints import account_grant_database, router
 from litellm.proxy.pass_through_endpoints.account_grants import (
     LOCK_SETTINGS_SQL,
+    READ_SETTINGS_SQL,
     AccountRouteDescriptor,
+    GrantDatabase,
     GrantFailure,
     GrantTransaction,
     describe_account_route,
@@ -77,7 +84,7 @@ def claim(**changes: str | None) -> ResourceClaim:
 
 
 def postgres_query(query: str) -> sql.SQL:
-    if query not in {CLAIM_CREATED_SQL, CLAIM_ADOPTED_SQL, READ_OWNERSHIP_SQL, LOCK_SETTINGS_SQL}:
+    if query not in {CLAIM_CREATED_SQL, CLAIM_ADOPTED_SQL, READ_OWNERSHIP_SQL, LOCK_SETTINGS_SQL, READ_SETTINGS_SQL}:
         raise ValueError("Unexpected SQL outside the ownership transaction contract")
     return sql.SQL(
         cast(
@@ -394,3 +401,41 @@ class AccountOwnershipTransactions(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await adopt_resource(PostgresDatabase(self.schema, hide_readback=True), "fixture-route", self.adoption())
         self.assertEqual(await self.rows(), [])
+
+    async def test_admin_api_adopts_and_reports_ownership_through_the_real_router(self) -> None:
+        app: Final = FastAPI()
+        app.include_router(router)
+
+        async def admin() -> UserAPIKeyAuth:
+            return UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+        def database() -> GrantDatabase:
+            return self.database
+
+        app.dependency_overrides[user_api_key_auth] = admin
+        app.dependency_overrides[account_grant_database] = database
+        body: Final = self.adoption().model_dump(mode="json")
+        resource: Final = "/cube_control/account_routes/fixture-route/resources"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            created = await client.post(resource, json=body)
+            repeated = await client.post(resource, json=body)
+            stale = await client.post(resource, json=body | {"expected_fingerprint": "0" * 64, "resource_id": "x_1"})
+            foreign = await client.post(resource, json=body | {"application_id": "other-app"})
+            owned = await client.get(resource + "/video-job/legacy_7")
+            missing = await client.get(resource + "/video-job/legacy_8")
+            invalid = await client.post(resource, json=body | {"resource_id": "a+b"})
+        self.assertEqual((created.status_code, created.json()["inserted"]), (200, True), created.text)
+        self.assertEqual((repeated.status_code, repeated.json()["inserted"]), (200, False))
+        self.assertEqual(created.json()["enforcement"], "not_verified")
+        self.assertEqual((stale.status_code, foreign.status_code, missing.status_code), (409, 409, 404))
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(
+            owned.json(),
+            {
+                "route_id": "fixture-route",
+                "owner_application_id": "fixture-app",
+                "provenance": "adopted",
+                "creator_key_hash": None,
+            },
+        )
+        self.assertEqual(await self.rows(), [("legacy_7", "fixture-app", "adopted", None)])
