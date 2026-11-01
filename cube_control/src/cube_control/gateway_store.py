@@ -1,13 +1,13 @@
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Final, Literal
+from typing import Final, Literal, LiteralString
 
 import psycopg
 from psycopg import Connection
 
 from cube_control.models import GatewayBatch, GatewayRecord, GatewayScan, GatewayScanView
 
-SCHEMA: Final[str] = """
+SCHEMA: Final[LiteralString] = """
 CREATE TABLE IF NOT EXISTS cube_control.gateway_scans (
     id text PRIMARY KEY, source_id text NOT NULL, sequence bigint NOT NULL,
     fingerprint text NOT NULL, payload jsonb NOT NULL, UNIQUE(source_id,sequence)

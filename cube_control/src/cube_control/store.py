@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final, Literal, Protocol
+from typing import Final, Literal, LiteralString, Protocol
 
 import psycopg
 from psycopg import Connection
 from pydantic import TypeAdapter, ValidationError
 
-from cube_control.gateway_inventory import GatewayInventoryAttempt, GatewayInventorySnapshot, GatewayInventoryState
+from cube_control.gateway_inventory import GatewayInventoryAttempt, GatewayInventorySnapshot
+from cube_control.inventory_evidence import GatewayEvidence, GatewayInventoryState, merge_evidence
 from cube_control.gateway_store import SCHEMA as GATEWAY_SCHEMA
 from cube_control.gateway_store import current_records, latest_scans
 from cube_control.media import SCHEMA as MEDIA_SCHEMA
@@ -52,7 +53,21 @@ class StoredState:
     gateway_inventories: tuple[GatewayInventoryState, ...] = ()
 
 
-INVENTORY_ROW: Final = TypeAdapter(tuple[str, str, str | None])
+INVENTORY_ROW: Final = TypeAdapter(tuple[str, str, str | None, str | None])
+INVENTORY_COLUMNS: Final = "gateway_origin, attempt::text, last_good::text, evidence::text"
+
+
+def inventory_state(row: object) -> GatewayInventoryState:
+    origin, attempt, last_good, evidence = INVENTORY_ROW.validate_python(row)
+    return GatewayInventoryState(
+        gateway_origin=origin,
+        attempt=GatewayInventoryAttempt.model_validate_json(attempt),
+        evidence=GatewayEvidence.model_validate_json(evidence)
+        if evidence is not None
+        else merge_evidence(None, GatewayInventorySnapshot.model_validate_json(last_good))
+        if last_good is not None
+        else None,
+    )
 
 
 class Repository(Protocol):
@@ -62,7 +77,7 @@ class Repository(Protocol):
     def manage(self, command: ManualCommand, actor: str, now: datetime) -> ManualResult: ...
 
 
-SCHEMA: Final[str] = """
+SCHEMA: Final[LiteralString] = """
 CREATE SCHEMA IF NOT EXISTS cube_control;
 CREATE TABLE IF NOT EXISTS cube_control.accounts (id text PRIMARY KEY, payload jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS cube_control.observations (
@@ -84,6 +99,7 @@ CREATE TABLE IF NOT EXISTS cube_control.fleet (id text PRIMARY KEY CHECK (id = '
 CREATE TABLE IF NOT EXISTS cube_control.gateway_inventories (
     gateway_origin text PRIMARY KEY, attempt jsonb NOT NULL, last_good jsonb
 );
+ALTER TABLE cube_control.gateway_inventories ADD COLUMN IF NOT EXISTS evidence jsonb;
 """
 
 
@@ -136,18 +152,10 @@ class PostgresRepository:
                 "SELECT payload::text FROM cube_control.fleet WHERE id='current'"
             ).fetchone()
             inventories: Final[tuple[GatewayInventoryState, ...]] = tuple(
-                GatewayInventoryState(
-                    gateway_origin=origin,
-                    attempt=GatewayInventoryAttempt.model_validate_json(attempt),
-                    last_good=GatewayInventorySnapshot.model_validate_json(last_good)
-                    if last_good is not None
-                    else None,
-                )
-                for origin, attempt, last_good in map(
-                    INVENTORY_ROW.validate_python,
+                map(
+                    inventory_state,
                     connection.execute(
-                        "SELECT gateway_origin, attempt::text, last_good::text FROM cube_control.gateway_inventories"
-                        " ORDER BY gateway_origin"
+                        f"SELECT {INVENTORY_COLUMNS} FROM cube_control.gateway_inventories ORDER BY gateway_origin"
                     ),
                 )
             )
@@ -174,18 +182,26 @@ class PostgresRepository:
     ) -> None:
         with self.connect() as connection:
             connection.execute(
-                "INSERT INTO cube_control.gateway_inventories AS stored (gateway_origin, attempt, last_good) "
-                "VALUES (%s, %s::jsonb, %s::jsonb) ON CONFLICT (gateway_origin) DO UPDATE SET "
-                "attempt = CASE WHEN (EXCLUDED.attempt->>'attempted_at')::timestamptz "
-                "> (stored.attempt->>'attempted_at')::timestamptz THEN EXCLUDED.attempt ELSE stored.attempt END, "
-                "last_good = CASE WHEN EXCLUDED.last_good IS NOT NULL AND (stored.last_good IS NULL OR "
-                "(EXCLUDED.last_good->'inventory'->>'observed_at')::timestamptz "
-                "> (stored.last_good->'inventory'->>'observed_at')::timestamptz) "
-                "THEN EXCLUDED.last_good ELSE stored.last_good END",
+                "SELECT pg_advisory_xact_lock(hashtext('cube-control-inventory'), hashtext(%s))", (gateway_origin,)
+            )
+            row: Final = connection.execute(
+                f"SELECT {INVENTORY_COLUMNS} FROM cube_control.gateway_inventories WHERE gateway_origin=%s FOR UPDATE",
+                (gateway_origin,),
+            ).fetchone()
+            stored: Final = inventory_state(row) if row is not None else None
+            newest_attempt: Final = (
+                attempt if stored is None or attempt.attempted_at > stored.attempt.attempted_at else stored.attempt
+            )
+            previous: Final = stored.evidence if stored is not None else None
+            evidence: Final = merge_evidence(previous, snapshot) if snapshot is not None else previous
+            connection.execute(
+                "INSERT INTO cube_control.gateway_inventories (gateway_origin, attempt, evidence) "
+                "VALUES (%s, %s::jsonb, %s::jsonb) ON CONFLICT (gateway_origin) DO UPDATE "
+                "SET attempt = EXCLUDED.attempt, evidence = EXCLUDED.evidence",
                 (
                     gateway_origin,
-                    attempt.model_dump_json(),
-                    snapshot.model_dump_json() if snapshot is not None else None,
+                    newest_attempt.model_dump_json(),
+                    evidence.model_dump_json() if evidence is not None else None,
                 ),
             )
 

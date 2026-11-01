@@ -6,11 +6,23 @@ from decimal import Decimal
 from typing import Final
 from uuid import uuid4
 
+from psycopg import Connection
+
+from threading import Barrier
+from time import monotonic, sleep
+
 from inventory_fixtures import bound, gateway_inventory, snapshot
 
-from cube_control.gateway_inventory import GatewayInventoryAttempt, GatewayInventoryState
+from cube_control.gateway_inventory import (
+    GatewayInventory,
+    GatewayInventoryAttempt,
+    GatewayInventorySnapshot,
+    InventoryRoute,
+)
+from cube_control.inventory import account_inventory
+from cube_control.inventory_evidence import GatewayInventoryState, merge_evidence
 from cube_control.models import Account, ImportBatch, ManualChange, ManualCommand, Observation, Provider, UsageEvent
-from cube_control.store import PostgresRepository
+from cube_control.store import SCHEMA, PostgresRepository
 from cube_control.summary import account_view
 
 DSN: Final[str] = os.environ.get("CUBE_CONTROL_TEST_DATABASE_URL", "")
@@ -225,14 +237,14 @@ class StoreTests(unittest.TestCase):
         restarted: Final = PostgresRepository(DSN).state().gateway_inventories
         self.assertEqual(
             {
-                item.gateway_origin: item.last_good.inventory.credentials[0].credential_name
+                item.gateway_origin: item.evidence.credentials[0].credential.credential_name
                 for item in restarted
-                if item.gateway_origin in (first, second) and item.last_good is not None
+                if item.gateway_origin in (first, second) and item.evidence is not None
             },
             {first: "first", second: "second"},
         )
 
-    def test_a_failed_attempt_keeps_the_last_good_snapshot_and_reports_the_failure(self) -> None:
+    def test_a_failed_attempt_keeps_the_known_evidence_and_reports_the_failure(self) -> None:
         origin: Final = f"http://gateway-{uuid4().hex}.test"
         self.record_collection(origin, self.now, self.now, "kept")
         failed_at: Final = self.now + timedelta(minutes=5)
@@ -240,12 +252,12 @@ class StoreTests(unittest.TestCase):
             origin, GatewayInventoryAttempt(attempted_at=failed_at, status="error", message="rejected"), None
         )
         state: Final = self.inventory_state(origin)
-        assert state is not None and state.last_good is not None
+        assert state is not None and state.evidence is not None
         self.assertEqual(
             (
                 state.attempt.status,
                 state.attempt.attempted_at,
-                state.last_good.inventory.credentials[0].credential_name,
+                state.evidence.credentials[0].credential.credential_name,
             ),
             ("error", failed_at, "kept"),
         )
@@ -258,13 +270,186 @@ class StoreTests(unittest.TestCase):
         after_late: Final = self.inventory_state(origin)
         self.record_collection(origin, later + timedelta(minutes=1), self.now, "cached")
         after_cached: Final = self.inventory_state(origin)
-        assert after_late is not None and after_late.last_good is not None
-        assert after_cached is not None and after_cached.last_good is not None
+        assert after_late is not None and after_late.evidence is not None
+        assert after_cached is not None and after_cached.evidence is not None
         self.assertEqual(
             [
-                (state.attempt.attempted_at, state.last_good.inventory.credentials[0].credential_name)
+                (state.attempt.attempted_at, state.evidence.credentials[0].credential.credential_name)
                 for state in (after_late, after_cached)
-                if state.last_good is not None
+                if state.evidence is not None
             ],
             [(later, "newest"), (later + timedelta(minutes=1), "newest")],
         )
+
+    def owned_origin(self) -> str:
+        origin: Final = f"http://gateway-{uuid4().hex}.test"
+
+        def forget() -> None:
+            with self.repository.connect() as connection:
+                connection.execute("DELETE FROM cube_control.gateway_inventories WHERE gateway_origin=%s", (origin,))
+
+        self.addCleanup(forget)
+        return origin
+
+    def record_inventory(self, origin: str, inventory: GatewayInventory) -> None:
+        self.repository.record_gateway_inventory(
+            origin,
+            GatewayInventoryAttempt(attempted_at=inventory.observed_at, status="collected", message="collected"),
+            snapshot(origin, inventory.observed_at, inventory),
+        )
+
+    def known_then_partial(self, origin: str) -> None:
+        self.record_inventory(
+            origin, gateway_inventory(self.now, credentials=(bound("database", "kept", "previously-known"),))
+        )
+        self.record_inventory(
+            origin,
+            gateway_inventory(
+                self.now + timedelta(minutes=1),
+                routes=(InventoryRoute(origin="runtime", route_id="new", account_id="new-account", binding="account"),),
+                unavailable=frozenset({("credentials", "database")}),
+            ),
+        )
+
+    def test_a_scan_with_an_unavailable_source_keeps_previous_accounts_and_adds_new_ones(self) -> None:
+        origin: Final = self.owned_origin()
+        self.known_then_partial(origin)
+        restarted: Final = PostgresRepository(DSN).state()
+        state: Final = next(item for item in restarted.gateway_inventories if item.gateway_origin == origin)
+        assert state.evidence is not None
+        self.assertEqual(
+            [(item.credential.credential_name, item.presence, item.observed_at) for item in state.evidence.credentials],
+            [("kept", "retained", self.now)],
+        )
+        accounts: Final = {
+            item.account_id: item
+            for item in account_inventory(restarted, self.now + timedelta(minutes=2)).accounts
+            if item.account_id in ("previously-known", "new-account")
+        }
+        self.assertEqual(
+            {
+                key: [(item.gateway_origin, item.presence) for item in (*value.credentials, *value.routes)]
+                for key, value in accounts.items()
+            },
+            {"new-account": [(origin, "latest_collection")], "previously-known": [(origin, "retained")]},
+        )
+
+    def test_a_complete_empty_scan_clears_obsolete_bindings(self) -> None:
+        origin: Final = self.owned_origin()
+        self.known_then_partial(origin)
+        self.record_inventory(origin, gateway_inventory(self.now + timedelta(minutes=2)))
+        state: Final = self.inventory_state(origin)
+        assert state is not None and state.evidence is not None
+        self.assertEqual((state.evidence.credentials, state.evidence.routes), ((), ()))
+
+    def test_legacy_snapshots_are_read_as_evidence_and_kept_under_later_partial_scans(self) -> None:
+        origin: Final = self.owned_origin()
+        legacy: Final = snapshot(
+            origin, self.now, gateway_inventory(self.now, credentials=(bound("database", "legacy", "legacy-account"),))
+        )
+        attempt: Final = GatewayInventoryAttempt(attempted_at=self.now, status="collected", message="collected")
+        with self.repository.connect() as connection:
+            connection.execute(
+                "INSERT INTO cube_control.gateway_inventories (gateway_origin, attempt, last_good) "
+                "VALUES (%s, %s::jsonb, %s::jsonb)",
+                (origin, attempt.model_dump_json(), legacy.model_dump_json()),
+            )
+        loaded: Final = self.inventory_state(origin)
+        assert loaded is not None
+        self.assertEqual(loaded.evidence, merge_evidence(None, legacy))
+        self.record_inventory(
+            origin,
+            gateway_inventory(self.now + timedelta(minutes=1), unavailable=frozenset({("credentials", "database")})),
+        )
+        extended: Final = self.inventory_state(origin)
+        assert extended is not None and extended.evidence is not None
+        self.assertEqual(
+            [(item.credential.credential_name, item.presence) for item in extended.evidence.credentials],
+            [("legacy", "retained")],
+        )
+        with self.repository.connect() as connection:
+            stored: Final = connection.execute(
+                "SELECT last_good::text FROM cube_control.gateway_inventories WHERE gateway_origin=%s", (origin,)
+            ).fetchone()
+        self.assertEqual(stored and GatewayInventorySnapshot.model_validate_json(stored[0]), legacy)
+
+    def test_the_schema_upgrade_adds_evidence_to_an_existing_inventory_table(self) -> None:
+        with self.repository.connect() as connection:
+            connection.execute("ALTER TABLE cube_control.gateway_inventories DROP COLUMN evidence")
+            connection.execute(SCHEMA)
+            columns: Final = connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='cube_control' AND table_name='gateway_inventories' ORDER BY ordinal_position"
+            ).fetchall()
+            connection.rollback()
+        self.assertEqual([row[0] for row in columns], ["gateway_origin", "attempt", "last_good", "evidence"])
+
+    def test_concurrent_collections_never_lose_retained_evidence(self) -> None:
+        origin: Final = self.owned_origin()
+        self.record_inventory(
+            origin, gateway_inventory(self.now, credentials=(bound("database", "kept", "previously-known"),))
+        )
+        known: Final = self.inventory_state(origin)
+        assert known is not None and known.evidence is not None
+        earlier: Final = gateway_inventory(
+            self.now + timedelta(minutes=1),
+            credentials=(bound("runtime", "earlier", "earlier-account"),),
+            unavailable=frozenset({("credentials", "database")}),
+        )
+        later: Final = gateway_inventory(
+            self.now + timedelta(minutes=2),
+            credentials=(bound("database", "kept", "previously-known"),),
+            unavailable=frozenset({("credentials", "runtime")}),
+        )
+        start: Final = Barrier(2)
+
+        def record(inventory: GatewayInventory) -> None:
+            start.wait()
+            self.record_inventory(origin, inventory)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            tuple(pool.map(record, (earlier, later)))
+        final: Final = self.inventory_state(origin)
+        assert final is not None
+        serial: Final = (
+            merge_evidence(
+                merge_evidence(known.evidence, snapshot(origin, earlier.observed_at, earlier)),
+                snapshot(origin, later.observed_at, later),
+            ),
+            merge_evidence(known.evidence, snapshot(origin, later.observed_at, later)),
+        )
+        self.assertIn(final.evidence, serial)
+
+    def test_a_first_collection_waits_for_the_origin_lock_before_reading_or_writing(self) -> None:
+        origin: Final = self.owned_origin()
+
+        def waiting_writers(connection: Connection[tuple[str, ...]]) -> int:
+            row: Final = connection.execute(
+                "SELECT count(*)::text FROM pg_locks WHERE locktype='advisory' AND NOT granted AND objsubid=2 "
+                "AND classid::bigint = (hashtext('cube-control-inventory')::bigint & 4294967295) "
+                "AND objid::bigint = (hashtext(%s)::bigint & 4294967295)",
+                (origin,),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with self.repository.connect() as holder:
+                try:
+                    holder.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext('cube-control-inventory'), hashtext(%s))", (origin,)
+                    )
+                    pending: Final = pool.submit(
+                        self.record_inventory,
+                        origin,
+                        gateway_inventory(self.now, credentials=(bound("database", "kept", "previously-known"),)),
+                    )
+                    deadline: Final = monotonic() + 10
+                    with self.repository.connect() as observer:
+                        while waiting_writers(observer) == 0 and monotonic() < deadline and not pending.done():
+                            sleep(0.05)
+                        blocked: Final = (waiting_writers(observer), pending.done(), self.inventory_state(origin))
+                finally:
+                    holder.rollback()
+            pending.result(timeout=10)
+        self.assertEqual(blocked, (1, False, None))
+        self.assertIsNotNone(self.inventory_state(origin))

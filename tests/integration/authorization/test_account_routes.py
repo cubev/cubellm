@@ -822,7 +822,8 @@ def _control_process(arguments: list[str], database_url: str) -> subprocess.Comp
 
 def _inventory_rows(origin: str) -> list[dict[str, JsonValue]]:
     return read_rows(
-        "SELECT attempt::text AS attempt, coalesce(last_good::text, '') AS last_good "
+        "SELECT attempt::text AS attempt, coalesce(last_good::text, '') AS last_good, "
+        "coalesce(evidence::text, '') AS evidence "
         "FROM cube_control.gateway_inventories WHERE gateway_origin = %s",
         (origin,),
     )
@@ -831,10 +832,15 @@ def _inventory_rows(origin: str) -> list[dict[str, JsonValue]]:
 def _restore_inventory_row(origin: str, prior: list[dict[str, JsonValue]]) -> None:
     if prior:
         write_rows(
-            "INSERT INTO cube_control.gateway_inventories (gateway_origin, attempt, last_good) "
-            "VALUES (%s, %s::jsonb, NULLIF(%s, '')::jsonb) ON CONFLICT (gateway_origin) DO UPDATE "
-            "SET attempt = EXCLUDED.attempt, last_good = EXCLUDED.last_good",
-            (origin, string_value(prior[0]["attempt"]), string_value(prior[0]["last_good"])),
+            "INSERT INTO cube_control.gateway_inventories (gateway_origin, attempt, last_good, evidence) "
+            "VALUES (%s, %s::jsonb, NULLIF(%s, '')::jsonb, NULLIF(%s, '')::jsonb) ON CONFLICT (gateway_origin) "
+            "DO UPDATE SET attempt = EXCLUDED.attempt, last_good = EXCLUDED.last_good, evidence = EXCLUDED.evidence",
+            (
+                origin,
+                string_value(prior[0]["attempt"]),
+                string_value(prior[0]["last_good"]),
+                string_value(prior[0]["evidence"]),
+            ),
         )
     else:
         write_rows("DELETE FROM cube_control.gateway_inventories WHERE gateway_origin = %s", (origin,))
@@ -956,7 +962,8 @@ def test_controller_collects_the_native_inventory_and_reports_the_failed_retry(
         if item["gateway_origin"] == origin
     ]
     assert [
-        (item["state"], item["last_attempt_status"], item["last_good_observed_at"] is not None) for item in gateways
+        (item["state"], item["last_attempt_status"], item["last_collected_observed_at"] is not None)
+        for item in gateways
     ] == [("last_attempt_failed", "error", True)], gateways
     entry: Final = next(
         item

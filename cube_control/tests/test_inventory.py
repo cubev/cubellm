@@ -7,12 +7,12 @@ from inventory_fixtures import bound, collected, gateway_inventory, snapshot
 
 from cube_control.gateway_inventory import (
     GatewayInventoryAttempt,
-    GatewayInventoryState,
     InventoryCredential,
     InventoryDeployment,
     InventoryRoute,
     Origin,
 )
+from cube_control.inventory_evidence import GatewayInventoryState, merge_evidence
 from cube_control.inventory import STALE_AFTER, AccountInventoryEntry, AccountInventoryReport, account_inventory
 from cube_control.models import (
     Account,
@@ -164,7 +164,9 @@ class AccountInventoryTests(unittest.TestCase):
         failed: Final = GatewayInventoryState(
             gateway_origin=B,
             attempt=GatewayInventoryAttempt(attempted_at=NOW, status="error", message="Gateway response rejected"),
-            last_good=snapshot(B, NOW - timedelta(hours=1), gateway_inventory(NOW - timedelta(hours=1))),
+            evidence=merge_evidence(
+                None, snapshot(B, NOW - timedelta(hours=1), gateway_inventory(NOW - timedelta(hours=1)))
+            ),
         )
         never: Final = GatewayInventoryState(
             gateway_origin="http://127.0.0.1:4002",
@@ -174,7 +176,7 @@ class AccountInventoryTests(unittest.TestCase):
         stale: Final = collected("http://127.0.0.1:4003", old, gateway_inventory(old))
         result: Final = report((collected(A, NOW, inventory), failed, never, stale))
         self.assertEqual(
-            [(item.gateway_origin, item.state, item.last_good_observed_at) for item in result.gateways],
+            [(item.gateway_origin, item.state, item.last_collected_observed_at) for item in result.gateways],
             [
                 (A, "current", NOW),
                 (B, "last_attempt_failed", NOW - timedelta(hours=1)),
@@ -336,3 +338,42 @@ class AccountInventoryTests(unittest.TestCase):
                 (ACCOUNT.id, ("catalogue",), False),
             ],
         )
+
+    def test_a_previously_known_account_survives_a_newer_scan_with_an_unavailable_source(self) -> None:
+        first: Final = NOW - timedelta(minutes=10)
+        known: Final = merge_evidence(
+            None,
+            snapshot(A, first, gateway_inventory(first, credentials=(bound("database", "kept", "previously-known"),))),
+        )
+        merged: Final = merge_evidence(
+            known,
+            snapshot(
+                A,
+                NOW,
+                gateway_inventory(
+                    NOW,
+                    routes=(
+                        InventoryRoute(origin="runtime", route_id="new", account_id="new-account", binding="account"),
+                    ),
+                    unavailable=frozenset({("credentials", "database")}),
+                ),
+            ),
+        )
+        state: Final = GatewayInventoryState(
+            gateway_origin=A,
+            attempt=GatewayInventoryAttempt(attempted_at=NOW, status="collected", message="collected"),
+            evidence=merged,
+        )
+        result: Final = report((state,), accounts=())
+        previous: Final = entry(result, "previously-known")
+        self.assertEqual(
+            [(item.credential.credential_name, item.presence, item.observed_at) for item in previous.credentials],
+            [("kept", "retained", first)],
+        )
+        self.assertTrue({"not_in_catalogue", "binding_not_in_latest_collection"} <= set(previous.gaps))
+        self.assertEqual([item.route.route_id for item in entry(result, "new-account").routes], ["new"])
+        self.assertIn(
+            ("source_unavailable", "database", "credentials"),
+            [(item.kind, item.origin, item.source) for item in result.findings],
+        )
+        self.assertEqual(result.coverage, "partial")

@@ -92,12 +92,6 @@ class GatewayInventoryAttempt(FrozenModel):
     message: str
 
 
-class GatewayInventoryState(FrozenModel):
-    gateway_origin: str
-    attempt: GatewayInventoryAttempt
-    last_good: GatewayInventorySnapshot | None = None
-
-
 CLOCK_SKEW: Final = timedelta(minutes=5)
 
 

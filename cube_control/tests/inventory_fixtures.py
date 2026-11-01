@@ -1,12 +1,12 @@
 from datetime import datetime
 from typing import Final
 
+from cube_control.inventory_evidence import GatewayInventoryState, merge_evidence
 from cube_control.gateway_inventory import (
     SOURCE_PAIRS,
     GatewayInventory,
     GatewayInventoryAttempt,
     GatewayInventorySnapshot,
-    GatewayInventoryState,
     InventoryCredential,
     InventoryDeployment,
     InventoryRejection,
@@ -72,7 +72,7 @@ def collected(gateway_origin: str, at: datetime, inventory: GatewayInventory) ->
     return GatewayInventoryState(
         gateway_origin=gateway_origin,
         attempt=GatewayInventoryAttempt(attempted_at=at, status="collected", message="collected"),
-        last_good=snapshot(gateway_origin, at, inventory),
+        evidence=merge_evidence(None, snapshot(gateway_origin, at, inventory)),
     )
 
 

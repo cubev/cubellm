@@ -5,14 +5,14 @@ from typing import Final, Literal
 
 from pydantic import AwareDatetime
 
-from cube_control.gateway_inventory import (
-    SOURCE_PAIRS,
+from cube_control.gateway_inventory import SOURCE_PAIRS, InventoryCredential, InventoryRoute, Origin, SourceName
+from cube_control.inventory_evidence import (
+    GatewayEvidence,
     GatewayInventoryState,
-    InventoryCredential,
-    InventoryDeployment,
-    InventoryRoute,
-    Origin,
-    SourceName,
+    KnownDeployment,
+    KnownRoute,
+    Presence,
+    SourceEvidence,
 )
 from cube_control.models import Account, FrozenModel, Observation
 from cube_control.store import StoredState
@@ -35,6 +35,7 @@ AccountGap = Literal[
     "credential_only_in_database",
     "credential_only_in_runtime",
     "credential_unused",
+    "binding_not_in_latest_collection",
     "invalid_binding",
     "no_usage_source",
     "no_verified_provider_usage",
@@ -49,11 +50,15 @@ STALE_AFTER: Final = timedelta(hours=24)
 class GatewayCredential(FrozenModel):
     gateway_origin: str
     credential: InventoryCredential
+    observed_at: AwareDatetime
+    presence: Presence
 
 
 class GatewayRoute(FrozenModel):
     gateway_origin: str
     route: InventoryRoute
+    observed_at: AwareDatetime
+    presence: Presence
 
 
 class AccountInventoryEntry(FrozenModel):
@@ -79,8 +84,9 @@ class GatewayCoverage(FrozenModel):
     last_attempt_at: AwareDatetime
     last_attempt_status: Literal["collected", "error", "uncertain"]
     last_attempt_message: str
-    last_good_checked_at: AwareDatetime | None = None
-    last_good_observed_at: AwareDatetime | None = None
+    last_collected_checked_at: AwareDatetime | None = None
+    last_collected_observed_at: AwareDatetime | None = None
+    sources: tuple[SourceEvidence, ...] = ()
 
 
 class InventoryFinding(FrozenModel):
@@ -116,50 +122,45 @@ def _latest(values: Iterable[datetime]) -> datetime | None:
     return max(ordered) if ordered else None
 
 
-def _sources_complete(state: GatewayInventoryState) -> bool:
-    if state.last_good is None:
+def _sources_complete(evidence: GatewayEvidence | None) -> bool:
+    if evidence is None:
         return False
-    inventory: Final = state.last_good.inventory
-    pairs: Final = tuple((source.name, source.origin) for source in inventory.sources)
+    pairs: Final = tuple((source.name, source.origin) for source in evidence.sources)
     return (
         len(pairs) == len(SOURCE_PAIRS)
         and frozenset(pairs) == SOURCE_PAIRS
-        and all(source.status == "complete" for source in inventory.sources)
-        and not inventory.rejected
+        and all(source.status == "complete" for source in evidence.sources)
+        and not evidence.rejected
     )
 
 
 def _coverage(state: GatewayInventoryState, now: datetime) -> GatewayCoverage:
-    good: Final = state.last_good
+    evidence: Final = state.evidence
     gateway_state: Final[GatewayState] = (
         "never_collected"
-        if good is None
+        if evidence is None
         else "last_attempt_failed"
         if state.attempt.status != "collected"
         else "stale"
-        if now - good.inventory.observed_at > STALE_AFTER
+        if now - evidence.observed_at > STALE_AFTER
         else "current"
     )
     return GatewayCoverage(
         gateway_origin=state.gateway_origin,
         state=gateway_state,
-        sources_complete=_sources_complete(state),
+        sources_complete=_sources_complete(evidence),
         last_attempt_at=state.attempt.attempted_at,
         last_attempt_status=state.attempt.status,
         last_attempt_message=state.attempt.message,
-        last_good_checked_at=good.checked_at if good is not None else None,
-        last_good_observed_at=good.inventory.observed_at if good is not None else None,
+        last_collected_checked_at=evidence.checked_at if evidence is not None else None,
+        last_collected_observed_at=evidence.observed_at if evidence is not None else None,
+        sources=evidence.sources if evidence is not None else (),
     )
 
 
-def _findings(state: GatewayInventoryState) -> tuple[InventoryFinding, ...]:
-    if state.last_good is None:
-        return ()
-    gateway: Final = state.gateway_origin
-    inventory: Final = state.last_good.inventory
-    bound: Final = frozenset(
-        (item.credential_name, item.origin) for item in inventory.credentials if item.binding == "bound"
-    )
+def _findings(gateway: str, evidence: GatewayEvidence) -> tuple[InventoryFinding, ...]:
+    credentials: Final = tuple(item.credential for item in evidence.credentials)
+    bound: Final = frozenset((item.credential_name, item.origin) for item in credentials if item.binding == "bound")
     return (
         *(
             InventoryFinding(
@@ -169,7 +170,7 @@ def _findings(state: GatewayInventoryState) -> tuple[InventoryFinding, ...]:
                 source=source.name,
                 detail=source.detail,
             )
-            for source in inventory.sources
+            for source in evidence.sources
             if source.status != "complete"
         ),
         *(
@@ -181,7 +182,7 @@ def _findings(state: GatewayInventoryState) -> tuple[InventoryFinding, ...]:
                 name=item.name,
                 detail=item.reason,
             )
-            for item in inventory.rejected
+            for item in evidence.rejected
         ),
         *(
             InventoryFinding(
@@ -191,30 +192,30 @@ def _findings(state: GatewayInventoryState) -> tuple[InventoryFinding, ...]:
                 name=item.credential_name,
                 account_id=item.account_id,
             )
-            for item in inventory.credentials
+            for item in credentials
             if item.binding != "bound"
         ),
         *(
             InventoryFinding(
-                kind="unbound_route" if item.binding == "unbound" else "invalid_route",
+                kind="unbound_route" if item.route.binding == "unbound" else "invalid_route",
                 gateway_origin=gateway,
-                origin=item.origin,
-                name=item.route_id or item.path,
-                account_id=item.account_id,
+                origin=item.route.origin,
+                name=item.route.route_id or item.route.path,
+                account_id=item.route.account_id,
             )
-            for item in inventory.routes
-            if item.binding != "account"
+            for item in evidence.routes
+            if item.route.binding != "account"
         ),
         *(
             InventoryFinding(
                 kind="unattributed_deployment",
                 gateway_origin=gateway,
-                origin=item.origin,
-                name=item.model_name,
-                detail=item.auth,
+                origin=item.deployment.origin,
+                name=item.deployment.model_name,
+                detail=item.deployment.auth,
             )
-            for item in inventory.deployments
-            if (item.credential_name, item.origin) not in bound
+            for item in evidence.deployments
+            if (item.deployment.credential_name, item.deployment.origin) not in bound
         ),
     )
 
@@ -267,6 +268,7 @@ def _gaps(
         ("credential_only_in_database", bool(database - runtime)),
         ("credential_only_in_runtime", bool(runtime - database)),
         ("credential_unused", unused),
+        ("binding_not_in_latest_collection", bool(bound) and all(item.presence == "retained" for item in bound)),
         ("invalid_binding", invalid),
         ("no_usage_source", not has_usage),
         ("no_verified_provider_usage", verified_usage == "none"),
@@ -276,15 +278,31 @@ def _gaps(
 
 
 def _references(
-    gateway: str, routes: tuple[InventoryRoute, ...], deployments: tuple[InventoryDeployment, ...]
+    gateway: str, routes: tuple[KnownRoute, ...], deployments: tuple[KnownDeployment, ...]
 ) -> tuple[tuple[str, str, str], ...]:
     return tuple(
         (gateway, origin, name)
         for origin, name in chain(
-            ((route.origin, route.credential_name) for route in routes),
-            ((deployment.origin, deployment.credential_name) for deployment in deployments),
+            ((item.route.origin, item.route.credential_name) for item in routes),
+            ((item.deployment.origin, item.deployment.credential_name) for item in deployments),
         )
         if name is not None
+    )
+
+
+def _gateway_credentials(gateway: str, evidence: GatewayEvidence) -> Iterable[GatewayCredential]:
+    return (
+        GatewayCredential(
+            gateway_origin=gateway, credential=item.credential, observed_at=item.observed_at, presence=item.presence
+        )
+        for item in evidence.credentials
+    )
+
+
+def _gateway_routes(gateway: str, evidence: GatewayEvidence) -> Iterable[GatewayRoute]:
+    return (
+        GatewayRoute(gateway_origin=gateway, route=item.route, observed_at=item.observed_at, presence=item.presence)
+        for item in evidence.routes
     )
 
 
@@ -297,24 +315,14 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
     events: Final = stored.events
     gateway_records: Final = stored.gateway_records
     gateways: Final = stored.gateway_inventories
-    collected: Final = tuple(state for state in gateways if state.last_good is not None)
+    collected: Final = tuple((state.gateway_origin, state.evidence) for state in gateways if state.evidence is not None)
     credentials: Final = tuple(
-        GatewayCredential(gateway_origin=state.gateway_origin, credential=item)
-        for state in collected
-        if state.last_good is not None
-        for item in state.last_good.inventory.credentials
-    )  # comprehension-ok: flattening per-gateway snapshots keeps each record's gateway origin
-    routes: Final = tuple(
-        GatewayRoute(gateway_origin=state.gateway_origin, route=item)
-        for state in collected
-        if state.last_good is not None
-        for item in state.last_good.inventory.routes
-    )  # comprehension-ok: flattening per-gateway snapshots keeps each record's gateway origin
+        chain.from_iterable(_gateway_credentials(origin, evidence) for origin, evidence in collected)
+    )
+    routes: Final = tuple(chain.from_iterable(_gateway_routes(origin, evidence) for origin, evidence in collected))
     referenced: Final = frozenset(
         chain.from_iterable(
-            _references(state.gateway_origin, state.last_good.inventory.routes, state.last_good.inventory.deployments)
-            for state in collected
-            if state.last_good is not None
+            _references(origin, evidence.routes, evidence.deployments) for origin, evidence in collected
         )
     )
     catalogued: Final = {account.id: account for account in stored.accounts}
@@ -401,5 +409,8 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
         else "partial",
         gateways=coverage,
         accounts=tuple(map(entry, account_ids)),
-        findings=(*chain.from_iterable(map(_findings, collected)), *_conflicts(credentials)),
+        findings=(
+            *chain.from_iterable(_findings(origin, evidence) for origin, evidence in collected),
+            *_conflicts(credentials),
+        ),
     )

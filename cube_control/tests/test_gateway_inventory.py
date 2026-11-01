@@ -300,7 +300,7 @@ class GatewayInventoryWorkflowTests(unittest.TestCase):
         report: Final = AccountInventoryReport.model_validate_json(response.content)
         self.assertEqual(
             [
-                (item.state, item.last_attempt_status, item.last_good_observed_at)
+                (item.state, item.last_attempt_status, item.last_collected_observed_at)
                 for item in report.gateways
                 if item.gateway_origin == origin
             ],
