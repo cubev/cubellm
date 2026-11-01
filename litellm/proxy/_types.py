@@ -701,6 +701,7 @@ class LiteLLMRoutes(enum.Enum):
     management_routes = (
         [
             "/cube_control/capabilities",
+            "/cube_control/account_inventory",
             "/cube_control/account_routes",
             "/cube_control/account_routes/{route_id}",
             "/cube_control/account_routes/{route_id}/grants",

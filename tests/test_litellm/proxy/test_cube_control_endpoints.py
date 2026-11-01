@@ -28,6 +28,8 @@ class ForbiddenGrantDatabase:
 @pytest.mark.parametrize(
     ("path", "allowed"),
     (
+        ("/cube_control/account_inventory", True),
+        ("/cube_control/account_inventory/extra", False),
         ("/cube_control/account_routes", True),
         ("/cube_control/account_routes/fixture-route", True),
         ("/cube_control/account_routes/fixture-route/grants", True),
