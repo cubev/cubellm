@@ -27,6 +27,7 @@ from cube_control.application_access import (
 )
 from cube_control.edge import GatewayEdgeSpec, render_gateway_edge
 from cube_control.gateway import GatewayProjectionBatch, prepare_gateway
+from cube_control.gateway_inventory import collect_and_record_gateway_inventory
 from cube_control.gateway_store import GatewayRepository
 from cube_control.github import collect_github
 from cube_control.heygen import collect_heygen
@@ -53,6 +54,7 @@ class CommandArguments(argparse.Namespace):
     account_name: str
     state_directory: Path
     destination_directory: Path
+    gateway_origin: str
 
 
 def main() -> int:
@@ -103,6 +105,9 @@ def main() -> int:
     github_parser.add_argument("--config", required=True, type=Path)
     github_parser.add_argument("--account-id", default="github-api")
     github_parser.add_argument("--account-name", default="GitHub API")
+    inventory_parser: Final = sub.add_parser("collect-gateway-inventory")
+    inventory_parser.add_argument("--config", required=True, type=Path)
+    inventory_parser.add_argument("--gateway-origin", required=True)
     import_parser: Final = sub.add_parser("import")
     import_parser.add_argument("path", nargs="?", default="-")
     serve_parser: Final = sub.add_parser("serve")
@@ -292,6 +297,31 @@ def main() -> int:
             )
         )
         return 0 if imported.status in ("applied", "duplicate") else 1
+    if args.command == "collect-gateway-inventory":
+        inventory_key: Final = read_private_key(args.config, "LITELLM_MASTER_KEY", "Gateway")
+        if isinstance(inventory_key, Unavailable):
+            print(inventory_key.message, file=sys.stderr)
+            return 2
+        try:
+            inventory_result: Final = collect_and_record_gateway_inventory(
+                repository, args.gateway_origin, inventory_key, datetime.now(UTC)
+            )
+        except psycopg.Error:
+            print("Inventory store unavailable", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "status": inventory_result.status,
+                    "message": inventory_result.message,
+                    "sources": [
+                        source.model_dump(mode="json")
+                        for source in (inventory_result.snapshot.inventory.sources if inventory_result.snapshot else ())
+                    ],
+                }
+            )
+        )
+        return 0 if inventory_result.status == "collected" else 1
     if args.command == "manage":
         raw_command: Final[str] = sys.stdin.read(65537) if args.path == "-" else Path(args.path).read_text()
         if len(raw_command) > 65536:

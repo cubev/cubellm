@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Final
 
+import psycopg
 from fastapi.testclient import TestClient
 
 from cube_control.api import create_app
@@ -35,7 +36,24 @@ class FixedRepository:
         return ImportResult(False, message="Read only fixture")
 
 
+class UnreachableRepository(FixedRepository):
+    def state(self) -> StoredState:
+        raise psycopg.OperationalError("connection to server at secret-host failed")
+
+
 class ApiTests(unittest.TestCase):
+    def test_inventory_is_read_only_and_reports_an_unreachable_store_without_details(self) -> None:
+        client: Final = TestClient(create_app(UnreachableRepository()))
+        response: Final = client.get("/api/v1/inventory")
+        self.assertEqual(
+            (response.status_code, response.json()), (503, {"detail": "Zentrale Datenbank ist nicht erreichbar"})
+        )
+        self.assertEqual(
+            [client.request(method, "/api/v1/inventory", json={}).status_code for method in ("POST", "PUT", "DELETE")],
+            [405, 405, 405],
+        )
+        self.assertEqual(client.get("/api/v1/capabilities").json()["account_inventory"], "gateway_bindings_v1")
+
     def test_explicit_account_attribution_is_never_copied_to_other_provider_accounts(self) -> None:
         now: Final = datetime(2026, 1, 5, tzinfo=UTC)
         accounts: Final = tuple(

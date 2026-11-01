@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict
 from starlette.middleware.base import RequestResponseEndpoint
 
 from cube_control.gateway import gateway_metrics
+from cube_control.inventory import AccountInventoryReport, account_inventory
 from cube_control.media import JobHistory, JobReader, JobSnapshot
 from cube_control.models import (
     AccountView,
@@ -52,6 +53,7 @@ class CapabilitiesResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
     schema_version: Literal[1] = 1
     gateway_native_account_projection: Literal["credential_snapshot_v1"] = "credential_snapshot_v1"
+    account_inventory: Literal["gateway_bindings_v1"] = "gateway_bindings_v1"
     gateway_projection_fields: tuple[str, ...] = (
         "account_id",
         "account_evidence",
@@ -116,6 +118,13 @@ def create_app(
                 for view in views
             ),
         )
+
+    def inventory() -> AccountInventoryReport:
+        try:
+            state: Final = repository.state()
+        except psycopg.Error:
+            raise HTTPException(503, detail="Zentrale Datenbank ist nicht erreichbar") from None
+        return account_inventory(state, clock())
 
     def fleet() -> FleetSnapshot | None:
         try:
@@ -187,6 +196,7 @@ def create_app(
     app.add_api_route("/healthz", health, methods=["GET"])
     app.add_api_route("/api/v1/capabilities", capabilities, methods=["GET"], response_model=CapabilitiesResponse)
     app.add_api_route("/api/v1/summary", summary, methods=["GET"], response_model=SummaryResponse)
+    app.add_api_route("/api/v1/inventory", inventory, methods=["GET"], response_model=AccountInventoryReport)
     app.add_api_route("/api/v1/fleet", fleet, methods=["GET"], response_model=FleetSnapshot | None)
     app.add_api_route("/api/v1/usage", usage, methods=["GET"], response_model=UsagePage)
     app.add_api_route(

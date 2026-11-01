@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, Protocol
 
 import httpx
 from pydantic import AwareDatetime, BaseModel, Field, SecretStr, ValidationError
@@ -173,3 +173,28 @@ def collect_gateway_inventory(
         return GatewayInventoryResult(status="error", message="Gateway response rejected")
     except ValueError:
         return GatewayInventoryResult(status="error", message="Gateway response exceeds size limit")
+
+
+class InventoryRecorder(Protocol):
+    def record_gateway_inventory(
+        self, gateway_origin: str, attempt: GatewayInventoryAttempt, snapshot: GatewayInventorySnapshot | None
+    ) -> None: ...
+
+
+def collect_and_record_gateway_inventory(
+    recorder: InventoryRecorder,
+    gateway_origin: str,
+    master_key: SecretStr,
+    now: datetime,
+    transport: httpx.BaseTransport | None = None,
+) -> GatewayInventoryResult:
+    origin: Final = gateway_origin.rstrip("/")
+    try:
+        require_admin_origin(origin)
+    except ValueError:
+        return GatewayInventoryResult(status="error", message="Gateway origin rejected")
+    result: Final = collect_gateway_inventory(origin, master_key, now, transport)
+    recorder.record_gateway_inventory(
+        origin, GatewayInventoryAttempt(attempted_at=now, status=result.status, message=result.message), result.snapshot
+    )
+    return result
