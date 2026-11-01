@@ -79,11 +79,8 @@ CONFIG: Final = {
 def postgres_query(query: str) -> sql.SQL:
     if query not in {LOCK_SETTINGS_SQL, READ_SETTINGS_SQL, WRITE_SETTINGS_SQL, INSERT_SETTINGS_SQL, APPEND_ROUTE_SQL}:
         raise ValueError("Unexpected SQL outside the account configuration transaction contract")
-    return sql.SQL(
-        cast(
-            LiteralString, re.sub(r"\$(\d+)", r"%(p\1)s", query)
-        )  # cast-ok: allowlisted SQL; only parameter markers change
-    )
+    marked: Final = re.sub(r"\$(\d+)", r"%(p\1)s", query)
+    return sql.SQL(cast(LiteralString, marked))  # cast-ok: allowlisted SQL with only parameter markers changed
 
 
 def numbered(parameters: tuple[str, ...]) -> dict[str, str]:

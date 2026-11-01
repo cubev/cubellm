@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from ipaddress import ip_address
 from itertools import chain
 from types import MappingProxyType
-from typing import Annotated, Final, cast
+from typing import Annotated, Final
 from urllib.parse import urlsplit
 
 import httpx
@@ -164,15 +164,7 @@ class ResolvedAccountCredential:
     headers: Mapping[str, str] = field(repr=False)
 
 
-def validate_account_route(
-    target: str,
-    auth: bool,
-    forward_headers: bool | None,
-    configured_headers: Mapping[str, object],
-    default_query_params: Mapping[str, object] | None,
-    policy: AccountHeaderCredential,
-    methods: Sequence[str] | None = None,
-) -> None:
+def _validate_account_target(target: str) -> None:
     parsed: Final = urlsplit(target)
     if (
         parsed.scheme not in {"http", "https"}
@@ -191,6 +183,18 @@ def validate_account_route(
             raise ValueError("Account credential routes require HTTPS outside literal loopback") from None
         if not loopback:
             raise ValueError("Account credential routes require HTTPS outside literal loopback")
+
+
+def validate_account_route(
+    target: str,
+    auth: bool,
+    forward_headers: bool | None,
+    configured_headers: Mapping[str, object],
+    default_query_params: Mapping[str, object] | None,
+    policy: AccountHeaderCredential,
+    methods: Sequence[str] | None = None,
+) -> None:
+    _validate_account_target(target)
     if not auth or forward_headers:
         raise ValueError("Account credential routes require gateway authentication and restricted forwarding")
     if default_query_params and not set(default_query_params).issubset(policy.allowed_query_parameters):
@@ -215,6 +219,12 @@ def validate_account_request(
         raise ValueError("Account credential route query parameter is not allowed")
 
 
+class _CredentialPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+    credential_info: CredentialAccountInfo
+    credential_values: Mapping[str, object]
+
+
 def resolve_account_credential(
     policy: AccountHeaderCredential,
     credential: CredentialItem | None,
@@ -222,13 +232,14 @@ def resolve_account_credential(
 ) -> ResolvedAccountCredential:
     if credential is None or credential.credential_name != policy.credential_name:
         raise ValueError("Named account credential is unavailable")
-    info: Final = CredentialAccountInfo.model_validate(cast(Mapping[str, object], credential.credential_info))
+    payload: Final = _CredentialPayload.model_validate(credential, from_attributes=True)
+    info: Final = payload.credential_info
     if info.cube_account_id != policy.account_id:
         raise ValueError("Named credential account does not match route account")
     origin: Final = credential_origin(target)
     if origin not in tuple(credential_origin(value, origin_only=True) for value in info.cube_allowed_origins):
         raise ValueError("Named account credential is not allowed for this origin")
-    values: Final = MappingProxyType(dict(cast(Mapping[str, object], credential.credential_values)))
+    values: Final = MappingProxyType(payload.credential_values)
 
     def header_value(header: CredentialHeader) -> str:
         raw: Final = values.get(header.field)

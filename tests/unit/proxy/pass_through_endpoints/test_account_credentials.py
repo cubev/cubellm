@@ -95,12 +95,18 @@ def credential(
     value: str | SecretStr = "inert-provider-canary",
     account_id: str = "fixture-account",
     origin: str = "https://vendor.example",
+    provider: str | None = None,
 ) -> CredentialItem:
     return CredentialItem(
         credential_name=POLICY.credential_name,
         credential_values={"access value": value},
-        credential_info={"cube_account_id": account_id, "cube_allowed_origins": [origin]},
+        credential_info={"cube_account_id": account_id, "cube_allowed_origins": [origin]}
+        | ({"cube_provider_id": provider} if provider is not None else {}),
     )
+
+
+def stored_info(item: CredentialItem) -> dict[str, object]:
+    return cast(dict[str, object], item.credential_info)  # cast-ok: the test mutates the stored mapping in place
 
 
 def test_native_credential_resolution_is_private_and_has_an_immutable_snapshot() -> None:
@@ -108,7 +114,7 @@ def test_native_credential_resolution_is_private_and_has_an_immutable_snapshot()
     resolved: Final = resolve_account_credential(POLICY, item, "https://vendor.example/check")
     assert resolved.headers["X-Vendor-Credential"] == "Bearer inert-provider-canary"
     assert "inert-provider-canary" not in repr(resolved)
-    cast(dict[str, object], item.credential_info)["cube_account_id"] = "later-account"
+    stored_info(item)["cube_account_id"] = "later-account"
     assert resolved.binding.account_id == "fixture-account"
     assert resolved.binding.origin == "https://vendor.example"
     assert isinstance(resolved.headers, MappingProxyType)
@@ -230,10 +236,9 @@ def test_credential_headers_cannot_use_protocol_fields_mutated_by_the_gateway(na
 
 
 def test_provider_identity_comes_from_the_request_credential_snapshot() -> None:
-    item: Final = credential()
-    cast(dict[str, object], item.credential_info)["cube_provider_id"] = "arbitrary-provider"
+    item: Final = credential(provider="arbitrary-provider")
     resolved: Final = resolve_account_credential(POLICY, item, "https://vendor.example/check")
-    cast(dict[str, object], item.credential_info)["cube_provider_id"] = "later-provider"
+    stored_info(item)["cube_provider_id"] = "later-provider"
     assert resolved.binding.provider == "arbitrary-provider"
     metadata: Final = stored_metadata(
         {"provider_account_provider": "forged-provider"}, account_binding=resolved.binding
@@ -244,8 +249,7 @@ def test_provider_identity_comes_from_the_request_credential_snapshot() -> None:
 
 @pytest.mark.parametrize("provider", ("", "Bad Provider", "UPPER"))
 def test_credential_provider_identity_must_be_a_valid_provider_id(provider: str) -> None:
-    item: Final = credential()
-    cast(dict[str, object], item.credential_info)["cube_provider_id"] = provider
+    item: Final = credential(provider=provider)
     with pytest.raises(ValueError):
         resolve_account_credential(POLICY, item, "https://vendor.example/check")
 

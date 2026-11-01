@@ -1,15 +1,14 @@
 import json
 import os
 import unittest
-from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
-from typing import Final, cast
+from typing import Final
 from uuid import uuid4
 
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from cube_control.gateway import (
     GatewayProjection,
@@ -192,7 +191,7 @@ class GatewayStoreTests(unittest.TestCase):
             "cache_read_tokens",
             "cache_write_tokens",
         )
-        values: Final = cast(Mapping[str, JsonValue], self.record.model_dump(mode="json"))
+        values: Final = TypeAdapter(dict[str, JsonValue]).validate_json(self.record.model_dump_json())
         legacy_record: Final = json.dumps({name: values[name] for name in legacy_fields}, separators=(",", ":"))
         raw: Final = '{"scan":' + batch.scan.model_dump_json() + ',"records":[' + legacy_record + "]}"
         self.assertEqual(batch.model_dump_json(), raw)

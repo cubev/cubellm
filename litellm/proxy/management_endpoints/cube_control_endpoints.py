@@ -1,4 +1,4 @@
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Final, Literal, NoReturn, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
@@ -58,11 +58,24 @@ class CubeControlCapabilities(BaseModel):
 
 
 async def _require_account_admin(
-    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
 ) -> UserAPIKeyAuth:
     if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
         raise HTTPException(status_code=403, detail="Only proxy admins can manage account grants")
     return user_api_key_dict
+
+
+class _CubeGeneralSettings(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+    store_model_in_db: JsonValue = None
+    disable_custom_api_keys: JsonValue = False
+    allow_client_side_credentials: JsonValue = None
+
+
+def _general_settings() -> _CubeGeneralSettings:
+    from litellm.proxy import proxy_server
+
+    return _CubeGeneralSettings.model_validate(vars(proxy_server)["general_settings"])
 
 
 async def account_grant_database(
@@ -72,12 +85,13 @@ async def account_grant_database(
 
     if proxy_server.prisma_client is None:
         raise HTTPException(status_code=503, detail="Account grant database is unavailable")
-    settings: Final = cast(Mapping[str, JsonValue], proxy_server.general_settings)
-    if proxy_server.store_model_in_db is not True and settings.get("store_model_in_db") is not True:
+    if proxy_server.store_model_in_db is not True and _general_settings().store_model_in_db is not True:
         raise HTTPException(status_code=409, detail="Database configuration updates are disabled")
     if proxy_server.proxy_config.settings.owned_by_config("pass_through_endpoints"):
         raise HTTPException(status_code=409, detail="Account routes are owned by the configuration file")
-    return cast(GrantDatabase, proxy_server.prisma_client)
+    return cast(  # cast-ok: PrismaClient provides the tx() protocol used for account configuration
+        GrantDatabase, proxy_server.prisma_client
+    )
 
 
 def account_credential_lookup() -> Callable[[str], CredentialItem | None]:
@@ -203,16 +217,13 @@ async def cube_control_account_resource(
 
 @router.get("/cube_control/capabilities", response_model=CubeControlCapabilities)
 async def cube_control_capabilities(
-    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
 ) -> CubeControlCapabilities:
     if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
         raise HTTPException(status_code=403, detail="Only proxy admins can inspect Cube Control capabilities")
 
-    from litellm.proxy import proxy_server
-
-    settings: Final = cast(Mapping[str, JsonValue], proxy_server.general_settings)
-
+    settings: Final = _general_settings()
     return CubeControlCapabilities(
-        custom_keys_allowed=coerce_bool(settings.get("disable_custom_api_keys", False)) is not True,
-        client_side_credentials_allowed=settings.get("allow_client_side_credentials") is True,
+        custom_keys_allowed=coerce_bool(settings.disable_custom_api_keys) is not True,
+        client_side_credentials_allowed=settings.allow_client_side_credentials is True,
     )
