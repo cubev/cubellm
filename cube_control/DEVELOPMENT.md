@@ -828,3 +828,14 @@ client probe before pytest and after teardown, all without route or external nam
 resolution; cleanup left no relay, container or test schema. Local acceptance only: one
 gateway worker, no Redis, scripted provider, synthetic credentials, no production
 rollout
+
+## Gateway account inventory acceptance
+
+The gateway reports its account bindings at `GET /cube_control/account_inventory` for proxy admins only. Non-admin keys get the same generic management denial as the other Cube Control routes. The controller collects that report with `collect-gateway-inventory`, keeps per-source evidence for each gateway and serves the reconciled inventory at `GET /api/v1/inventory`
+
+A scan with an unreadable source used to replace the whole stored snapshot, so accounts known only from that source disappeared. Evidence is now merged source by source as described in the README, under a per-origin lock, and legacy snapshot rows are read without being rewritten
+
+Evidence: the controller suite (224 tests, 228 subtests against the dedicated `cubecontrol_test` database) covers the merge rules, a previously known uncatalogued account surviving a newer scan with an unavailable source while a new account appears, complete empty sources, partial rejections, records without identity, a legacy row extended by a later partial scan, the additive schema upgrade, a first collection waiting on the origin lock, CLI failure contracts and the read-only API. Twelve targeted mutants of the merge, store and report each fail these tests. The native integration file passes all six tests against image `cubellm-native-dev:d4cc90b` in the isolated runner: the controller CLI collects the live gateway inventory into the test database, a retry with a rejected key keeps the known evidence, and the served controller API reports both without secret values. That controller test runs only against a database named `cubecontrol_test` and skips elsewhere, so CI coverage needs a dedicated controller database first
+
+Limits: one gateway worker, no Redis, synthetic credentials and a scripted provider. No live provider account, billing value or off-LAN path was exercised. Still open: browser enrollment and management, precise provider usage and billing reconciliation, further authentication protocols, provider media jobs, rotation and distributed revocation, multiple workers with Redis, and LAN and Tailscale acceptance
+

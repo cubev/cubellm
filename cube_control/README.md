@@ -39,7 +39,7 @@ The deployment process must resolve `CONTROL_PYTHON_BASE` to an image digest and
 
 ## API
 
-`GET /healthz` verifies database readiness. `GET /api/v1/summary` exposes source-qualified observations and separate proxy totals. `GET /api/v1/fleet` exposes the last imported host inventory with per-host timestamps. `/` is the browser overview
+`GET /healthz` verifies database readiness. `GET /api/v1/summary` exposes source-qualified observations and separate proxy totals. `GET /api/v1/fleet` exposes the last imported host inventory with per-host timestamps. `GET /api/v1/inventory` exposes the account inventory described below. `/` is the browser overview
 
 ```sh
 python -m cube_control import observations.json
@@ -969,3 +969,14 @@ Native SDK artifact acceptance now includes the account/gateway subset, real
 native tokenizer execution and the local recording-server route checks. The
 complete gateway image, rebuilt native Admin UI, target-runtime execution and
 coordinated production/source activation remain separate required steps
+
+## Gateway account inventory
+
+`python -m cube_control collect-gateway-inventory --config admin.env --gateway-origin http://127.0.0.1:4000` reads the gateway's `GET /cube_control/account_inventory` and stores the result under the canonical gateway origin. The configuration file must be a regular file owned by the current user with no group or other permissions, and must contain `LITELLM_MASTER_KEY`. The origin must be an explicit loopback HTTP origin with a port. Any other origin is rejected without a request and without a stored record. The command prints only the attempt status, a sanitized message and per-source counts, and exits non-zero unless the inventory was collected and stored. A failed store write never reports a collected inventory
+
+Every attempt is stored with its time and status. Each gateway keeps per-source evidence for credentials, routes and deployments, separately for the gateway's runtime view and its database. A source read completely replaces that source's records, so a complete empty source clears obsolete bindings. A partially readable source adds what it read and keeps the remaining known records. An unavailable source keeps every known record. Kept records are marked `retained` and keep the time they were last read. They are never re-stamped as current. Records without a stable identity, such as a route without id or path or a deployment without a model id, never remove a retained record. Older or equal deliveries never replace newer evidence, and concurrent collectors for the same origin are serialized. `latest_collection` only means the record was readable in the latest collection, not that it is fresh or provider-verified
+
+`GET /api/v1/inventory` is read-only. It joins the catalogue, manual entries, media jobs, observations, usage events, gateway records and every collected gateway. Accounts known only from a gateway, a job or a manual entry stay listed with their source and a `not_in_catalogue` gap. Nothing is enrolled, and provider or ownership is never inferred from model names. Each gateway reports `current`, `stale`, `last_attempt_failed` or `never_collected` together with its per-source evidence. Unbound, invalid, conflicting and unattributed records are findings. Provider usage counts as verified only for a current, fresh, known provider reading of the current period. Older readings stay visible as history. Overall coverage is `configured_sources_complete` only when every collected gateway is current with all six sources complete and nothing rejected
+
+Inventory rows written before source-wise evidence existed are read as evidence and are not rewritten. `init` adds the evidence column to an existing table
+
