@@ -14,7 +14,13 @@ from starlette.convertors import Convertor, PathConvertor
 from starlette.routing import BaseRoute, Mount, Route, WebSocketRoute, compile_path
 from typing_extensions import Self
 
-from .account_credentials import AccountHeaderCredential, CredentialHeader, Identifier, validate_account_route
+from .account_credentials import (
+    AccountHeaderCredential,
+    CredentialHeader,
+    Identifier,
+    validate_account_resources,
+    validate_account_route,
+)
 from .account_grants import (
     LOCK_SETTINGS_SQL,
     READ_SETTINGS_SQL,
@@ -24,6 +30,7 @@ from .account_grants import (
     describe_account_route,
     settings_from_rows,
 )
+from .account_resources import AccountResourceType
 
 INSERT_SETTINGS_SQL: Final = """INSERT INTO "LiteLLM_Config" ("param_name", "param_value") VALUES ($1, '{}'::jsonb)
 ON CONFLICT ("param_name") DO NOTHING"""
@@ -73,6 +80,7 @@ class AccountRouteDefinition(BaseModel):
         validate_account_route(
             self.target, True, False, MappingProxyType({}), None, self.account_credential, self.methods
         )
+        validate_account_resources(self.path, self.include_subpath, self.account_credential)
         return self
 
     def stored(self) -> Mapping[str, JsonValue]:
@@ -82,7 +90,11 @@ class AccountRouteDefinition(BaseModel):
             target=self.target,
             methods=self.methods,
             include_subpath=self.include_subpath,
-            account_credential=_StoredCredential.model_validate(self.account_credential, from_attributes=True),
+            account_credential=(
+                _StoredResourceCredential.model_validate(self.account_credential, from_attributes=True)
+                if self.account_credential.resource_types
+                else _StoredCredential.model_validate(self.account_credential, from_attributes=True)
+            ),
         )
         return _OBJECT.validate_json(route.model_dump_json())
 
@@ -95,6 +107,15 @@ class _StoredCredential(BaseModel):
     allowed_query_parameters: tuple[str, ...]
 
 
+class _StoredResourceCredential(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    account_id: str
+    credential_name: str
+    headers: tuple[CredentialHeader, ...]
+    allowed_query_parameters: tuple[str, ...]
+    resource_types: Annotated[tuple[AccountResourceType, ...], Field(min_length=1)]
+
+
 class _StoredRoute(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     id: str
@@ -104,7 +125,7 @@ class _StoredRoute(BaseModel):
     include_subpath: bool
     auth: Literal[True] = True
     forward_headers: Literal[False] = False
-    account_credential: _StoredCredential
+    account_credential: _StoredCredential | _StoredResourceCredential
 
 
 class AccountRouteCreateCommand(BaseModel):

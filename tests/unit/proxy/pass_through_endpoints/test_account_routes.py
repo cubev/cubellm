@@ -355,3 +355,67 @@ async def test_route_creation_reports_only_a_verified_readback() -> None:
 async def test_route_creation_refuses_to_commit_an_unexpected_write(database: ScriptedDatabase) -> None:
     with pytest.raises(RuntimeError):
         await create_account_route(database, AccountRouteCreateCommand(route=DEFINITION))
+
+
+LEGACY_STORED_ROUTE: Final[dict[str, JsonValue]] = {
+    "id": "legacy-proof",
+    "path": "/cube_api/legacy-proof/quota",
+    "target": "https://vendor.example/quota",
+    "methods": ["GET"],
+    "include_subpath": False,
+    "auth": True,
+    "forward_headers": False,
+    "account_credential": {
+        "account_id": "legacy-account",
+        "credential_name": "legacy-credential",
+        "headers": [{"name": "X-Api-Key", "field": "api_key", "prefix": ""}],
+        "allowed_query_parameters": [],
+    },
+}
+LEGACY_FINGERPRINT: Final = "b31c235b29ca20bc01109312b46d27a330f5250f47378bd68df013191c190d2b"
+LEGACY_DEFINITION: Final[dict[str, JsonValue]] = {
+    "id": "legacy-proof",
+    "path": "/cube_api/legacy-proof/quota",
+    "target": "https://vendor.example/quota",
+    "methods": ["GET"],
+    "account_credential": {
+        "account_id": "legacy-account",
+        "credential_name": "legacy-credential",
+        "headers": [{"name": "X-Api-Key", "field": "api_key"}],
+    },
+}
+
+
+def test_routes_created_before_resource_types_keep_their_stored_shape_retry_and_fingerprint() -> None:
+    definition: Final = AccountRouteDefinition.model_validate(LEGACY_DEFINITION)
+    assert definition.stored() == LEGACY_STORED_ROUTE
+    assert plan_account_route(settings(LEGACY_STORED_ROUTE), definition) is False
+    stored: Final = describe_account_route(settings(LEGACY_STORED_ROUTE), "legacy-proof")
+    assert not isinstance(stored, GrantFailure) and stored.fingerprint == LEGACY_FINGERPRINT
+
+
+def test_declared_resource_types_are_persisted_and_change_the_fingerprint() -> None:
+    credential: Final = LEGACY_DEFINITION["account_credential"]
+    assert isinstance(credential, dict)
+    resource_types: Final[list[JsonValue]] = [
+        {"name": "quota-report", "item_paths": ["/cube_api/legacy-proof/quota/{resource_id}"]}
+    ]
+    definition: Final = AccountRouteDefinition.model_validate(
+        LEGACY_DEFINITION
+        | {"include_subpath": True, "account_credential": credential | {"resource_types": resource_types}}
+    )
+    stored: Final = definition.stored()
+    stored_credential: Final = stored["account_credential"]
+    assert isinstance(stored_credential, dict)
+    assert stored_credential["resource_types"] == [
+        {"name": "quota-report", "item_paths": ["/cube_api/legacy-proof/quota/{resource_id}"], "creation": None}
+    ]
+    without: Final = {
+        **stored,
+        "account_credential": {k: v for k, v in stored_credential.items() if k != "resource_types"},
+    }
+    with_resources: Final = describe_account_route(settings(stored), "legacy-proof")
+    without_resources: Final = describe_account_route(settings(without), "legacy-proof")
+    assert not isinstance(with_resources, GrantFailure) and not isinstance(without_resources, GrantFailure)
+    assert with_resources.fingerprint != without_resources.fingerprint
+    assert plan_account_route(settings(without), definition) == GrantFailure("conflict")

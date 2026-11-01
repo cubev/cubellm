@@ -126,6 +126,7 @@ from .account_credentials import (
     account_application_allowed,
     resolve_account_credential,
     validate_account_request,
+    validate_account_resources,
     validate_account_route,
 )
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
@@ -3396,6 +3397,12 @@ async def _register_pass_through_endpoint(
 
     if target is None:
         return
+    if endpoint_data.get("account_credential") is not None:
+        validate_account_resources(
+            path,
+            endpoint_data.get("include_subpath", False) is True,
+            AccountHeaderCredential.model_validate(endpoint_data["account_credential"]),
+        )
 
     guardrails: Final = endpoint_data.get("guardrails")
     methods: Final = endpoint_data.get("methods")

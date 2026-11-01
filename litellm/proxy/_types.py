@@ -27,7 +27,11 @@ from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
     validate_langfuse_span_scope_value,
     validate_no_callback_env_reference,
 )
-from litellm.proxy.pass_through_endpoints.account_credentials import AccountHeaderCredential, validate_account_route
+from litellm.proxy.pass_through_endpoints.account_credentials import (
+    AccountHeaderCredential,
+    validate_account_resources,
+    validate_account_route,
+)
 from litellm.types.agents import AgentCaller
 from litellm.types.integrations.compression_interception import (
     CompressionSavingsMetadata,
@@ -2454,6 +2458,7 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
                 self.account_credential,
                 self.methods,
             )
+            validate_account_resources(self.path, self.include_subpath, self.account_credential)
         return self
 
     id: str | None = Field(

@@ -2,6 +2,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from ipaddress import ip_address
+from itertools import chain
 from types import MappingProxyType
 from typing import Annotated, Final, cast
 from urllib.parse import urlsplit
@@ -11,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from typing_extensions import Self
 
 from litellm.models.credentials import CredentialItem
+
+from .account_resources import AccountResourceType, is_resource_template, resource_id_in_path, validate_resource_types
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
 
@@ -44,7 +47,7 @@ class AccountApplicationGrant(BaseModel):
     application_id: Identifier
     key_hash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
     account_id: Identifier
-    path: Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^/[A-Za-z0-9._~!$&'()+,;=:@/-]*$")]
+    path: Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^/[A-Za-z0-9._~!$&'()+,;=:@/{}-]*$")]
     methods: Annotated[
         tuple[Annotated[str, Field(pattern=r"^[!#$%&'+.^_`|~0-9A-Z-]{1,32}$")], ...],
         Field(min_length=1, max_length=16),
@@ -52,6 +55,9 @@ class AccountApplicationGrant(BaseModel):
 
     @model_validator(mode="after")
     def validate_grant(self) -> Self:
+        templated: Final = "{" in self.path or "}" in self.path
+        if templated and not is_resource_template(self.path):
+            raise ValueError("Application resource grants require one whole {resource_id} segment")
         if "//" in self.path or any(segment in {".", ".."} for segment in self.path.split("/")):
             raise ValueError("Application grants require exact canonical paths")
         if len(set(self.methods)) != len(self.methods):
@@ -66,11 +72,18 @@ class AccountHeaderCredential(BaseModel):
     headers: Annotated[tuple[CredentialHeader, ...], Field(min_length=1, max_length=8)]
     allowed_query_parameters: tuple[Annotated[str, Field(min_length=1, max_length=128)], ...] = ()
     application_grants: Annotated[tuple[AccountApplicationGrant, ...], Field(max_length=256)] = ()
+    resource_types: Annotated[tuple[AccountResourceType, ...], Field(max_length=16)] = ()
 
     @model_validator(mode="after")
     def validate_policy(self) -> Self:
         if any(grant.account_id != self.account_id for grant in self.application_grants):
             raise ValueError("Application grant account must match its credential policy")
+        templates: Final = frozenset(chain.from_iterable(resource.item_paths for resource in self.resource_types))
+        if any(
+            grant.path not in templates if is_resource_template(grant.path) else _covered(templates, grant.path)
+            for grant in self.application_grants
+        ):
+            raise ValueError("Resource grants must name a declared item path; concrete grants cannot cover one")
         if len({header.name.lower() for header in self.headers}) != len(self.headers):
             raise ValueError("Credential headers must be unique")
         if len(set(self.allowed_query_parameters)) != len(self.allowed_query_parameters):
@@ -83,6 +96,14 @@ class AccountHeaderCredential(BaseModel):
         return self
 
 
+def _covered(templates: frozenset[str], path: str) -> bool:
+    return any(resource_id_in_path(template, path) is not None for template in templates)
+
+
+def validate_account_resources(path: str, include_subpath: bool, policy: AccountHeaderCredential) -> None:
+    validate_resource_types(path, include_subpath, policy.resource_types)
+
+
 def account_application_allowed(
     policy: AccountHeaderCredential,
     application_id: str | None,
@@ -90,13 +111,18 @@ def account_application_allowed(
     path: str,
     method: str,
 ) -> bool:
-    return application_id is not None and key_hash is not None and any(
-        grant.application_id == application_id
-        and grant.key_hash == key_hash
-        and grant.account_id == policy.account_id
-        and grant.path == path
-        and method in grant.methods
-        for grant in policy.application_grants
+    return (
+        application_id is not None
+        and key_hash is not None
+        and any(
+            grant.application_id == application_id
+            and grant.key_hash == key_hash
+            and grant.account_id == policy.account_id
+            and grant.path == path
+            and not is_resource_template(grant.path)
+            and method in grant.methods
+            for grant in policy.application_grants
+        )
     )
 
 

@@ -12,6 +12,7 @@ from .account_credentials import (
     AccountApplicationGrant,
     AccountHeaderCredential,
     credential_origin,
+    validate_account_resources,
     validate_account_route,
 )
 
@@ -115,6 +116,7 @@ def describe_account_route(settings: Mapping[str, JsonValue], route_id: str) -> 
             route.account_credential,
             route.methods,
         )
+        validate_account_resources(route.path, route.include_subpath, route.account_credential)
         credential: Final = _OBJECT.validate_python(raw.get("account_credential"))
         stable: Final = {
             **raw,
