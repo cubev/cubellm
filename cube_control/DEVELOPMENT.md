@@ -769,3 +769,62 @@ resolver masking and records an isolation proof before the command starts
 This is local acceptance with synthetic credentials and a scripted provider. It does
 not cover real provider accounts, multiple workers, Redis, LAN or Tailscale access,
 or any production rollout
+
+
+## Controller resource lifecycle acceptance
+
+`tests/integration/authorization/test_account_routes.py` drives the real controller CLI
+against the gateway with a scripted provider and synthetic credentials.
+`provision-account-route` creates a route with two resource types (one with a creation
+rule), and an identical retry returns `existing` with the same fingerprint. Two
+applications are prepared, provisioned and delivered with a concrete creation scope and
+two item templates. PostgreSQL holds both keys with `exact:` for the creation path and
+`resource:` for the templates, the passthrough entries (plain creation path,
+`resource:` templates) and no raw keys. The route lists six grants with application,
+key hash, account, path and method, and contains no provider secret. A creation request
+with the owner key records one created ownership row with the owner key hash.
+`adopt-account-resource` returns `adopted`, then `existing` on retry and `conflict` for
+the other application, leaving exactly one adopted row for the owner. The owner reads
+both items with their distinct provider bodies; the other application, an ID under the
+wrong type, an unowned ID and the master key are denied. After
+`revoke-application` the owner key is denied for items and creation. The scripted
+provider records JSON POST requests only: it saw exactly one creation POST, and none
+after revocation. GET forwarding is shown by the item response bodies, not by these
+observations
+
+The controller only administers a gateway reached over an explicit-port loopback HTTP
+origin and skips otherwise. CircleCI's integration script uses
+`http://127.0.0.1:4000`, so the test is selected there; its CI outcome has not been
+observed for this branch
+
+## Pass-through route writers and the lost update
+
+Creating, updating and deleting a pass-through endpoint used to read the route list from
+the in-memory settings view and write it back over the database row. A route stored
+shortly before, for example through account route creation, was not yet in that view
+and was silently dropped when another route was deleted. With a database the three
+writers now lock the settings row, plan on the stored routes, write only
+`pass_through_endpoints`, read it back and check that nothing else changed, in one
+transaction. Non-admin callers are rejected before the transaction, duplicate IDs on
+create and ID collisions on update return 409, and deleting a route removes its
+resource ownership rows in the same transaction. The cache, the settings view and the
+runtime routes change only after the commit. Configuration-file routes and setups
+without a database keep the previous path
+
+Evidence: `test_account_grants_transactions.py` (34 PostgreSQL tests) observes a real
+lock wait in both orders against account route creation and against grant appends, and
+covers a readback failure and a failed ownership delete rolling back the whole change,
+non-admin rejection without database or runtime changes, and updating an account route
+without losing its credential policy. Seven targeted mutants (settings view on delete
+and create, missing admin check, ID collision, kept ownership, unlocked read, accepted
+foreign setting change) each fail these tests. The integration regression
+`test_deleting_a_route_never_drops_a_route_created_right_before` waits until the legacy
+settings view contains the older route, creates a newer one and deletes the older one;
+against image b6cbee0 it fails because the newer route is gone from the database
+
+The complete image `cubellm-native-dev:d58d90d` (revision label matches) passed all four
+tests of that file in the isolated runner (25.32 s): container probe before the suite,
+client probe before pytest and after teardown, all without route or external name
+resolution; cleanup left no relay, container or test schema. Local acceptance only: one
+gateway worker, no Redis, scripted provider, synthetic credentials, no production
+rollout
