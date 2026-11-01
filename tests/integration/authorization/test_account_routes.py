@@ -673,3 +673,125 @@ def test_deleting_a_route_never_drops_a_route_created_right_before(gateway: Gate
         assert gateway.get(f"/cube_control/account_routes/integration-newer-{marker}")["route_id"] == (
             f"integration-newer-{marker}"
         )
+
+
+def _inventory_records(body: dict[str, JsonValue], collection: str, origin: str) -> list[dict[str, JsonValue]]:
+    records: Final = body[collection]
+    assert isinstance(records, list), body
+    return [record for record in map(object_value, records) if record["origin"] == origin]
+
+
+def test_account_inventory_reports_stored_bindings_to_admins_only_without_secrets(gateway: Gateway) -> None:
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-inventory-{marker}"
+    canary: Final = f"sk-inventory-canary-{marker}"
+    with gateway.scenario() as scenario:
+        handle: Final = register_scenario(marker, JsonResponse(content_type="application/json", body={"ok": True}))
+        scenario.cleanups.callback(delete_scenario, handle)
+        bound: Final = _credential(gateway, scenario, account, canary)
+        plain: Final = f"integration-plain-{marker}"
+        gateway.post(
+            "/credentials",
+            {
+                "credential_name": plain,
+                "credential_values": {"api_key": canary},
+                "credential_info": {"custom_llm_provider": "openai"},
+            },
+        )
+        scenario.cleanups.callback(_delete_credential, gateway, plain)
+        route_id: Final = f"integration-inventory-route-{marker}"
+        gateway.post(
+            "/cube_control/account_routes",
+            {
+                "route": {
+                    "id": route_id,
+                    "path": f"/cube_api/integration-{marker}/inventory",
+                    "target": f"{handle.api_base()}/v1/inventory",
+                    "methods": ["GET"],
+                    "account_credential": {
+                        "account_id": account,
+                        "credential_name": bound,
+                        "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+                    },
+                }
+            },
+        )
+        scenario.cleanups.callback(_delete_route_if_present, gateway, route_id)
+        legacy_id: Final = f"integration-legacy-{marker}"
+        legacy: Final = gateway.request(
+            "POST",
+            "/config/pass_through_endpoint",
+            {
+                "id": legacy_id,
+                "path": f"/integration-legacy-{marker}",
+                "target": f"{handle.api_base()}/v1/legacy?api_key={canary}",
+                "headers": {"X-Inventory-Canary": canary},
+                "auth": True,
+            },
+        )
+        assert legacy.status_code == 200, legacy.text
+        scenario.cleanups.callback(_delete_route_if_present, gateway, legacy_id)
+        model: Final = scenario.model(api_key=canary)
+        team: Final = scenario.team()
+        user: Final = scenario.user(teams=[team], user_role="internal_user")
+        internal_key: Final = scenario.key(user_id=user, team_id=team)
+        application_key: Final = scenario.key(
+            user_id=user, team_id=team, metadata={"cube_application_id": f"integration-app-{marker}"}
+        )
+
+        response: Final = gateway.request("GET", "/cube_control/account_inventory")
+        assert response.status_code == 200, response.text
+        assert canary not in response.text
+        body: Final = object_value(JSON_OBJECT.validate_json(response.content))
+        sources: Final = {
+            (string_value(item["name"]), string_value(item["origin"])): string_value(item["status"])
+            for item in map(object_value, body["sources"] if isinstance(body["sources"], list) else [])
+        }
+        assert {key: status for key, status in sources.items() if key[1] == "database"} == {
+            ("credentials", "database"): "complete",
+            ("routes", "database"): "complete",
+            ("deployments", "database"): "complete",
+        }, sources
+        runtime_sources: Final = {key[0]: status for key, status in sources.items() if key[1] == "runtime"}
+        assert set(runtime_sources) == {"credentials", "routes", "deployments"}, sources
+        assert set(runtime_sources.values()) <= {"complete", "partial"}, sources
+        stored_credentials: Final = {
+            string_value(item["credential_name"]): (item["account_id"], item["binding"])
+            for item in _inventory_records(body, "credentials", "database")
+        }
+        assert stored_credentials[bound] == (account, "bound")
+        assert stored_credentials[plain] == (None, "unbound")
+        stored_routes: Final = {
+            item["route_id"]: item
+            for item in _inventory_records(body, "routes", "database")
+            if isinstance(item["route_id"], str)
+        }
+        assert (stored_routes[route_id]["account_id"], stored_routes[route_id]["binding"]) == (account, "account")
+        assert (stored_routes[legacy_id]["binding"], stored_routes[legacy_id]["inline_header_names"]) == (
+            "unbound",
+            ["X-Inventory-Canary"],
+        )
+        stored_models: Final = [
+            (item["auth"], item["provider"])
+            for item in _inventory_records(body, "deployments", "database")
+            if item["model_name"] == model
+        ]
+        assert stored_models == [("stored_api_key", None)], stored_models
+        keys: Final = (internal_key, application_key)
+        allowed: Final = [gateway.request("GET", "/v1/models", key=key).status_code for key in keys]
+        assert allowed == [200, 200]
+        denials: Final = [
+            (
+                gateway.request("GET", "/cube_control/account_inventory", key=key),
+                gateway.request("GET", f"/cube_control/account_routes/{route_id}", key=key),
+            )
+            for key in keys
+        ]
+        assert [
+            (
+                (inventory.status_code, object_value(object_value(inventory.json())["error"])["type"]),
+                (sibling.status_code, object_value(object_value(sibling.json())["error"])["type"]),
+                key in inventory.text,
+            )
+            for (inventory, sibling), key in zip(denials, keys, strict=True)
+        ] == [((401, "auth_error"), (401, "auth_error"), False)] * 2, [item.text for pair in denials for item in pair]
