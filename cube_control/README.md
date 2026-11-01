@@ -847,6 +847,72 @@ idempotent. The worker that serves the request registers the route when the
 configuration reloads; worker-wide registration and provider access are not verified
 
 
+## Account resource ownership
+
+Some provider APIs create resources such as media jobs or files and then address
+them by ID. A named account route can declare resource types so that each
+application reaches only the resources it owns. The capability
+`passthrough_account_resources: application_ownership_v1` identifies the contract
+
+A resource type belongs to the route and is part of its fingerprint. It has a
+stable `name`, one to sixteen `item_paths` and an optional `creation` rule. Each
+item path lies below the route path (the route needs `include_subpath`) and has
+exactly one whole `{resource_id}` segment between literal segments, for example
+`/cube_api/media/jobs/{resource_id}` or `/cube_api/media/jobs/{resource_id}/cancel`.
+Item paths must not overlap. A creation rule names a concrete path, explicit
+methods and an `id_selector` of one to eight object keys or array indexes that must
+lead to one string. Resource IDs are one segment of `[A-Za-z0-9._~:@-]`, at most
+256 characters and never `.` or `..`. Routes without resource types keep their
+stored form and fingerprint
+
+Ownership is stored per account, type and ID in
+`LiteLLM_AccountResourceOwnership`. The owner is the application; the row also
+records whether the resource was `created` through the gateway (with the creating
+key hash) or `adopted` by an administrator. A request to an item path is allowed
+only when the key carries a `resource:<item path>` route, has an active grant for
+that exact template and method, and the application owns the resource on that
+route. A rotated key with its own grant keeps access. Non-canonical IDs are denied
+without a lookup and never fall back to literal grants
+
+After a successful JSON response to a declared creation request, the gateway looks
+at every resource type whose creation path and method match and applies each type's
+own selector. Types whose selector yields a canonical ID are claimed together in one
+transaction; a type whose selector finds no ID stays unowned and does not block the
+others. A resource already owned by another application stays with that owner and is
+reported as a conflict for that type, while the other claims are still recorded.
+Only a storage or readback verification failure rolls back the whole batch. Capture
+never replaces the provider response: error statuses, streamed or non-JSON bodies,
+a missing key identity or a store failure record nothing and are logged. Without a
+row, later item requests for that resource are denied
+
+Administrators bind existing provider resources with
+`POST /cube_control/account_routes/{route_id}/resources` and
+`{"expected_fingerprint", "resource_type", "resource_id", "application_id"}`. The
+fingerprint check, type check and insert run in one locked transaction; a stale
+fingerprint or another owner returns 409, an undeclared type 400 and a missing
+route 404. `GET .../resources/{resource_type}/{resource_id}` reads the ownership
+
+In the controller, `provision-account-route` accepts `resource_types` and sends
+them only to gateways with the ownership capability. Route base and creation paths
+must stay concrete. An application scope may name an item template instead of a
+concrete path; such a scope becomes a `resource:` key route and passthrough entry
+and requires the ownership capability. `adopt-account-resource --config ADMIN_ENV`
+reads an adoption specification on stdin:
+
+```json
+{
+  "gateway_origin": "http://127.0.0.1:4000",
+  "route_id": "example-media",
+  "expected_fingerprint": "<route fingerprint>",
+  "resource_type": "video-job",
+  "resource_id": "vid_123",
+  "application_id": "example-app"
+}
+```
+
+It prints `adopted`, `existing`, `conflict`, `error` or `uncertain`. Repeating the
+identical command is safe
+
 ## Account provenance in the usage audit
 
 The companion exposes the whitelist SQL columns for native spend rows through

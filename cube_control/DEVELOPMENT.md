@@ -719,9 +719,53 @@ against the new image and fails against the previous image `a0724de` at the miss
 route creation endpoint. Locally it ran without Redis and with one proxy, which
 differs from the CI management job
 
-Found during the run: the `litellm_proxy_extras` invalid-index check ignores a Unix
-socket given as `host=` in `DATABASE_URL` and tries TCP on 127.0.0.1:5432. It only
-logs a warning and skips the check; startup and migrations work. Not fixed yet
+Found during the run: the `litellm_proxy_extras` invalid-index check ignored a Unix
+socket given as `host=` in `DATABASE_URL` and tried TCP on 127.0.0.1:5432. It only
+logged a warning and skipped the check. Fixed in 7779a77
 
 This is local acceptance with synthetic credentials. It does not cover real provider
 accounts, multiple workers, LAN or Tailscale access, or any production rollout
+
+
+## Account resource ownership acceptance
+
+Built the complete image `cubellm-native-dev:b6cbee0` from an exact `git archive`
+context of b6cbee0 (revision label matches). The resource integration test in
+`tests/integration/authorization/test_account_routes.py` creates a route with two
+resource types sharing one creation request and a third type without creation,
+grants two applications the same creation and item operations, and creates both
+resources with one provider response. PostgreSQL holds exactly the two created rows
+with the owner application and creating key hash; an administrator then adopts a
+third resource. Each owned item is forwarded to its own scripted provider route with
+a distinct body. The other application gets 403 on every item although its grants
+are active, and unowned IDs and IDs under the wrong type are denied. Rows are removed
+per account through scenario cleanup, which also checks that none remain. Both
+account route tests passed (2 passed, 10.77 s)
+
+The run used `/home/cubev/Work/.cubellm-build/gateway-acceptance/run_isolated_integration.sh`,
+which replaces the older runner with host networking. The gateway, the scripted
+upstream and a Unix-socket relay share one Docker `--network none` namespace. The
+Python 3.14 test client runs on the host in its own user, network and mount namespace
+with `hosts: files` and the systemd-resolved and nscd sockets masked, because glibc
+reaches those resolvers over Unix sockets that a network namespace alone does not
+block. The client reaches the gateway and upstream only through the relay sockets and
+PostgreSQL through its Unix socket
+
+Evidence, in order: a probe inside the container namespace ran once before the suite
+and showed no route, outbound TCP failing with "network unreachable" and no external
+name resolution; the run aborts otherwise. The client then waited for gateway and
+upstream readiness over the relay, and measured its own namespace before pytest (no
+route, only `lo`, outbound TCP and external DNS failing, gateway, upstream and
+PostgreSQL reachable). No functional request is sent if this proof fails. After
+pytest teardown the client namespace was measured again with the same result. The
+container namespace was not measured again after the suite. The client namespace
+supervises its relay and reaps it on every exit path. Cleanup reported no remaining
+relay, container or test schema
+
+Unit, PostgreSQL and controller tests now run through
+`/home/cubev/Work/.cubellm-build/offline-run.sh`, which applies the same namespace and
+resolver masking and records an isolation proof before the command starts
+
+This is local acceptance with synthetic credentials and a scripted provider. It does
+not cover real provider accounts, multiple workers, Redis, LAN or Tailscale access,
+or any production rollout
