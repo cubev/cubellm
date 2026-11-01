@@ -40,6 +40,7 @@ class AccountGateway:
         self.grants: tuple[AccountGrant, ...] = ()
         self.route_id: str = SCOPE.route_id
         self.capabilities: bool = True
+        self.resource_capability: bool = False
         self.fingerprint: str = SCOPE.expected_fingerprint
         self.account_id: str = SCOPE.account_id
         self.methods: tuple[str, ...] = ("GET", "POST")
@@ -138,6 +139,11 @@ class AccountGateway:
                             "credential_values_full_masking": True,
                         }
                         if self.capabilities
+                        else {}
+                    ),
+                    **(
+                        {"passthrough_account_resources": "application_ownership_v1"}
+                        if self.resource_capability
                         else {}
                     ),
                 },
@@ -253,6 +259,53 @@ class AccountApplicationTests(unittest.TestCase):
         ):
             with self.subTest(changes=changes), self.assertRaises(ValidationError):
                 ApplicationAccessSpec.model_validate(SPEC.model_dump() | changes)
+
+    def test_resource_scopes_follow_the_native_template_grammar(self) -> None:
+        for path in (
+            "/cube_api/fixture/quota/{resource_id}/",
+            "/cube_api/fixture/quota//{resource_id}",
+            "/cube_api/fixture/quota/x{resource_id}",
+            "/cube_api/fixture/{resource_id}/{resource_id}",
+            "/cube_api/fixture/quota/{id}",
+            "/cube_api/fixture/quota/{resource_id}/../cancel",
+        ):
+            with self.subTest(path=path), self.assertRaises(ValidationError):
+                AccountRouteScope.model_validate(SCOPE.model_dump() | {"path": path})
+        for path in (
+            "/cube_api/fixture/quota/{resource_id}",
+            "/cube_api/fixture/quota/{resource_id}/cancel",
+            "/cube_api/fixture/{resource_id}/quota",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    AccountRouteScope.model_validate(SCOPE.model_dump() | {"path": path}).key_route, "resource:" + path
+                )
+        self.assertEqual(SCOPE.key_route, "exact:/cube_api/fixture/quota")
+
+    def test_resource_scope_keys_carry_resource_routes_only_on_gateways_with_resource_ownership(self) -> None:
+        template: Final = SCOPE.path + "/{resource_id}"
+        spec: Final = ApplicationAccessSpec.model_validate(
+            SPEC.model_dump() | {"account_routes": [SCOPE.model_dump() | {"path": template}]}
+        )
+        self.assertEqual(spec.key_routes, ("resource:" + template,))
+        self._assert_preflight_rejected(spec, "include_subpath", True, "Application state or gateway response rejected")
+        with tempfile.TemporaryDirectory() as root:
+            directory: Final = Path(root) / "state"
+            gateway: Final = AccountGateway()
+            gateway.include_subpath = True
+            gateway.resource_capability = True
+            prepare_application_access(spec, directory)
+            result: Final = provision_application_access(
+                directory, SecretStr("inert-master"), httpx.MockTransport(gateway)
+            )
+            self.assertEqual(result.status, "provisioned", result.message)
+            assert gateway.key is not None
+            self.assertEqual(gateway.key["allowed_routes"], ["resource:" + template])
+            self.assertEqual(
+                gateway.key["metadata"]["allowed_passthrough_routes"],  # pyright: ignore[reportIndexIssue, reportUnknownMemberType]  # fake stores raw JSON
+                ["resource:" + template],
+            )
+            self.assertEqual(tuple(grant.path for grant in gateway.grants), (template,))
 
     def test_preflight_rejects_drift_missing_routes_and_old_capabilities_before_mutation(self) -> None:
         conflict: Final = "Account route conflicts with the prepared scope"

@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from typing import Annotated, Final, Literal, Self
 from urllib.parse import quote
@@ -9,16 +10,39 @@ from cube_control.application_gateway import request_gateway
 from cube_control.models import FrozenModel, Identifier
 
 Fingerprint = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
-AccountPath = Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^/[A-Za-z0-9._~!$&'()+,;=:@/-]*$")]
+AccountPath = Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^/[A-Za-z0-9._~!$&'()+,;=:@/{}-]*$")]
+RESOURCE_PLACEHOLDER: Final = "{resource_id}"
 AccountMethods = Annotated[
     tuple[Annotated[str, Field(pattern=r"^[!#$%&'+.^_`|~0-9A-Z-]{1,32}$")], ...],
     Field(min_length=1, max_length=16),
 ]
 
 
+_TEMPLATE_LITERAL: Final = re.compile(r"[A-Za-z0-9._~!$&'()+,;=:@-]+")
+
+
+def is_resource_template(path: str) -> bool:
+    segments: Final = path.split("/")
+    literals: Final = tuple(segment for segment in segments[1:] if segment != RESOURCE_PLACEHOLDER)
+    return (
+        path.startswith("/")
+        and len(path) <= 1024
+        and segments.count(RESOURCE_PLACEHOLDER) == 1
+        and all(_TEMPLATE_LITERAL.fullmatch(segment) is not None for segment in literals)
+        and all(segment not in (".", "..") for segment in literals)
+    )
+
+
+def has_placeholder(path: str) -> bool:
+    return "{" in path or "}" in path
+
+
 def require_managed_path(path: str) -> None:
-    if "//" in path or any(part in {".", ".."} for part in path.split("/")):
+    segments: Final = path.split("/")
+    if "//" in path or any(part in {".", ".."} for part in segments):
         raise ValueError("Account scopes require canonical concrete paths")
+    if has_placeholder(path) and not is_resource_template(path):
+        raise ValueError("Account resource templates need one whole {resource_id} segment between literal segments")
     if not path.startswith("/cube_api/") or path == "/cube_api/":
         raise ValueError("Managed account scopes require the dedicated /cube_api/ namespace")
 
@@ -38,6 +62,14 @@ class AccountRouteScope(FrozenModel):
         return self
 
     @property
+    def key_route(self) -> str:
+        return ("resource:" if is_resource_template(self.path) else "exact:") + self.path
+
+    @property
+    def passthrough_route(self) -> str:
+        return "resource:" + self.path if is_resource_template(self.path) else self.path
+
+    @property
     def management_path(self) -> str:
         return "/cube_control/account_routes/" + quote(self.route_id, safe="")
 
@@ -49,6 +81,10 @@ class AccountCapabilities(BaseModel):
     passthrough_account_binding: Literal["configured_credential_v1"]
     passthrough_header_isolation: Literal[True]
     credential_values_full_masking: Literal[True]
+
+
+class AccountResourceCapabilities(BaseModel):
+    passthrough_account_resources: Literal["application_ownership_v1"]
 
 
 class AccountGrant(FrozenModel):

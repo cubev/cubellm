@@ -11,7 +11,12 @@ import psycopg
 import uvicorn
 from pydantic import ValidationError
 
-from cube_control.account_routes import AccountRouteSpec, ensure_account_route
+from cube_control.account_routes import (
+    AccountResourceAdoptionSpec,
+    AccountRouteSpec,
+    adopt_account_resource,
+    ensure_account_route,
+)
 from cube_control.api import create_app
 from cube_control.application_access import (
     ApplicationAccessSpec,
@@ -69,6 +74,8 @@ def main() -> int:
     revoke_access_parser.add_argument("--config", required=True, type=Path)
     route_parser: Final = sub.add_parser("provision-account-route")
     route_parser.add_argument("--config", required=True, type=Path)
+    adopt_parser: Final = sub.add_parser("adopt-account-resource")
+    adopt_parser.add_argument("--config", required=True, type=Path)
     deliver_access_parser: Final = sub.add_parser("deliver-application")
     deliver_access_parser.add_argument("--state-directory", required=True, type=Path)
     deliver_access_parser.add_argument("--destination-directory", required=True, type=Path)
@@ -131,6 +138,22 @@ def main() -> int:
         route_result: Final = ensure_account_route(route_spec, route_key)
         print(route_result.model_dump_json())
         return 0 if route_result.status in ("created", "existing") else 1
+    if args.command == "adopt-account-resource":
+        raw_adoption: Final = sys.stdin.read(65537)
+        try:
+            if len(raw_adoption) > 65536:
+                raise ValueError("Resource adoption specification exceeds size limit")
+            adoption_spec: Final = AccountResourceAdoptionSpec.model_validate_json(raw_adoption)
+        except ValueError:
+            print("Resource adoption specification rejected; input values are not logged", file=sys.stderr)
+            return 2
+        adoption_key: Final = read_private_key(args.config, "LITELLM_MASTER_KEY", "Gateway")
+        if isinstance(adoption_key, Unavailable):
+            print(adoption_key.message, file=sys.stderr)
+            return 2
+        adoption_result: Final = adopt_account_resource(adoption_spec, adoption_key)
+        print(adoption_result.model_dump_json())
+        return 0 if adoption_result.status in ("adopted", "existing") else 1
     if args.command in ("provision-application", "deliver-application", "revoke-application"):
         master_key: Final = read_private_key(args.config, "LITELLM_MASTER_KEY", "Gateway")
         if isinstance(master_key, Unavailable):

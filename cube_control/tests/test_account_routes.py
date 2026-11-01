@@ -13,7 +13,16 @@ from typing import Final
 import httpx
 from pydantic import JsonValue, SecretStr, TypeAdapter, ValidationError
 
-from cube_control.account_routes import AccountRouteHeader, AccountRouteResult, AccountRouteSpec, ensure_account_route
+from cube_control.account_routes import (
+    AccountResourceAdoptionSpec,
+    AccountResourceCreation,
+    AccountResourceType,
+    AccountRouteHeader,
+    AccountRouteResult,
+    AccountRouteSpec,
+    adopt_account_resource,
+    ensure_account_route,
+)
 
 SPEC: Final = AccountRouteSpec(
     gateway_origin="http://127.0.0.1:4000",
@@ -119,6 +128,82 @@ class AccountRouteTests(unittest.TestCase):
             ]
         }
         self.assertEqual(ensure(gateway).status, "existing")
+
+    def test_resource_types_are_sent_only_to_gateways_with_resource_ownership(self) -> None:
+        resources: Final = (
+            AccountResourceType(
+                name="video-job",
+                item_paths=("/cube_api/fixture/quota/videos/{resource_id}",),
+                creation=AccountResourceCreation(
+                    path="/cube_api/fixture/quota/videos", methods=("POST",), id_selector=("data", 0, "id")
+                ),
+            ),
+            AccountResourceType(name="file", item_paths=("/cube_api/fixture/quota/{resource_id}/content",)),
+        )
+        spec: Final = SPEC.model_copy(update={"include_subpath": True, "resource_types": resources})
+        old: Final = RouteGateway()
+        self.assertEqual(ensure(old, spec).status, "error")
+        self.assertEqual(old.bodies, [])
+        gateway: Final = RouteGateway()
+        gateway.capabilities["passthrough_account_resources"] = "application_ownership_v1"
+        gateway.route_changes = {"include_subpath": True}
+        self.assertEqual(ensure(gateway, spec).status, "created")
+        self.assertEqual(
+            gateway.bodies,
+            [
+                {
+                    "route": {
+                        "id": "fixture-route",
+                        "path": "/cube_api/fixture/quota",
+                        "target": "https://vendor.example/v1/quota",
+                        "methods": ["GET", "POST"],
+                        "include_subpath": True,
+                        "account_credential": {
+                            "account_id": "fixture-account",
+                            "credential_name": "fixture-credential",
+                            "headers": [{"name": "X-Api-Key", "field": "api_key", "prefix": ""}],
+                            "allowed_query_parameters": [],
+                            "resource_types": [
+                                {
+                                    "name": "video-job",
+                                    "item_paths": ["/cube_api/fixture/quota/videos/{resource_id}"],
+                                    "creation": {
+                                        "path": "/cube_api/fixture/quota/videos",
+                                        "methods": ["POST"],
+                                        "id_selector": ["data", 0, "id"],
+                                    },
+                                },
+                                {"name": "file", "item_paths": ["/cube_api/fixture/quota/{resource_id}/content"]},
+                            ],
+                        },
+                    }
+                }
+            ],
+        )
+
+    def test_route_bases_and_creation_paths_stay_concrete_and_templates_follow_native_grammar(self) -> None:
+        with self.assertRaises(ValidationError):
+            AccountRouteSpec.model_validate(SPEC.model_dump() | {"path": "/cube_api/fixture/{resource_id}"})
+        for path in (
+            "/cube_api/fixture/jobs/{resource_id}/",
+            "/cube_api/fixture/jobs//{resource_id}",
+            "/cube_api/fixture/jobs/x{resource_id}",
+            "/cube_api/fixture/{resource_id}/{resource_id}",
+            "/cube_api/fixture/jobs/{id}",
+            "/cube_api/fixture/jobs",
+        ):
+            with self.subTest(path=path), self.assertRaises(ValidationError):
+                AccountResourceType(name="job", item_paths=(path,))
+        for path in ("/cube_api/fixture/jobs/{resource_id}", "/cube_api/fixture/{resource_id}/cancel"):
+            with self.subTest(path=path):
+                self.assertEqual(AccountResourceType(name="job", item_paths=(path,)).item_paths, (path,))
+        with self.assertRaises(ValidationError):
+            AccountResourceCreation(path="/cube_api/fixture/jobs/{resource_id}", methods=("POST",), id_selector=("id",))
+        with self.assertRaises(ValidationError):
+            AccountRouteSpec.model_validate(
+                SPEC.model_dump()
+                | {"resource_types": [{"name": "job", "item_paths": ["/cube_api/fixture/quota/{resource_id}"]}]}
+            )
 
     def test_gateway_without_route_management_is_never_asked_to_store(self) -> None:
         gateway: Final = RouteGateway()
@@ -298,3 +383,94 @@ class AccountRouteCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+ADOPTION: Final = AccountResourceAdoptionSpec(
+    gateway_origin="http://127.0.0.1:4000",
+    route_id="fixture-route",
+    expected_fingerprint="f" * 64,
+    resource_type="file",
+    resource_id="file_1",
+    application_id="fixture-app",
+)
+
+
+class AdoptionGateway:
+    def __init__(self, status: int = 200, inserted: bool = True, owner: str = "fixture-app") -> None:
+        self.status: Final = status
+        self.inserted: Final = inserted
+        self.owner: Final = owner
+        self.capabilities: dict[str, JsonValue] = {"passthrough_account_resources": "application_ownership_v1"}
+        self.bodies: list[dict[str, JsonValue]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/cube_control/capabilities":
+            return httpx.Response(200, json=self.capabilities)
+        assert (request.method, request.url.path) == ("POST", "/cube_control/account_routes/fixture-route/resources")
+        self.bodies.append(TypeAdapter(dict[str, JsonValue]).validate_json(request.content))
+        if self.status != 200:
+            return httpx.Response(self.status, json={"detail": "rejected"})
+        return httpx.Response(
+            200,
+            json={
+                "stored": True,
+                "inserted": self.inserted,
+                "enforcement": "not_verified",
+                "ownership": {
+                    "route_id": "fixture-route",
+                    "owner_application_id": self.owner,
+                    "provenance": "adopted",
+                    "creator_key_hash": None,
+                },
+            },
+        )
+
+
+def adopt(gateway: AdoptionGateway) -> str:
+    return adopt_account_resource(ADOPTION, SecretStr("inert-master"), httpx.MockTransport(gateway)).status
+
+
+class AccountResourceAdoptionTests(unittest.TestCase):
+    def test_adoption_sends_the_pinned_fingerprint_and_reports_new_and_existing_ownership(self) -> None:
+        gateway: Final = AdoptionGateway()
+        self.assertEqual(adopt(gateway), "adopted")
+        self.assertEqual(
+            gateway.bodies,
+            [
+                {
+                    "expected_fingerprint": "f" * 64,
+                    "resource_type": "file",
+                    "resource_id": "file_1",
+                    "application_id": "fixture-app",
+                }
+            ],
+        )
+        self.assertEqual(adopt(AdoptionGateway(inserted=False)), "existing")
+
+    def test_conflicts_rejections_and_foreign_receipts_never_report_ownership(self) -> None:
+        for gateway, expected in (
+            (AdoptionGateway(status=409), "conflict"),
+            (AdoptionGateway(status=400), "error"),
+            (AdoptionGateway(status=404), "error"),
+            (AdoptionGateway(status=502), "uncertain"),
+            (AdoptionGateway(owner="other-app"), "error"),
+        ):
+            with self.subTest(status=gateway.status, owner=gateway.owner):
+                self.assertEqual(adopt(gateway), expected)
+
+    def test_gateways_without_resource_ownership_are_never_asked_to_adopt(self) -> None:
+        gateway: Final = AdoptionGateway()
+        gateway.capabilities = {}
+        self.assertEqual(adopt(gateway), "error")
+        self.assertEqual(gateway.bodies, [])
+
+    def test_adoption_specification_rejects_non_canonical_ids_and_remote_origins(self) -> None:
+        for changes in (
+            {"resource_id": "a/b"},
+            {"resource_id": ".."},
+            {"resource_id": "a b"},
+            {"expected_fingerprint": "f" * 63},
+            {"gateway_origin": "https://remote.example"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                AccountResourceAdoptionSpec.model_validate(ADOPTION.model_dump() | changes)

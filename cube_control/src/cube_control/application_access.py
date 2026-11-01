@@ -15,9 +15,11 @@ from pydantic import BaseModel, Field, JsonValue, SecretStr, field_validator, mo
 
 from cube_control.application_accounts import (
     AccountCapabilities,
+    AccountResourceCapabilities,
     AccountRouteScope,
     ensure_account_grants,
     inspect_account_routes,
+    is_resource_template,
 )
 from cube_control.application_gateway import gateway_client, require_admin_origin
 from cube_control.application_gateway import request_gateway as _request
@@ -62,7 +64,15 @@ class ApplicationAccessSpec(FrozenModel):
 
     @property
     def key_routes(self) -> tuple[str, ...]:
-        return (*self.routes, *("exact:" + path for path in self.account_paths))
+        return (*self.routes, *(scope.key_route for scope in self.account_routes))
+
+    @property
+    def passthrough_routes(self) -> tuple[str, ...]:
+        return tuple(scope.passthrough_route for scope in self.account_routes)
+
+    @property
+    def uses_account_resources(self) -> bool:
+        return any(is_resource_template(scope.path) for scope in self.account_routes)
 
     @property
     def user_id(self) -> str:
@@ -95,7 +105,7 @@ class ApplicationAccessState(FrozenModel):
     def key_metadata(self) -> dict[str, JsonValue]:
         return {
             **self.metadata,
-            **({"allowed_passthrough_routes": list(self.spec.account_paths)} if self.spec.account_routes else {}),
+            **({"allowed_passthrough_routes": list(self.spec.passthrough_routes)} if self.spec.account_routes else {}),
         }
 
 
@@ -300,7 +310,7 @@ def _matches_key(state: ApplicationAccessState, raw: bytes) -> bool:
         and key.models == state.spec.models
         and key.allowed_routes == state.spec.key_routes
         and key.metadata == state.key_metadata
-        and key.allowed_passthrough_routes in (None, state.spec.account_paths)
+        and key.allowed_passthrough_routes in (None, state.spec.passthrough_routes)
         and not key.aliases
         and not key.config
     )
@@ -321,6 +331,8 @@ def _provision(
     if caps_code != 200:
         return result("error", "Gateway provisioning capabilities unavailable")
     _Capabilities.model_validate_json(caps_raw)
+    if state.spec.uses_account_resources:
+        AccountResourceCapabilities.model_validate_json(caps_raw)
     if state.spec.account_routes:
         AccountCapabilities.model_validate_json(caps_raw)
         account_preflight: Final = inspect_account_routes(
