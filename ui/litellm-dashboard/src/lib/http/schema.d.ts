@@ -3756,6 +3756,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cube_control/account_routes/{route_id}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cube Control Adopt Account Resource */
+        post: operations["cube_control_adopt_account_resource_cube_control_account_routes__route_id__resources_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cube_control/account_routes/{route_id}/resources/{resource_type}/{resource_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cube Control Account Resource */
+        get: operations["cube_control_account_resource_cube_control_account_routes__route_id__resources__resource_type___resource_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cube_control/capabilities": {
         parameters: {
             query?: never;
@@ -23950,6 +23984,37 @@ export interface components {
             credential_name: string;
             /** Headers */
             headers: components["schemas"]["CredentialHeader"][];
+            /**
+             * Resource Types
+             * @default []
+             */
+            resource_types: components["schemas"]["AccountResourceType"][];
+        };
+        /** AccountResourceReceipt */
+        AccountResourceReceipt: {
+            /**
+             * Enforcement
+             * @default not_verified
+             * @constant
+             */
+            enforcement: "not_verified";
+            /** Inserted */
+            inserted: boolean;
+            ownership: components["schemas"]["ResourceOwnership"];
+            /**
+             * Stored
+             * @default true
+             * @constant
+             */
+            stored: true;
+        };
+        /** AccountResourceType */
+        AccountResourceType: {
+            creation?: components["schemas"]["ResourceCreation"] | null;
+            /** Item Paths */
+            item_paths: string[];
+            /** Name */
+            name: string;
         };
         /** AccountRouteCreateCommand */
         AccountRouteCreateCommand: {
@@ -29557,6 +29622,12 @@ export interface components {
              * @constant
              */
             passthrough_account_provider: "credential_metadata_v1";
+            /**
+             * Passthrough Account Resources
+             * @default application_ownership_v1
+             * @constant
+             */
+            passthrough_account_resources: "application_ownership_v1";
             /**
              * Passthrough Account Route Management
              * @default atomic_create_v1
@@ -40085,6 +40156,40 @@ export interface components {
         ResetSpendRequest: {
             /** Reset To */
             reset_to: number;
+        };
+        /** ResourceAdoptionCommand */
+        ResourceAdoptionCommand: {
+            /** Application Id */
+            application_id: string;
+            /** Expected Fingerprint */
+            expected_fingerprint: string;
+            /** Resource Id */
+            resource_id: string;
+            /** Resource Type */
+            resource_type: string;
+        };
+        /** ResourceCreation */
+        ResourceCreation: {
+            /** Id Selector */
+            id_selector: (string | number)[];
+            /** Methods */
+            methods: string[];
+            /** Path */
+            path: string;
+        };
+        /** ResourceOwnership */
+        ResourceOwnership: {
+            /** Creator Key Hash */
+            creator_key_hash?: string | null;
+            /** Owner Application Id */
+            owner_application_id: string;
+            /**
+             * Provenance
+             * @enum {string}
+             */
+            provenance: "created" | "adopted";
+            /** Route Id */
+            route_id: string;
         };
         /** ResponseAPIUsage */
         ResponseAPIUsage: {
@@ -53107,6 +53212,74 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AccountGrantReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_adopt_account_resource_cube_control_account_routes__route_id__resources_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                route_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResourceAdoptionCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountResourceReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_account_resource_cube_control_account_routes__route_id__resources__resource_type___resource_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                route_id: string;
+                resource_type: string;
+                resource_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceOwnership"];
                 };
             };
             /** @description Validation Error */
