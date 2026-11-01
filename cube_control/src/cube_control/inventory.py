@@ -14,9 +14,20 @@ from cube_control.gateway_inventory import (
     Origin,
     SourceName,
 )
-from cube_control.models import Account, FrozenModel, GatewayRecord, Observation, UsageEvent
+from cube_control.models import Account, FrozenModel, Observation
+from cube_control.store import StoredState
+from cube_control.summary import ReadingView, latest_measurements, reading_view
 
-Reference = Literal["catalogue", "gateway_credential", "gateway_route", "observation", "usage_event", "gateway_record"]
+Reference = Literal[
+    "catalogue",
+    "gateway_credential",
+    "gateway_route",
+    "observation",
+    "usage_event",
+    "gateway_record",
+    "media_job",
+    "manual_entry",
+]
 AccountGap = Literal[
     "inventory_not_collected",
     "not_in_catalogue",
@@ -27,7 +38,9 @@ AccountGap = Literal[
     "invalid_binding",
     "no_usage_source",
     "no_verified_provider_usage",
+    "provider_usage_not_current",
 ]
+VerifiedUsage = Literal["current", "historical", "none"]
 GatewayState = Literal["current", "stale", "last_attempt_failed", "never_collected"]
 USAGE_METRICS: Final = frozenset(("spend", "usage"))
 STALE_AFTER: Final = timedelta(hours=24)
@@ -43,13 +56,6 @@ class GatewayRoute(FrozenModel):
     route: InventoryRoute
 
 
-class UsageEvidence(FrozenModel):
-    source: str
-    metric: str
-    status: str
-    observed_at: AwareDatetime
-
-
 class AccountInventoryEntry(FrozenModel):
     account_id: str
     provider: str | None = None
@@ -60,7 +66,7 @@ class AccountInventoryEntry(FrozenModel):
     credentials: tuple[GatewayCredential, ...] = ()
     routes: tuple[GatewayRoute, ...] = ()
     observation_sources: tuple[str, ...] = ()
-    usage_evidence: tuple[UsageEvidence, ...] = ()
+    usage_evidence: tuple[ReadingView, ...] = ()
     last_observed_at: AwareDatetime | None = None
     last_usage_at: AwareDatetime | None = None
     gaps: tuple[AccountGap, ...] = ()
@@ -240,7 +246,7 @@ def _gaps(
     referenced: frozenset[tuple[str, str, str]],
     collected: bool,
     has_usage: bool,
-    verified_usage: bool,
+    verified_usage: VerifiedUsage,
     invalid: bool,
 ) -> tuple[AccountGap, ...]:
     bound: Final = tuple(item for item in credentials if item.credential.binding == "bound")
@@ -263,7 +269,8 @@ def _gaps(
         ("credential_unused", unused),
         ("invalid_binding", invalid),
         ("no_usage_source", not has_usage),
-        ("no_verified_provider_usage", not verified_usage),
+        ("no_verified_provider_usage", verified_usage == "none"),
+        ("provider_usage_not_current", verified_usage == "historical"),
     )
     return tuple(gap for gap, applies in candidates if applies)
 
@@ -281,14 +288,15 @@ def _references(
     )
 
 
-def account_inventory(
-    accounts: tuple[Account, ...],
-    observations: tuple[Observation, ...],
-    events: tuple[UsageEvent, ...],
-    gateway_records: tuple[GatewayRecord, ...],
-    gateways: tuple[GatewayInventoryState, ...],
-    now: datetime,
-) -> AccountInventoryReport:
+def _history_view(view: ReadingView, latest: tuple[Observation, ...]) -> ReadingView:
+    return ReadingView(reading=view.reading, freshness=view.freshness, current=view.current and view.reading in latest)
+
+
+def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryReport:
+    observations: Final = stored.observations
+    events: Final = stored.events
+    gateway_records: Final = stored.gateway_records
+    gateways: Final = stored.gateway_inventories
     collected: Final = tuple(state for state in gateways if state.last_good is not None)
     credentials: Final = tuple(
         GatewayCredential(gateway_origin=state.gateway_origin, credential=item)
@@ -309,7 +317,7 @@ def account_inventory(
             if state.last_good is not None
         )
     )
-    catalogued: Final = {account.id: account for account in accounts}
+    catalogued: Final = {account.id: account for account in stored.accounts}
     account_ids: Final = sorted(
         frozenset(
             chain(
@@ -319,6 +327,8 @@ def account_inventory(
                 (item.account_id for item in observations),
                 (item.account_id for item in events),
                 (record.account_id for record in gateway_records if record.account_id is not None),
+                (job.account_id for job in stored.jobs),
+                (entry.command.account_id for entry in stored.manual_entries),
             )
         )
     )
@@ -338,6 +348,18 @@ def account_inventory(
             ("observation", bool(own_observations)),
             ("usage_event", bool(own_events)),
             ("gateway_record", bool(own_records)),
+            ("media_job", any(job.account_id == account_id for job in stored.jobs)),
+            ("manual_entry", any(entry.command.account_id == account_id for entry in stored.manual_entries)),
+        )
+        latest: Final = latest_measurements(account_id, stored.observations)
+        evidence: Final = tuple(
+            _history_view(reading_view(item, stored.observations, now), latest)
+            for item in sorted(usage_observations, key=lambda item: (item.observed_at, item.collected_at))
+        )
+        verified: Final = tuple(
+            view.current
+            for view in evidence
+            if view.reading.source == "provider_api" and view.reading.status == "known"
         )
         invalid: Final = any(item.credential.binding == "invalid" for item in own_credentials) or any(
             item.route.binding == "invalid" for item in own_routes
@@ -352,10 +374,7 @@ def account_inventory(
             credentials=own_credentials,
             routes=own_routes,
             observation_sources=tuple(sorted(frozenset(item.source for item in own_observations))),
-            usage_evidence=tuple(
-                UsageEvidence(source=item.source, metric=item.metric, status=item.status, observed_at=item.observed_at)
-                for item in sorted(usage_observations, key=lambda item: item.observed_at)
-            ),
+            usage_evidence=evidence,
             last_observed_at=_latest(item.observed_at for item in own_observations),
             last_usage_at=_latest(
                 chain((item.occurred_at for item in own_events), (record.occurred_at for record in own_records))
@@ -367,7 +386,7 @@ def account_inventory(
                 bool(collected),
                 bool(own_events or own_records)
                 or any(item.status in ("known", "estimated", "manual") for item in usage_observations),
-                any(item.source == "provider_api" and item.status == "known" for item in usage_observations),
+                "current" if any(verified) else "historical" if verified else "none",
                 invalid,
             ),
         )

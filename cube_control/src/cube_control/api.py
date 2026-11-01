@@ -17,20 +17,12 @@ from cube_control.models import (
     FleetSnapshot,
     GatewayMetrics,
     GatewayScanView,
-    Observation,
     ProviderId,
     utc_now,
 )
 from cube_control.store import Repository
-from cube_control.summary import account_view, current_measurement
+from cube_control.summary import ReadingView, account_view, reading_view
 from cube_control.usage import UsageFailure, UsageHistory, UsagePage, UsageQuery, UsageReader
-
-
-class ReadingView(BaseModel):
-    model_config = ConfigDict(frozen=True)
-    reading: Observation
-    freshness: Literal["fresh", "stale", "clock_skew", "expired"]
-    current: bool
 
 
 class SummaryAccount(BaseModel):
@@ -68,14 +60,6 @@ class CapabilitiesResponse(BaseModel):
         "call_type",
         "completed_at",
         "duration_ms",
-    )
-
-
-def reading_view(reading: Observation, observations: tuple[Observation, ...], now: datetime) -> ReadingView:
-    return ReadingView(
-        reading=reading,
-        freshness=reading.freshness(now),
-        current=current_measurement(reading, observations, now, now.strftime("%Y-%m")),
     )
 
 

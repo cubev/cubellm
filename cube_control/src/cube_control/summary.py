@@ -1,7 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
 from itertools import groupby
-from typing import Final
+from typing import Final, Literal
+
+from pydantic import BaseModel, ConfigDict
 
 from cube_control.amounts import exact_sum
 from cube_control.gateway import gateway_metrics
@@ -61,6 +63,21 @@ def current_measurement(
             )
         )
         for o in observations
+    )
+
+
+class ReadingView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    reading: Observation
+    freshness: Literal["fresh", "stale", "clock_skew", "expired"]
+    current: bool
+
+
+def reading_view(reading: Observation, observations: tuple[Observation, ...], now: datetime) -> ReadingView:
+    return ReadingView(
+        reading=reading,
+        freshness=reading.freshness(now),
+        current=current_measurement(reading, observations, now, now.strftime("%Y-%m")),
     )
 
 

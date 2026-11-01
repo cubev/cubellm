@@ -5,7 +5,7 @@ from typing import Final
 
 from pydantic import ValidationError
 
-from cube_control.api import reading_view
+from cube_control.summary import reading_view
 from cube_control.manual import active_fields, effective_account
 from cube_control.models import Account, ManualChange, ManualCommand, ManualEntry, Observation, Provider
 from cube_control.store import StoredState

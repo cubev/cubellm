@@ -13,8 +13,17 @@ from cube_control.gateway_inventory import (
     InventoryRoute,
     Origin,
 )
-from cube_control.inventory import STALE_AFTER, AccountInventoryReport, account_inventory
-from cube_control.models import Account, Observation, Provider, UsageEvent
+from cube_control.inventory import STALE_AFTER, AccountInventoryEntry, AccountInventoryReport, account_inventory
+from cube_control.models import (
+    Account,
+    ManualChange,
+    ManualCommand,
+    ManualEntry,
+    MediaJob,
+    Observation,
+    Provider,
+)
+from cube_control.store import StoredState
 
 NOW: Final = datetime(2026, 11, 1, 18, 0, tzinfo=UTC)
 A: Final = "http://127.0.0.1:4000"
@@ -26,29 +35,58 @@ def report(
     gateways: tuple[GatewayInventoryState, ...],
     accounts: tuple[Account, ...] = (ACCOUNT,),
     observations: tuple[Observation, ...] = (),
-    events: tuple[UsageEvent, ...] = (),
+    jobs: tuple[MediaJob, ...] = (),
+    manual_entries: tuple[ManualEntry, ...] = (),
 ) -> AccountInventoryReport:
-    return account_inventory(accounts, observations, events, (), gateways, NOW)
+    return account_inventory(
+        StoredState(
+            accounts=accounts,
+            observations=observations,
+            events=(),
+            jobs=jobs,
+            manual_entries=manual_entries,
+            gateway_inventories=gateways,
+        ),
+        NOW,
+    )
+
+
+def entry(result: AccountInventoryReport, account_id: str = ACCOUNT.id) -> AccountInventoryEntry:
+    return next(item for item in result.accounts if item.account_id == account_id)
 
 
 def gaps(result: AccountInventoryReport, account_id: str = ACCOUNT.id) -> tuple[str, ...]:
     return next(entry.gaps for entry in result.accounts if entry.account_id == account_id)
 
 
-def observation(metric: str, source: str, status: str) -> Observation:
+def observation(
+    metric: str,
+    source: str,
+    status: str,
+    *,
+    external_id: str = "",
+    window: str = "month",
+    period: str = "2026-11",
+    at: datetime = NOW,
+    scope: str | None = None,
+    expires: datetime | None = None,
+) -> Observation:
+    measured: Final = status in ("known", "manual", "estimated")
     return Observation.model_validate(
         {
             "account_id": ACCOUNT.id,
-            "external_id": f"{metric}-{source}",
+            "external_id": external_id or f"{metric}-{source}-{status}",
             "metric": metric,
-            "window": "month",
-            "period": "2026-11",
+            "window": window,
+            "period": period,
             "status": status,
             "source": source,
-            "observed_at": NOW,
-            "collected_at": NOW,
-            "value": Decimal(1),
-            "unit": "USD",
+            "snapshot_scope": scope,
+            "expires_at": expires,
+            "observed_at": at,
+            "collected_at": at,
+            "value": Decimal(1) if measured else None,
+            "unit": "USD" if measured else None,
         }
     )
 
@@ -68,6 +106,18 @@ def referenced(
                 InventoryDeployment(origin=item, model_name="m", credential_name=name, auth="credential_reference")
                 for item in (("database", "runtime") if origin == "both" else (origin,))
             ),
+        ),
+    )
+
+
+def _provider_usage_flags(found: AccountInventoryEntry) -> tuple[bool, bool, tuple[bool, ...]]:
+    return (
+        "provider_usage_not_current" in found.gaps,
+        "no_verified_provider_usage" in found.gaps,
+        tuple(
+            view.current
+            for view in found.usage_evidence
+            if view.reading.source == "provider_api" and view.reading.status == "known"
         ),
     )
 
@@ -200,3 +250,89 @@ class AccountInventoryTests(unittest.TestCase):
         result: Final = report((referenced(A, "both", "c", account_id="unknown-account"),))
         self.assertIn("not_in_catalogue", gaps(result, "unknown-account"))
         self.assertIn("no_gateway_credential", gaps(result))
+
+    def test_provider_usage_is_current_only_while_it_is_the_latest_fresh_reading_of_this_period(self) -> None:
+        current: Final = observation("spend", "provider_api", "known")
+        earlier: Final = NOW - timedelta(seconds=30)
+        histories: Final = {
+            "previous_period": (observation("spend", "provider_api", "known", period="2026-10"),),
+            "stale": (observation("spend", "provider_api", "known", at=NOW - timedelta(hours=2)),),
+            "replaced_unscoped_by_newer_estimate": (
+                observation("spend", "provider_api", "known", at=earlier),
+                observation("spend", "provider_api", "estimated"),
+            ),
+            "superseded_scoped_snapshot": (
+                observation("spend", "provider_api", "known", external_id="old", at=earlier, scope="billing"),
+                observation("budget", "provider_api", "known", external_id="new", scope="billing"),
+            ),
+            "expired": (observation("spend", "provider_api", "known", expires=NOW),),
+            "clock_skew": (observation("spend", "provider_api", "known", at=NOW + timedelta(minutes=5)),),
+            "provider_wide_error_in_all_window": (
+                observation("spend", "provider_api", "known", at=earlier),
+                observation("spend", "provider_api", "error", window="all", period="2026-11"),
+            ),
+            "later_error_same_window": (
+                observation("spend", "provider_api", "known", at=earlier),
+                observation("spend", "provider_api", "error"),
+            ),
+            "later_unknown_same_window": (
+                observation("spend", "provider_api", "known", at=earlier),
+                observation("spend", "provider_api", "unknown"),
+            ),
+        }
+        self.assertEqual(
+            {
+                name: _provider_usage_flags(entry(report((), observations=readings)))
+                for name, readings in histories.items()
+            },
+            dict.fromkeys(histories, (True, False, (False,))),
+        )
+        fresh: Final = entry(report((), observations=(current,)))
+        self.assertEqual([view.current for view in fresh.usage_evidence], [True])
+        self.assertFalse({"provider_usage_not_current", "no_verified_provider_usage"} & set(fresh.gaps))
+
+    def test_newer_readings_from_another_source_leave_provider_usage_current(self) -> None:
+        provider: Final = observation("spend", "provider_api", "known", at=NOW - timedelta(seconds=30))
+        imported: Final = observation("spend", "import", "known")
+        self.assertEqual(
+            _provider_usage_flags(entry(report((), observations=(provider, imported)))), (False, False, (True,))
+        )
+
+    def test_replaced_readings_stay_in_the_history_with_their_identity(self) -> None:
+        old: Final = observation("spend", "provider_api", "known", external_id="old", at=NOW - timedelta(seconds=30))
+        new: Final = observation("spend", "provider_api", "known", external_id="new")
+        found: Final = entry(report((), observations=(new, old)))
+        self.assertEqual(
+            [(view.reading.external_id, view.current) for view in found.usage_evidence], [("old", False), ("new", True)]
+        )
+
+    def test_accounts_referenced_only_by_jobs_or_manual_entries_are_listed_with_their_source(self) -> None:
+        job: Final = MediaJob(
+            account_id="job-only",
+            job_id="job-1",
+            state="reserved",
+            updated_at=NOW,
+            reserved_amount=Decimal(1),
+            unit="USD",
+            expires_at=NOW + timedelta(hours=1),
+        )
+        manual: Final = ManualEntry(
+            command=ManualCommand(
+                command_id="command-1",
+                account_id="manual-only",
+                expected_version=0,
+                changes=(ManualChange(field="note", action="set", value="kept"),),
+            ),
+            revision=1,
+            actor="owner",
+            received_at=NOW,
+        )
+        result: Final = report((), jobs=(job,), manual_entries=(manual,))
+        self.assertEqual(
+            [(item.account_id, item.references, "not_in_catalogue" in item.gaps) for item in result.accounts],
+            [
+                ("job-only", ("media_job",), True),
+                ("manual-only", ("manual_entry",), True),
+                (ACCOUNT.id, ("catalogue",), False),
+            ],
+        )
