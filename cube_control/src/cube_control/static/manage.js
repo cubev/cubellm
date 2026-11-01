@@ -25,7 +25,7 @@ const management = (() => {
  const awaitingFresh = new Map();
  const enrollments = new Map();
  const referenceLabels = {catalogue:"Kontenkatalog",gateway_credential:"Gateway-Zugang",gateway_route:"Gateway-Route",observation:"Messwert",usage_event:"Nutzungsereignis",gateway_record:"Gateway-Aufruf",media_job:"Medienauftrag",manual_entry:"Manuelle Angabe"};
- const gapLabels = {inventory_not_collected:"Kein Gateway-Inventar erfasst",not_in_catalogue:"Nicht im Kontenkatalog",no_gateway_credential:"Kein Gateway-Zugang",credential_only_in_database:"Zugang nur gespeichert, nicht geladen",credential_only_in_runtime:"Zugang nur geladen, nicht gespeichert",credential_unused:"Zugang ungenutzt",binding_not_in_latest_collection:"Bindung nur aus früherem Scan",invalid_binding:"Ungültige Bindung",no_usage_source:"Keine Nutzungsquelle",no_verified_provider_usage:"Keine bestätigte Anbieternutzung",provider_usage_not_current:"Anbieternutzung nicht aktuell"};
+ const gapLabels = {inventory_not_collected:"Kein Gateway-Inventar erfasst",not_in_catalogue:"Nicht im Kontenkatalog",no_gateway_credential:"Kein Gateway-Zugang",credential_only_in_database:"Zugang nur gespeichert, nicht geladen",credential_only_in_runtime:"Zugang nur geladen, nicht gespeichert",credential_unused:"Zugang ungenutzt",binding_not_in_latest_collection:"Bindung nur aus früherem Scan",invalid_binding:"Ungültige Bindung",no_usage_source:"Keine Nutzungsquelle",no_verified_provider_usage:"Keine bestätigte Anbieternutzung",provider_usage_not_current:"Anbieternutzung nicht aktuell",no_confirmed_credential_binding:"Keine bestätigte Zuordnung zu Inventurfunden"};
  function labelled_codes(prefix, codes, labels) { const p=node("p","explanation",`${prefix}: ${codes.map((code)=>labels[code]||code).join(", ")}`); p.title=codes.join(", "); return p; }
  function node(tag, cls, text) { const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e; }
  function button(text, cls, handler) { const b=node("button",cls,text); b.type="button"; b.addEventListener("click",handler); return b; }
@@ -221,6 +221,34 @@ const management = (() => {
   const parts=[findingLabels[item.kind]||item.kind,item.gateway_origin,item.source&&item.origin?`${item.source}/${item.origin}`:item.origin,item.name,item.account_id?"Konto "+item.account_id:null,item.detail].filter(Boolean);
   return node("li","",parts.join(" · "));
  }
+ const credentialFindingLabels = {unassigned_candidate:"Dienst und Konto unbekannt",provider_hint_without_account:"Anbieterhinweis ohne Katalogkonto",archived_candidate:"Nur in Archiv/Export",unbound_candidate:"Keine bestätigte Kontobindung",quarantined_record:"Unstimmiger Eintrag zurückgehalten",incomplete_scan:"Scan unvollständig"};
+ const kindLabels = {api_key_or_token:"API-Schlüssel oder Token",connection_string:"Verbindungszeichenfolge",encrypted_material:"Verschlüsseltes Material",local_application_secret:"Lokales Anwendungsgeheimnis",public_firebase_client_configuration:"Öffentliche Firebase-Clientkonfiguration"};
+ const importLabels = {imported:"übernommen",older_or_equal_ignored:"älterer oder gleicher Scan ignoriert",rejected:"abgelehnt",unreadable:"Dateien nicht lesbar"};
+ function credentialSection(report) {
+  const sources=report.credential_sources||[], candidates=report.credential_candidates||[], findings=report.credential_findings||[];
+  if(!sources.length)return [];
+  const sourceList=node("div","inventory-gateways");
+  for(const source of sources){
+   const card=node("article","inventory-gateway credential-source");
+   card.append(node("h3","",source.source_id),node("p","",`Letzter Import ${since(source.last_attempt_at)}: ${importLabels[source.last_attempt_status]||source.last_attempt_status}${source.last_attempt_message?" · "+source.last_attempt_message:""}`));
+   if(source.scanned_at)card.append(node("p",source.scan_freshness==="stale"?"explanation error":"explanation",`Scan ${since(source.scanned_at)}${source.scan_freshness==="stale"?" (veraltet)":""} · ${source.scan_complete?"Umfang vollständig gelesen":"Umfang unvollständig"} · Gültigkeit ungeprüft · ${source.candidates} Kandidaten, davon ${source.retained_candidates} nur aus früherem Scan`));
+   const hosts=node("ul","sources");
+   for(const host of source.hosts)hosts.append(node("li",host.complete?"":"warning",`${host.host}: ${host.files_read} Dateien, ${host.roots} Wurzeln (${host.scope_id})${host.presence==="retained"?" · aus früherem Scan":""}${host.complete?"":" · unvollständig"}`));
+   card.append(hosts); sourceList.append(card);
+  }
+  const list=node("div","inventory-accounts");
+  for(const item of candidates){
+   const card=node("article","inventory-account credential-candidate");
+   card.append(node("h3","",`${item.service} · ${item.reference}`));
+   card.append(node("p","explanation",`Ungebunden · ${item.provider_hint?"Anbieterhinweis "+item.provider_hint+" (kein Kontonachweis)":"kein Anbieterhinweis"}`));
+   card.append(node("p",item.presence==="retained"||item.state==="archived_only"?"explanation error":"explanation",`${item.state==="current"?"Aktuelle Fundstelle":"Nur Archiv/Export"} · ${item.presence==="retained"?"aus früherem Scan, zuletzt gesehen "+since(item.last_observed_at):"im letzten Scan gesehen"}${item.scan_freshness==="stale"?" · Scan veraltet":""}`));
+   card.append(node("p","explanation",`Hosts: ${item.hosts.join(", ")} · Projekte: ${item.projects.join(", ")} · Variablen: ${item.variables.join(", ")} · Art: ${item.kinds.map((kind)=>kindLabels[kind]||kind).join(", ")}`));
+   list.append(card);
+  }
+  const notes=node("ul","credential-findings");
+  for(const item of findings)notes.append(node("li","",[credentialFindingLabels[item.kind]||item.kind,item.service,item.reference,item.host,item.detail].filter(Boolean).join(" · ")));
+  return [node("h3","",`Gefundene Zugangsdaten (${candidates.length}, alle ungebunden)`),node("p","explanation","Nur Metadaten aus der Dienstinventur: keine Schlüsselwerte, keine Dateipfade, keine Prüfung beim Anbieter. Ein Fund belegt weder Gültigkeit noch Kontozugehörigkeit; ein Dienstname ist nur ein Anbieterhinweis."),sourceList,list,node("h3","",`Hinweise zu Zugangsdaten (${findings.length})`),notes];
+ }
  async function loadInventory() {
   const box=byId("inventory"); const ticket=++inventoryTicket; let report;
   try { const response=await fetch("/api/v1/inventory",{cache:"no-store"}); if(!response.ok)throw new Error("unavailable"); report=await response.json(); }
@@ -235,7 +263,7 @@ const management = (() => {
   }
   if(ticket!==inventoryTicket)return;
   inventoryLoadedAt=new Date().toISOString();
-  const coverage={not_collected:"Noch kein Gateway-Inventar erfasst",partial:"Teilweise erfasst",configured_sources_complete:"Alle konfigurierten Quellen vollständig"}[report.coverage];
+  const coverage={not_collected:"Gateway: noch kein Inventar erfasst",partial:"Gateway: teilweise erfasst",configured_sources_complete:"Gateway: alle sechs Gatewayquellen vollständig gelesen (keine Aussage über alle Konten)"}[report.coverage];
   const gateways=node("div","inventory-gateways");
   for(const gateway of report.gateways){
    const card=node("article","inventory-gateway");
@@ -265,7 +293,7 @@ const management = (() => {
   if(!accounts.childElementCount)accounts.append(node("p","explanation","Keine passenden Konten."));
   const findings=node("ul","findings"); for(const item of report.findings)findings.append(finding(item));
   if(!findings.childElementCount)findings.append(node("li","","Keine Hinweise."));
-  box.replaceChildren(node("p","",`${coverage} · erzeugt ${since(report.generated_at)}`),gateways,node("h3","","Konten und Bindungen"),filterToggle,accounts,node("h3","",`Hinweise (${report.findings.length})`),findings);
+  box.replaceChildren(node("p","",`${coverage} · erzeugt ${since(report.generated_at)}`),gateways,node("h3","","Konten und Bindungen"),filterToggle,accounts,node("h3","",`Hinweise (${report.findings.length})`),findings,...credentialSection(report));
   if(csrf){
    if(!enrollments.has("")){ const own=node("details","new-account"); own.append(node("summary","","Weiteres Konto aufnehmen"),enrollment("")); enrollments.set("",own); }
    box.append(enrollments.get(""));

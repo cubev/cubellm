@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Final, Literal, LiteralString, Protocol
 
 import psycopg
@@ -7,6 +7,14 @@ from psycopg import Connection
 from pydantic import TypeAdapter, ValidationError
 
 from cube_control.gateway_inventory import GatewayInventoryAttempt, GatewayInventorySnapshot
+from cube_control.credential_inventory import (
+    CredentialImportAttempt,
+    CredentialInventorySnapshot,
+    CredentialInventoryState,
+    ImportStatus,
+    from_legacy,
+    merge_snapshot,
+)
 from cube_control.inventory_evidence import GatewayEvidence, GatewayInventoryState, merge_evidence
 from cube_control.gateway_store import SCHEMA as GATEWAY_SCHEMA
 from cube_control.gateway_store import current_records, latest_scans
@@ -17,6 +25,7 @@ from cube_control.models import (
     FleetSnapshot,
     GatewayRecord,
     GatewayScanView,
+    Identifier,
     ImportBatch,
     ManualCommand,
     ManualEntry,
@@ -51,10 +60,53 @@ class StoredState:
     gateway_records: tuple[GatewayRecord, ...] = ()
     gateway_scans: tuple[GatewayScanView, ...] = ()
     gateway_inventories: tuple[GatewayInventoryState, ...] = ()
+    credential_inventories: tuple[CredentialInventoryState, ...] = ()
 
 
 INVENTORY_ROW: Final = TypeAdapter(tuple[str, str, str | None, str | None])
 INVENTORY_COLUMNS: Final = "gateway_origin, attempt::text, last_good::text, evidence::text"
+
+
+CREDENTIAL_ROW: Final = TypeAdapter(tuple[str, str | None, str | None, str | None])
+SOURCE_ID: Final = TypeAdapter[str](Identifier)
+CREDENTIAL_COLUMNS: Final = "source_id, attempt::text, evidence::text, snapshot::text"
+
+
+def credential_outcome(
+    previous: CredentialInventorySnapshot | None,
+    attempted_at: datetime,
+    outcome: CredentialInventorySnapshot | tuple[ImportStatus, str],
+) -> tuple[CredentialInventorySnapshot | None, CredentialImportAttempt]:
+    if not isinstance(outcome, CredentialInventorySnapshot):
+        return previous, CredentialImportAttempt(attempted_at=attempted_at, status=outcome[0], message=outcome[1])
+    newer: Final = previous is None or outcome.scanned_at > previous.scanned_at
+    return merge_snapshot(previous, outcome), CredentialImportAttempt(
+        attempted_at=attempted_at,
+        status="imported" if newer else "older_or_equal_ignored",
+        scanned_at=outcome.scanned_at,
+    )
+
+
+def credential_state(row: object) -> CredentialInventoryState:
+    source_id, attempt, evidence, legacy = CREDENTIAL_ROW.validate_python(row)
+    snapshot: Final = (
+        CredentialInventorySnapshot.model_validate_json(evidence)
+        if evidence is not None
+        else from_legacy(legacy)
+        if legacy is not None
+        else None
+    )
+    return CredentialInventoryState(
+        source_id=source_id,
+        attempt=CredentialImportAttempt.model_validate_json(attempt)
+        if attempt is not None
+        else CredentialImportAttempt(
+            attempted_at=snapshot.imported_at if snapshot is not None else datetime.min.replace(tzinfo=UTC),
+            status="imported",
+            scanned_at=snapshot.scanned_at if snapshot is not None else None,
+        ),
+        evidence=snapshot,
+    )
 
 
 def inventory_state(row: object) -> GatewayInventoryState:
@@ -100,6 +152,13 @@ CREATE TABLE IF NOT EXISTS cube_control.gateway_inventories (
     gateway_origin text PRIMARY KEY, attempt jsonb NOT NULL, last_good jsonb
 );
 ALTER TABLE cube_control.gateway_inventories ADD COLUMN IF NOT EXISTS evidence jsonb;
+CREATE TABLE IF NOT EXISTS cube_control.credential_inventories (
+    source_id text PRIMARY KEY, scanned_at timestamptz NOT NULL, snapshot jsonb NOT NULL
+);
+ALTER TABLE cube_control.credential_inventories ADD COLUMN IF NOT EXISTS attempt jsonb;
+ALTER TABLE cube_control.credential_inventories ADD COLUMN IF NOT EXISTS evidence jsonb;
+ALTER TABLE cube_control.credential_inventories ALTER COLUMN snapshot DROP NOT NULL;
+ALTER TABLE cube_control.credential_inventories ALTER COLUMN scanned_at DROP NOT NULL;
 """
 
 
@@ -175,7 +234,51 @@ class PostgresRepository:
                 current_records(connection),
                 latest_scans(connection),
                 inventories,
+                tuple(
+                    map(
+                        credential_state,
+                        connection.execute(
+                            f"SELECT {CREDENTIAL_COLUMNS} FROM cube_control.credential_inventories ORDER BY source_id"
+                        ),
+                    )
+                ),
             )
+
+    def record_credential_import(
+        self,
+        source_id: str,
+        attempted_at: datetime,
+        outcome: CredentialInventorySnapshot | tuple[ImportStatus, str],
+    ) -> ImportStatus:
+        SOURCE_ID.validate_python(source_id)
+        if isinstance(outcome, CredentialInventorySnapshot) and outcome.source_id != source_id:
+            raise ValueError("Credential inventory snapshot belongs to another source")
+        with self.connect() as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('cube-control-credentials'), hashtext(%s))", (source_id,)
+            )
+            row: Final = connection.execute(
+                f"SELECT {CREDENTIAL_COLUMNS} FROM cube_control.credential_inventories WHERE source_id=%s FOR UPDATE",
+                (source_id,),
+            ).fetchone()
+            stored: Final = credential_state(row) if row is not None else None
+            previous: Final = stored.evidence if stored is not None else None
+            evidence, attempt = credential_outcome(previous, attempted_at, outcome)
+            newest: Final = (
+                attempt if stored is None or attempt.attempted_at >= stored.attempt.attempted_at else stored.attempt
+            )
+            connection.execute(
+                "INSERT INTO cube_control.credential_inventories (source_id, scanned_at, attempt, evidence) "
+                "VALUES (%s, %s, %s::jsonb, %s::jsonb) ON CONFLICT (source_id) DO UPDATE "
+                "SET scanned_at = EXCLUDED.scanned_at, attempt = EXCLUDED.attempt, evidence = EXCLUDED.evidence",
+                (
+                    source_id,
+                    evidence.scanned_at if evidence is not None else None,
+                    newest.model_dump_json(),
+                    evidence.model_dump_json() if evidence is not None else None,
+                ),
+            )
+            return attempt.status
 
     def record_gateway_inventory(
         self, gateway_origin: str, attempt: GatewayInventoryAttempt, snapshot: GatewayInventorySnapshot | None

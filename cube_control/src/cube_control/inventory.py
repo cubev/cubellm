@@ -5,6 +5,12 @@ from typing import Final, Literal
 
 from pydantic import AwareDatetime
 
+from cube_control.credential_reconciliation import (
+    CandidateView,
+    CredentialFinding,
+    CredentialSourceView,
+    credential_views,
+)
 from cube_control.gateway_inventory import SOURCE_PAIRS, InventoryCredential, InventoryRoute, Origin, SourceName
 from cube_control.inventory_evidence import (
     GatewayEvidence,
@@ -40,6 +46,7 @@ AccountGap = Literal[
     "no_usage_source",
     "no_verified_provider_usage",
     "provider_usage_not_current",
+    "no_confirmed_credential_binding",
 ]
 VerifiedUsage = Literal["current", "historical", "none"]
 GatewayState = Literal["current", "stale", "last_attempt_failed", "never_collected"]
@@ -115,6 +122,9 @@ class AccountInventoryReport(FrozenModel):
     gateways: tuple[GatewayCoverage, ...]
     accounts: tuple[AccountInventoryEntry, ...]
     findings: tuple[InventoryFinding, ...]
+    credential_sources: tuple[CredentialSourceView, ...] = ()
+    credential_candidates: tuple[CandidateView, ...] = ()
+    credential_findings: tuple[CredentialFinding, ...] = ()
 
 
 def _latest(values: Iterable[datetime]) -> datetime | None:
@@ -326,6 +336,9 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
         )
     )
     catalogued: Final = {account.id: account for account in stored.accounts}
+    credential_sources, credential_candidates, credential_findings = credential_views(
+        stored.credential_inventories, frozenset(str(account.provider) for account in stored.accounts), now
+    )
     account_ids: Final = sorted(
         frozenset(
             chain(
@@ -387,15 +400,22 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
             last_usage_at=_latest(
                 chain((item.occurred_at for item in own_events), (record.occurred_at for record in own_records))
             ),
-            gaps=_gaps(
-                account,
-                own_credentials,
-                referenced,
-                bool(collected),
-                bool(own_events or own_records)
-                or any(item.status in ("known", "estimated", "manual") for item in usage_observations),
-                "current" if any(verified) else "historical" if verified else "none",
-                invalid,
+            gaps=(
+                *_gaps(
+                    account,
+                    own_credentials,
+                    referenced,
+                    bool(collected),
+                    bool(own_events or own_records)
+                    or any(item.status in ("known", "estimated", "manual") for item in usage_observations),
+                    "current" if any(verified) else "historical" if verified else "none",
+                    invalid,
+                ),
+                *(
+                    ("no_confirmed_credential_binding",)
+                    if credential_candidates and account is not None and account.kind == "api"
+                    else ()
+                ),
             ),
         )
 
@@ -413,4 +433,7 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
             *chain.from_iterable(_findings(origin, evidence) for origin, evidence in collected),
             *_conflicts(credentials),
         ),
+        credential_sources=credential_sources,
+        credential_candidates=credential_candidates,
+        credential_findings=credential_findings,
     )

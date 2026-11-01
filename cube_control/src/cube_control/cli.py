@@ -9,7 +9,7 @@ from typing import Final
 
 import psycopg
 import uvicorn
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from cube_control.account_routes import (
     AccountResourceAdoptionSpec,
@@ -26,6 +26,12 @@ from cube_control.application_access import (
     provision_application_access,
     revoke_application_access,
 )
+from cube_control.credential_inventory import (
+    MAX_SOURCE_BYTES,
+    CredentialInventorySnapshot,
+    ImportStatus,
+    parse_inventory,
+)
 from cube_control.edge import GatewayEdgeSpec, render_gateway_edge
 from cube_control.gateway import GatewayProjectionBatch, prepare_gateway
 from cube_control.gateway_inventory import collect_and_record_gateway_inventory
@@ -33,7 +39,7 @@ from cube_control.gateway_store import GatewayRepository
 from cube_control.github import collect_github
 from cube_control.heygen import collect_heygen
 from cube_control.media import JobCommand, PostgresJobManager
-from cube_control.models import GatewayBatch, ImportBatch, ManualCommand
+from cube_control.models import GatewayBatch, Identifier, ImportBatch, ManualCommand
 from cube_control.native_gateway import PROJECTION_COLUMNS, prepare_native_gateway
 from cube_control.openrouter import collect_openrouter
 from cube_control.provider_access import Unavailable, read_private_key
@@ -56,6 +62,20 @@ class CommandArguments(argparse.Namespace):
     state_directory: Path
     destination_directory: Path
     gateway_origin: str
+    source_id: str
+    register: Path
+    plan: Path
+
+
+SOURCE_IDENTIFIER: Final = TypeAdapter[str](Identifier)
+
+
+def credential_sources(register: Path, plan: Path) -> tuple[bytes, bytes] | None:
+    try:
+        with register.open("rb") as register_file, plan.open("rb") as plan_file:
+            return register_file.read(MAX_SOURCE_BYTES + 1), plan_file.read(MAX_SOURCE_BYTES + 1)
+    except OSError:
+        return None
 
 
 def main() -> int:
@@ -109,6 +129,10 @@ def main() -> int:
     inventory_parser: Final = sub.add_parser("collect-gateway-inventory")
     inventory_parser.add_argument("--config", required=True, type=Path)
     inventory_parser.add_argument("--gateway-origin", required=True)
+    credential_parser: Final = sub.add_parser("import-credential-inventory")
+    credential_parser.add_argument("--source-id", required=True)
+    credential_parser.add_argument("--register", required=True, type=Path)
+    credential_parser.add_argument("--plan", required=True, type=Path)
     import_parser: Final = sub.add_parser("import")
     import_parser.add_argument("path", nargs="?", default="-")
     serve_parser: Final = sub.add_parser("serve")
@@ -323,6 +347,48 @@ def main() -> int:
             )
         )
         return 0 if inventory_result.status == "collected" else 1
+    if args.command == "import-credential-inventory":
+        try:
+            SOURCE_IDENTIFIER.validate_python(args.source_id)
+        except ValidationError:
+            print("Credential inventory source ID rejected", file=sys.stderr)
+            return 2
+        attempted_at: Final = datetime.now(UTC)
+        sources_read: Final = credential_sources(args.register, args.plan)
+        parsed: Final = (
+            parse_inventory(sources_read[0], sources_read[1], args.source_id, attempted_at)
+            if sources_read is not None
+            else None
+        )
+        outcome: Final[CredentialInventorySnapshot | tuple[ImportStatus, str]] = (
+            ("unreadable", "Credential inventory files are not readable")
+            if parsed is None
+            else ("rejected", parsed)
+            if isinstance(parsed, str)
+            else parsed
+        )
+        try:
+            status: Final = repository.record_credential_import(args.source_id, attempted_at, outcome)
+        except psycopg.Error:
+            print("Inventory store unavailable", file=sys.stderr)
+            return 1
+        if not isinstance(outcome, CredentialInventorySnapshot):
+            print(json.dumps({"status": status, "message": outcome[1]}))
+            return 2
+        print(
+            json.dumps(
+                {
+                    "status": status,
+                    "scanned_at": outcome.scanned_at.isoformat(),
+                    "services": len(outcome.services),
+                    "candidates": len(outcome.candidates),
+                    "quarantined": len(outcome.quarantined),
+                    "incomplete_hosts": sum(1 for host in outcome.hosts if not host.complete),
+                    "validity": outcome.validity,
+                }
+            )
+        )
+        return 0
     if args.command == "manage":
         raw_command: Final[str] = sys.stdin.read(65537) if args.path == "-" else Path(args.path).read_text()
         if len(raw_command) > 65536:

@@ -10,6 +10,7 @@ from time import monotonic
 from typing import Final
 from uuid import uuid4
 
+import test_credential_inventory as credential_fixtures
 import uvicorn
 from inventory_fixtures import bound, gateway_inventory, snapshot
 from playwright.sync_api import Page, Route, expect, sync_playwright
@@ -17,6 +18,7 @@ from pydantic import SecretStr, TypeAdapter
 
 from cube_control.api import create_app
 from cube_control.browser_session import private_authority
+from cube_control.credential_inventory import public_reference
 from cube_control.gateway_inventory import GatewayInventoryAttempt, InventoryCredential
 from cube_control.models import Account, ImportBatch, ManualChange, ManualCommand
 from cube_control.store import PostgresRepository
@@ -71,12 +73,16 @@ def main() -> None:
     )
     discovered: Final = f"ui-discovered-{marker}"
     gateway: Final = f"http://ui-gateway-{marker}.test"
+    credential_source: Final = f"ui-credentials-{marker}"
     proof: Final = Path(os.environ.get("CUBE_CONTROL_BROWSER_PROOF", f"/tmp/cubellm-ui-management-{marker}"))
     proof.mkdir(parents=True, exist_ok=False)
 
     def forget() -> None:
         with repository.connect() as connection:
             connection.execute("DELETE FROM cube_control.gateway_inventories WHERE gateway_origin=%s", (gateway,))
+            connection.execute(
+                "DELETE FROM cube_control.credential_inventories WHERE source_id=%s", (credential_source,)
+            )
             for account_id in (managed.id, discovered):
                 connection.execute("DELETE FROM cube_control.manual_commands WHERE account_id=%s", (account_id,))
                 connection.execute("DELETE FROM cube_control.accounts WHERE id=%s", (account_id,))
@@ -125,6 +131,24 @@ def main() -> None:
                     GatewayInventoryAttempt(attempted_at=observed, status="collected", message="collected"),
                     snapshot(gateway, observed, inventory),
                 )
+            for attempted, raw in (
+                (
+                    datetime.now(UTC) - timedelta(minutes=5),
+                    credential_fixtures.standard(scanned=datetime.now(UTC) - timedelta(days=9)),
+                ),
+                (
+                    datetime.now(UTC) - timedelta(minutes=2),
+                    credential_fixtures.sources([], [], unreadable=2, scanned=datetime.now(UTC) - timedelta(days=8)),
+                ),
+            ):
+                imported = repository.record_credential_import(
+                    credential_source, attempted, credential_fixtures.parsed(raw, credential_source)
+                )
+                assert imported == "imported", imported
+            failed_import: Final = repository.record_credential_import(
+                credential_source, datetime.now(UTC), ("unreadable", "Credential inventory files are not readable")
+            )
+            assert failed_import == "unreadable", failed_import
             thread: Final = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
             thread.start()
             running.callback(stop, server, thread)
@@ -181,6 +205,35 @@ def main() -> None:
                     flush=True,
                 )
                 discovered_card.screenshot(path=str(proof / "01-discovered-retained.png"))
+                credential_card: Final = inventory_box.locator(".credential-source").filter(has_text=credential_source)
+                expect(credential_card).to_contain_text("(veraltet)")
+                expect(credential_card).to_contain_text("Dateien nicht lesbar")
+                retained_cards: Final = inventory_box.locator(".credential-candidate").filter(
+                    has_text="aus früherem Scan, zuletzt gesehen vor 9 Tagen"
+                )
+                expect(retained_cards).to_have_count(5)
+                expect(inventory_box).to_contain_text("Gateway: ")
+                expect(inventory_box).to_contain_text("Keine bestätigte Zuordnung zu Inventurfunden")
+                expect(inventory_box).to_contain_text("Art: API-Schlüssel oder Token")
+                expect(credential_card).to_contain_text("Umfang unvollständig")
+                expect(credential_card).to_contain_text("davon 5 nur aus früherem Scan")
+                expect(inventory_box).to_contain_text("Gefundene Zugangsdaten")
+                coin_card: Final = inventory_box.locator(".credential-candidate").filter(
+                    has_text=public_reference(credential_source, credential_fixtures.COIN_KEY)
+                )
+                expect(coin_card).to_contain_text("Ungebunden · kein Anbieterhinweis")
+                expect(coin_card).to_contain_text("aus früherem Scan, zuletzt gesehen")
+                page_text: Final = page.locator("body").inner_text()
+                assert not any(
+                    value in page_text
+                    for value in (
+                        credential_fixtures.OPENAI_KEY,
+                        credential_fixtures.COIN_KEY,
+                        credential_fixtures.SECRET_PATH,
+                        credential_fixtures.ROOT,
+                    )
+                ), "private credential provenance reached the page"
+                coin_card.screenshot(path=str(proof / "06-credential-candidate.png"))
 
                 def record(observed: datetime, unavailable: bool) -> None:
                     repository.record_gateway_inventory(
@@ -513,6 +566,11 @@ def main() -> None:
                 phone.locator("#accounts .card").filter(has_text=marker).filter(has_text="Managed").screenshot(
                     path=str(proof / "05-mobile-managed-card.png")
                 )
+                phone_candidate: Final = phone.locator(".credential-candidate").filter(
+                    has_text=public_reference(credential_source, credential_fixtures.COIN_KEY)
+                )
+                expect(phone_candidate).to_be_visible()
+                phone_candidate.screenshot(path=str(proof / "07-mobile-credential-candidate.png"))
                 browser.close()
         print("browser management acceptance passed")
 
