@@ -248,3 +248,65 @@ def test_credential_provider_identity_must_be_a_valid_provider_id(provider: str)
     cast(dict[str, object], item.credential_info)["cube_provider_id"] = provider
     with pytest.raises(ValueError):
         resolve_account_credential(POLICY, item, "https://vendor.example/check")
+
+
+RESOURCE_TYPES: Final = (
+    {"name": "report-job", "item_paths": ["/reports/jobs/{resource_id}", "/reports/jobs/{resource_id}/cancel"]},
+)
+
+
+def resource_grant(path: str) -> dict[str, object]:
+    return {
+        "application_id": "fixture-app",
+        "key_hash": "a" * 64,
+        "account_id": "fixture-account",
+        "path": path,
+        "methods": ["POST"],
+    }
+
+
+def resource_policy(*paths: str) -> AccountHeaderCredential:
+    return AccountHeaderCredential.model_validate(
+        POLICY.model_dump()
+        | {"resource_types": RESOURCE_TYPES, "application_grants": [resource_grant(path) for path in paths]}
+    )
+
+
+def test_resource_grants_must_name_a_declared_item_path() -> None:
+    assert resource_policy("/reports/jobs/{resource_id}/cancel").application_grants[0].path == (
+        "/reports/jobs/{resource_id}/cancel"
+    )
+    with pytest.raises(ValidationError):
+        resource_policy("/reports/files/{resource_id}")
+
+
+@pytest.mark.parametrize("path", ("/reports/jobs/abc", "/reports/jobs/abc/cancel"))
+def test_concrete_grants_cannot_bypass_resource_ownership_by_naming_an_item(path: str) -> None:
+    with pytest.raises(ValidationError):
+        resource_policy(path)
+
+
+@pytest.mark.parametrize("path", ("/reports/{id}", "/reports/x{resource_id}", "/reports/{resource_id}/{resource_id}"))
+def test_resource_grant_paths_need_one_whole_placeholder_segment(path: str) -> None:
+    with pytest.raises(ValidationError):
+        AccountApplicationGrant.model_validate(resource_grant(path))
+
+
+@pytest.mark.parametrize("path", ("/reports/jobs/{resource_id}/cancel", "/reports/jobs/abc/cancel"))
+def test_resource_grants_never_authorize_through_the_literal_path_check(path: str) -> None:
+    policy: Final = resource_policy("/reports/jobs/{resource_id}/cancel")
+    assert not account_application_allowed(policy, "fixture-app", "a" * 64, path, "POST")
+
+
+def test_resource_routes_need_subpath_forwarding_before_they_can_be_persisted() -> None:
+    policy: Final = resource_policy()
+    with pytest.raises(ValidationError):
+        PassThroughGenericEndpoint(path="/reports", target="https://vendor.example", account_credential=policy)
+    accepted: Final = PassThroughGenericEndpoint(
+        path="/reports",
+        target="https://vendor.example",
+        include_subpath=True,
+        methods=["POST"],
+        account_credential=policy,
+    )
+    assert accepted.account_credential == policy
