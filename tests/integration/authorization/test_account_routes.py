@@ -791,8 +791,14 @@ def test_account_inventory_reports_stored_bindings_to_admins_only_without_secret
         ]
         assert [
             (
-                (inventory.status_code, object_value(object_value(inventory.json())["error"])["type"]),
-                (sibling.status_code, object_value(object_value(sibling.json())["error"])["type"]),
+                (
+                    inventory.status_code,
+                    object_value(object_value(JSON_OBJECT.validate_json(inventory.content))["error"])["type"],
+                ),
+                (
+                    sibling.status_code,
+                    object_value(object_value(JSON_OBJECT.validate_json(sibling.content))["error"])["type"],
+                ),
                 key in inventory.text,
             )
             for (inventory, sibling), key in zip(denials, keys, strict=True)
