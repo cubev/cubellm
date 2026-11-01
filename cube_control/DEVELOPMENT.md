@@ -688,3 +688,40 @@ module has no type-discipline findings. The dashboard schema was regenerated
 User and key management in the end-to-end test still uses the contract transport,
 so this is not proof of native user/key persistence. No production route,
 credential or service was changed
+
+
+## Fresh gateway image and native persistence acceptance
+
+Built the complete image `cubellm-native-dev:2baed0a` from an exact `git archive`
+context of 2baed0a with the existing pinned toolchains (image
+`sha256:6478372b6452707b4a86ab712ea9f737192d1dbbbe74016af0d105f011b29b28`, revision
+label matches the commit). It ran against a throwaway schema in the dedicated local
+test database, a loopback mock provider and a synthetic master key; schema and
+container were removed afterwards
+
+The controller acceptance used the real controller CLI and native HTTP endpoints
+only, without the contract transport. It stored a named credential and a team,
+created the account route (a retry returned `existing` with the same fingerprint),
+prepared, provisioned and delivered an application key and checked PostgreSQL
+directly: the user row, the key row with its hash, team and exact route, no raw key
+and the grant bound to the key hash. The granted request reached the provider with
+only the bound credential header and no application key. Other methods (405), child
+paths (404), anonymous calls (401), the master key without a grant (403) and an
+inference route outside the key scope (403) were denied and never reached the
+provider. After controller revocation the gateway denied the key at runtime (401).
+All 25 steps passed
+
+The new integration test `tests/integration/authorization/test_account_routes.py`
+covers the native part in the repository harness: route creation and idempotent
+retry, real user and key persistence, the grant, forwarding with the bound
+credential observed at the owned upstream, the denials and blocking. It passes
+against the new image and fails against the previous image `a0724de` at the missing
+route creation endpoint. Locally it ran without Redis and with one proxy, which
+differs from the CI management job
+
+Found during the run: the `litellm_proxy_extras` invalid-index check ignores a Unix
+socket given as `host=` in `DATABASE_URL` and tries TCP on 127.0.0.1:5432. It only
+logs a warning and skips the check; startup and migrations work. Not fixed yet
+
+This is local acceptance with synthetic credentials. It does not cover real provider
+accounts, multiple workers, LAN or Tailscale access, or any production rollout
