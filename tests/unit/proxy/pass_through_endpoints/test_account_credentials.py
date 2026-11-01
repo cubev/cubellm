@@ -280,7 +280,16 @@ def test_resource_grants_must_name_a_declared_item_path() -> None:
         resource_policy("/reports/files/{resource_id}")
 
 
-@pytest.mark.parametrize("path", ("/reports/jobs/abc", "/reports/jobs/abc/cancel"))
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/reports/jobs/abc",
+        "/reports/jobs/abc/cancel",
+        "/reports/jobs/a+b",
+        "/reports/jobs/a!b",
+        "/reports/jobs/a$b/cancel",
+    ),
+)
 def test_concrete_grants_cannot_bypass_resource_ownership_by_naming_an_item(path: str) -> None:
     with pytest.raises(ValidationError):
         resource_policy(path)
@@ -310,3 +319,12 @@ def test_resource_routes_need_subpath_forwarding_before_they_can_be_persisted() 
         account_credential=policy,
     )
     assert accepted.account_credential == policy
+
+
+@pytest.mark.parametrize("path", ("/reports/jobs", "/reports/jobs/abc/cancelled", "/reports/usage"))
+def test_concrete_grants_outside_item_shapes_keep_their_exact_behavior(path: str) -> None:
+    policy: Final = AccountHeaderCredential.model_validate(
+        POLICY.model_dump() | {"resource_types": RESOURCE_TYPES, "application_grants": [resource_grant(path)]}
+    )
+    assert account_application_allowed(policy, "fixture-app", "a" * 64, path, "POST")
+    assert not account_application_allowed(policy, "fixture-app", "a" * 64, path + "/child", "POST")

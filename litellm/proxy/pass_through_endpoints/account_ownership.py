@@ -1,12 +1,14 @@
 from dataclasses import dataclass
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 from typing_extensions import Self
 
-from .account_credentials import Identifier
+from litellm._logging import verbose_proxy_logger
+
+from .account_credentials import AccountHeaderCredential, Identifier
 from .account_grants import GrantDatabase, GrantTransaction
-from .account_resources import ResourceTypeName, canonical_resource_id
+from .account_resources import ResourcePathMatch, ResourceTypeName, canonical_resource_id, find_resource
 
 _COLUMNS: Final = '"account_id", "resource_type", "resource_id", "route_id", "owner_application_id", "provenance"'
 CLAIM_CREATED_SQL: Final = f"""INSERT INTO "LiteLLM_AccountResourceOwnership" ({_COLUMNS}, "creator_key_hash")
@@ -106,3 +108,41 @@ async def read_ownership(
         return None
     async with database.tx() as transaction:
         return await _read(transaction, account_id, resource_type, resource_id)
+
+
+class OwnershipLookup(Protocol):
+    async def __call__(self, account_id: str, resource_type: str, resource_id: str, /) -> ResourceOwnership | None: ...
+
+
+def resource_path_match(policy: AccountHeaderCredential, path: str) -> ResourcePathMatch | None:
+    return find_resource(policy.resource_types, path)
+
+
+async def resource_access_allowed(
+    policy: AccountHeaderCredential,
+    match: ResourcePathMatch,
+    route_id: str | None,
+    application_id: str | None,
+    key_hash: str | None,
+    method: str,
+    lookup: OwnershipLookup,
+) -> bool:
+    resource_id: Final = match.resource_id
+    if resource_id is None or route_id is None or application_id is None or key_hash is None:
+        return False
+    granted: Final = any(
+        grant.application_id == application_id
+        and grant.key_hash == key_hash
+        and grant.account_id == policy.account_id
+        and grant.path == match.template
+        and method in grant.methods
+        for grant in policy.application_grants
+    )
+    if not granted:
+        return False
+    try:
+        ownership: Final = await lookup(policy.account_id, match.resource_type, resource_id)
+    except Exception:
+        verbose_proxy_logger.warning("Account resource ownership lookup failed; access denied")
+        return False
+    return ownership is not None and ownership.owner_application_id == application_id and ownership.route_id == route_id

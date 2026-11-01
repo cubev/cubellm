@@ -7,6 +7,7 @@ from pydantic import JsonValue, ValidationError
 from litellm.proxy.pass_through_endpoints.account_resources import (
     AccountResourceType,
     ResourceCreation,
+    ResourcePathMatch,
     canonical_resource_id,
     find_resource,
     resource_id_in_path,
@@ -105,8 +106,12 @@ def test_selector_definitions_are_bounded_and_strictly_typed(selector: tuple[obj
 
 def test_route_with_multiple_operations_per_resource_type_is_accepted_and_resolves_paths() -> None:
     validate_resource_types(ROUTE, True, (JOBS, FILES))
-    assert find_resource((JOBS, FILES), f"{ROUTE}/jobs/abc/cancel") == ("video-job", JOBS.item_paths[1], "abc")
-    assert find_resource((JOBS, FILES), f"{ROUTE}/files/f-1/content") == ("file", FILES.item_paths[0], "f-1")
+    assert find_resource((JOBS, FILES), f"{ROUTE}/jobs/abc/cancel") == ResourcePathMatch(
+        "video-job", JOBS.item_paths[1], "abc"
+    )
+    assert find_resource((JOBS, FILES), f"{ROUTE}/files/f-1/content") == ResourcePathMatch(
+        "file", FILES.item_paths[0], "f-1"
+    )
     assert find_resource((JOBS, FILES), f"{ROUTE}/jobs") is None
     assert find_resource((JOBS, FILES), f"{ROUTE}/files/f-1") is None
 
@@ -142,3 +147,17 @@ def test_route_rejects_resource_types_that_could_be_ambiguous_or_escape_the_rout
 def test_routes_without_resource_types_keep_their_existing_rules() -> None:
     validate_resource_types(ROUTE, False, ())
     assert find_resource((), f"{ROUTE}/jobs/abc") is None
+
+
+@pytest.mark.parametrize("segment", ("a+b", "a!b", "a$b", "", "{resource_id}", "a%2fb", "x" * 257))
+def test_non_canonical_segments_still_match_the_item_path_structurally(segment: str) -> None:
+    match: Final = find_resource((JOBS, FILES), f"{ROUTE}/jobs/{segment}/cancel")
+    assert match == ResourcePathMatch("video-job", JOBS.item_paths[1], segment)
+    assert match.resource_id is None
+
+
+@pytest.mark.parametrize(
+    "path", (f"{ROUTE}/jobs", f"{ROUTE}/jobs/abc/cancelled", f"{ROUTE}/jobs/abc/cancel/now", f"{ROUTE}/reports")
+)
+def test_paths_outside_item_shapes_are_not_resource_paths(path: str) -> None:
+    assert find_resource((JOBS, FILES), path) is None

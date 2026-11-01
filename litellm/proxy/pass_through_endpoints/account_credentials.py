@@ -13,7 +13,7 @@ from typing_extensions import Self
 
 from litellm.models.credentials import CredentialItem
 
-from .account_resources import AccountResourceType, is_resource_template, resource_id_in_path, validate_resource_types
+from .account_resources import AccountResourceType, is_resource_template, template_segment, validate_resource_types
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
 
@@ -97,7 +97,7 @@ class AccountHeaderCredential(BaseModel):
 
 
 def _covered(templates: frozenset[str], path: str) -> bool:
-    return any(resource_id_in_path(template, path) is not None for template in templates)
+    return any(template_segment(template, path) is not None for template in templates)
 
 
 def validate_account_resources(path: str, include_subpath: bool, policy: AccountHeaderCredential) -> None:

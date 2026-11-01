@@ -1,5 +1,6 @@
 import re
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from itertools import chain, combinations, product
 from typing import Annotated, Final, TypeAlias
 
@@ -47,15 +48,19 @@ def is_resource_template(path: str) -> bool:
     )
 
 
-def resource_id_in_path(template: str, path: str) -> str | None:
+def template_segment(template: str, path: str) -> str | None:
     expected: Final = template.split("/")
     actual: Final = path.split("/")
     if len(expected) != len(actual):
         return None
     if any(want != got for want, got in zip(expected, actual) if want != RESOURCE_PLACEHOLDER):
         return None
-    candidate: Final = actual[expected.index(RESOURCE_PLACEHOLDER)]
-    return candidate if canonical_resource_id(candidate) else None
+    return actual[expected.index(RESOURCE_PLACEHOLDER)]
+
+
+def resource_id_in_path(template: str, path: str) -> str | None:
+    segment: Final = template_segment(template, path)
+    return segment if segment is not None and canonical_resource_id(segment) else None
 
 
 def _templates_overlap(first: str, second: str) -> bool:
@@ -129,14 +134,25 @@ def validate_resource_types(
         raise ValueError("Account resource creation paths must not match an item path")
 
 
-def _candidates(resource_types: Sequence[AccountResourceType], path: str) -> Iterator[tuple[str, str, str]]:
+@dataclass(frozen=True, slots=True)
+class ResourcePathMatch:
+    resource_type: str
+    template: str
+    segment: str
+
+    @property
+    def resource_id(self) -> str | None:
+        return self.segment if canonical_resource_id(self.segment) else None
+
+
+def _candidates(resource_types: Sequence[AccountResourceType], path: str) -> Iterator[ResourcePathMatch]:
     for resource in resource_types:
         for template in resource.item_paths:
-            resource_id = resource_id_in_path(template, path)
-            if resource_id is not None:
-                yield resource.name, template, resource_id
+            segment = template_segment(template, path)
+            if segment is not None:
+                yield ResourcePathMatch(resource.name, template, segment)
 
 
-def find_resource(resource_types: Sequence[AccountResourceType], path: str) -> tuple[str, str, str] | None:
+def find_resource(resource_types: Sequence[AccountResourceType], path: str) -> ResourcePathMatch | None:
     matches: Final = tuple(_candidates(resource_types, path))
     return matches[0] if len(matches) == 1 else None
