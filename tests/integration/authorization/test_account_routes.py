@@ -1,8 +1,14 @@
+import json
+import os
+import subprocess
+import sys
 import uuid
 from hashlib import sha256
+from pathlib import Path
 from typing import Final
 
 import httpx
+import pytest
 from integration._support.upstream import delete_scenario, register_scenario
 from integration.cost_calculation.cost_tracking_case import JsonResponse, RoutedResponse
 from pydantic import JsonValue
@@ -311,3 +317,359 @@ def test_created_and_adopted_resources_are_reachable_only_by_the_owning_applicat
             (f"/{marker}/v1/media/jobs", {"marker": marker})
         ]
     assert _ownership_rows(account) == []
+
+
+CUBE_CONTROL_SOURCE: Final = Path(__file__).resolve().parents[3] / "cube_control" / "src"
+
+
+def _admin_origin(gateway: Gateway) -> str | None:
+    url: Final = gateway.client.base_url
+    loopback: Final = url.scheme == "http" and url.host in ("127.0.0.1", "::1") and url.port is not None
+    host: Final = f"[{url.host}]" if ":" in url.host else url.host
+    return f"http://{host}:{url.port}" if loopback else None
+
+
+def _control(arguments: list[str], payload: str | None, secrets: tuple[str, ...]) -> dict[str, JsonValue]:
+    result: Final = subprocess.run(
+        [sys.executable, "-m", "cube_control", *arguments],
+        input=payload,
+        text=True,
+        capture_output=True,
+        env=os.environ | {"PYTHONPATH": os.pathsep.join((str(CUBE_CONTROL_SOURCE), *sys.path))},
+        timeout=120,
+        check=False,
+    )
+    assert not any(secret in result.stdout + result.stderr for secret in secrets), "controller output leaked a secret"
+    return JSON_OBJECT.validate_json(result.stdout or "{}")
+
+
+def _delete_application_access(gateway: Gateway, application: str) -> None:
+    keys: Final = read_rows(
+        "SELECT token FROM \"LiteLLM_VerificationToken\" WHERE metadata->>'cube_application_id' = %s", (application,)
+    )
+    if keys:
+        gateway.post("/key/delete", {"keys": [string_value(row["token"]) for row in keys]})
+    assert (
+        read_rows(
+            "SELECT token FROM \"LiteLLM_VerificationToken\" WHERE metadata->>'cube_application_id' = %s",
+            (application,),
+        )
+        == []
+    )
+    user: Final = "cubellm-app-" + sha256(application.encode()).hexdigest()[:32]
+    if read_rows('SELECT user_id FROM "LiteLLM_UserTable" WHERE user_id = %s', (user,)):
+        response: Final = gateway.request("POST", "/user/delete", {"user_ids": [user]})
+        assert response.status_code == 200, response.text
+    assert read_rows('SELECT user_id FROM "LiteLLM_UserTable" WHERE user_id = %s', (user,)) == []
+
+
+def test_controller_provisions_resource_access_adopts_resources_and_revokes_keys(
+    gateway: Gateway, tmp_path: Path
+) -> None:
+    origin: Final = _admin_origin(gateway)
+    if origin is None:
+        pytest.skip("The controller only administers a gateway reached over a loopback HTTP origin with a port")
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-account-{marker}"
+    base: Final = f"/cube_api/integration-{marker}/media"
+    route_id: Final = f"integration-controller-{marker}"
+    provider_value: Final = f"synthetic-provider-{marker}"
+    video_id: Final = f"vid-{marker}"
+    file_id: Final = f"file-{marker}"
+    video_template: Final = base + "/videos/{resource_id}"
+    file_template: Final = base + "/files/{resource_id}"
+    items: Final[dict[str, dict[str, JsonValue]]] = {
+        f"{base}/videos/{video_id}": {"kind": "video", "id": video_id},
+        f"{base}/files/{file_id}": {"kind": "file", "id": file_id},
+    }
+    with gateway.scenario() as scenario:
+        handle: Final = register_scenario(
+            marker,
+            RoutedResponse(
+                content_type="application/x-routed",
+                routes={
+                    "POST /v1/media/jobs": JsonResponse(
+                        content_type="application/json", body={"video": {"id": video_id}}
+                    ),
+                    **{
+                        "GET /v1/media" + path.removeprefix(base): JsonResponse(
+                            content_type="application/json", body=body
+                        )
+                        for path, body in items.items()
+                    },
+                },
+            ),
+        )
+        scenario.cleanups.callback(delete_scenario, handle)
+        scenario.cleanups.callback(_delete_ownership, account)
+        admin: Final = tmp_path / "admin.env"
+        admin.write_text(f"LITELLM_MASTER_KEY={gateway.key}\n")
+        admin.chmod(0o600)
+        credential: Final = _credential(gateway, scenario, account, provider_value)
+        team: Final = scenario.team()
+        route_spec: Final = json.dumps(
+            {
+                "gateway_origin": origin,
+                "route_id": route_id,
+                "account_id": account,
+                "credential_name": credential,
+                "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+                "target": f"{handle.api_base()}/v1/media",
+                "path": base,
+                "methods": ["GET", "POST"],
+                "include_subpath": True,
+                "resource_types": [
+                    {
+                        "name": "video-job",
+                        "item_paths": [video_template],
+                        "creation": {"path": base + "/jobs", "methods": ["POST"], "id_selector": ["video", "id"]},
+                    },
+                    {"name": "file", "item_paths": [file_template]},
+                ],
+            }
+        )
+        secrets: Final = (gateway.key, provider_value)
+        created: Final = _control(["provision-account-route", "--config", str(admin)], route_spec, secrets)
+        scenario.cleanups.callback(_delete_route, gateway, route_id)
+        repeated: Final = _control(["provision-account-route", "--config", str(admin)], route_spec, secrets)
+        assert created["status"] == "created", created
+        assert (repeated["status"], repeated["fingerprint"]) == ("existing", created["fingerprint"]), repeated
+        fingerprint: Final = string_value(created["fingerprint"])
+
+        scopes: Final[tuple[tuple[str, str], ...]] = (
+            (base + "/jobs", "POST"),
+            (video_template, "GET"),
+            (file_template, "GET"),
+        )
+        delivered_keys: Final[dict[str, str]] = {}
+        states: Final[dict[str, Path]] = {}
+        for name in ("owner", "other"):
+            application: str = f"integration-{name}-{marker}"
+            state: Path = tmp_path / f"state-{name}"
+            consumer: Path = tmp_path / f"consumer-{name}"
+            spec: dict[str, JsonValue] = {
+                "application_id": application,
+                "team_id": team,
+                "gateway_origin": origin,
+                "account_routes": [
+                    {
+                        "route_id": route_id,
+                        "account_id": account,
+                        "expected_fingerprint": fingerprint,
+                        "path": path,
+                        "methods": [method],
+                    }
+                    for path, method in scopes
+                ],
+            }
+            prepared: dict[str, JsonValue] = _control(
+                ["prepare-application", "--state-directory", str(state)], json.dumps(spec), secrets
+            )
+            assert prepared["status"] == "prepared", prepared
+            scenario.cleanups.callback(_delete_application_access, gateway, application)
+            provisioned: dict[str, JsonValue] = _control(
+                ["provision-application", "--state-directory", str(state), "--config", str(admin)], None, secrets
+            )
+            assert provisioned["status"] == "provisioned", provisioned
+            delivered: dict[str, JsonValue] = _control(
+                [
+                    "deliver-application",
+                    "--state-directory",
+                    str(state),
+                    "--destination-directory",
+                    str(consumer),
+                    "--config",
+                    str(admin),
+                ],
+                None,
+                secrets,
+            )
+            assert delivered["status"] == "delivered", delivered
+            key: str = (consumer / "api-key").read_text().strip()
+            delivered_keys[name] = key
+            states[name] = state
+        owner_app: Final = f"integration-owner-{marker}"
+        other_app: Final = f"integration-other-{marker}"
+        owner_hash: Final = sha256(delivered_keys["owner"].encode()).hexdigest()
+        other_hash: Final = sha256(delivered_keys["other"].encode()).hexdigest()
+        all_secrets: Final = (*secrets, delivered_keys["owner"], delivered_keys["other"])
+
+        key_routes: Final[list[JsonValue]] = [
+            f"exact:{base}/jobs",
+            f"resource:{video_template}",
+            f"resource:{file_template}",
+        ]
+        passthrough: Final[list[JsonValue]] = [
+            f"{base}/jobs",
+            f"resource:{video_template}",
+            f"resource:{file_template}",
+        ]
+        stored_keys: Final = read_rows(
+            "SELECT token, allowed_routes, metadata->'allowed_passthrough_routes' AS passthrough,"
+            " metadata->>'cube_application_id' AS application"
+            ' FROM "LiteLLM_VerificationToken" WHERE token IN (%s, %s) ORDER BY application',
+            (owner_hash, other_hash),
+        )
+        assert stored_keys == [
+            {"token": other_hash, "allowed_routes": key_routes, "passthrough": passthrough, "application": other_app},
+            {"token": owner_hash, "allowed_routes": key_routes, "passthrough": passthrough, "application": owner_app},
+        ], stored_keys
+        raw_keys: Final = read_rows(
+            'SELECT token FROM "LiteLLM_VerificationToken" WHERE token IN (%s, %s)',
+            (delivered_keys["owner"], delivered_keys["other"]),
+        )
+        assert raw_keys == []
+        route: Final = gateway.get(f"/cube_control/account_routes/{route_id}")
+        stored_grants: Final = route["grants"]
+        assert isinstance(stored_grants, list), route
+        grants: Final = sorted(
+            (
+                string_value(grant["application_id"]),
+                string_value(grant["key_hash"]),
+                string_value(grant["account_id"]),
+                string_value(grant["path"]),
+                json.dumps(grant["methods"]),
+            )
+            for grant in map(object_value, stored_grants)
+        )
+        assert grants == sorted(
+            (application, key_hash, account, path, json.dumps([method]))
+            for application, key_hash in ((owner_app, owner_hash), (other_app, other_hash))
+            for path, method in scopes
+        ), grants
+        assert provider_value not in json.dumps(route)
+
+        _observed(gateway)
+        creation: Final = eventually(
+            lambda: gateway.request("POST", base + "/jobs", {"marker": marker}, key=delivered_keys["owner"]),
+            lambda response: response.status_code != 404,
+            seconds=60,
+        )
+        assert (creation.status_code, creation.json()) == (200, {"video": {"id": video_id}}), creation.text
+
+        def adoption(application: str) -> str:
+            return json.dumps(
+                {
+                    "gateway_origin": origin,
+                    "route_id": route_id,
+                    "expected_fingerprint": fingerprint,
+                    "resource_type": "file",
+                    "resource_id": file_id,
+                    "application_id": application,
+                }
+            )
+
+        adopted: Final = _control(["adopt-account-resource", "--config", str(admin)], adoption(owner_app), all_secrets)
+        readopted: Final = _control(
+            ["adopt-account-resource", "--config", str(admin)], adoption(owner_app), all_secrets
+        )
+        foreign: Final = _control(["adopt-account-resource", "--config", str(admin)], adoption(other_app), all_secrets)
+        assert (adopted["status"], readopted["status"], foreign["status"]) == ("adopted", "existing", "conflict")
+        assert _ownership_rows(account) == [
+            {
+                "resource_type": "file",
+                "resource_id": file_id,
+                "route_id": route_id,
+                "owner_application_id": owner_app,
+                "provenance": "adopted",
+                "creator_key_hash": None,
+            },
+            {
+                "resource_type": "video-job",
+                "resource_id": video_id,
+                "route_id": route_id,
+                "owner_application_id": owner_app,
+                "provenance": "created",
+                "creator_key_hash": owner_hash,
+            },
+        ]
+
+        owner_reads: Final = {path: gateway.request("GET", path, key=delivered_keys["owner"]) for path in items}
+        assert {path: (response.status_code, response.json()) for path, response in owner_reads.items()} == {
+            path: (200, body) for path, body in items.items()
+        }
+        assert [gateway.request("GET", path, key=delivered_keys["other"]).status_code for path in items] == [403, 403]
+        assert gateway.request("GET", f"{base}/videos/{file_id}", key=delivered_keys["owner"]).status_code == 403
+        assert gateway.request("GET", f"{base}/videos/unowned-{marker}", key=delivered_keys["owner"]).status_code == 403
+        assert gateway.request("GET", f"{base}/videos/{video_id}", key=gateway.key).status_code == 403
+
+        revoked: Final = _control(
+            ["revoke-application", "--state-directory", str(states["owner"]), "--config", str(admin)], None, all_secrets
+        )
+        assert revoked["status"] == "blocked", revoked
+        after: Final = eventually(
+            lambda: gateway.request("GET", f"{base}/videos/{video_id}", key=delivered_keys["owner"]),
+            lambda response: response.status_code in (401, 403),
+            seconds=90,
+        )
+        assert after.status_code in (401, 403), after.text
+        denied_creation: Final = gateway.request(
+            "POST", base + "/jobs", {"marker": marker}, key=delivered_keys["owner"]
+        )
+        assert denied_creation.status_code in (401, 403), denied_creation.text
+        assert gateway.request("GET", f"{base}/videos/{video_id}", key=delivered_keys["other"]).status_code == 403
+        observed_posts: Final = [object_value(value) for value in _observed(gateway)]
+        assert [(value["path"], value["body"]) for value in observed_posts] == [
+            (f"/{marker}/v1/media/jobs", {"marker": marker})
+        ]
+
+
+def _delete_route_if_present(gateway: Gateway, route_id: str) -> None:
+    if gateway.request("GET", f"/cube_control/account_routes/{route_id}").status_code != 404:
+        _delete_route(gateway, route_id)
+
+
+def _stored_route_ids() -> list[JsonValue]:
+    rows: Final = read_rows(
+        "SELECT jsonb_path_query_array(param_value, '$.pass_through_endpoints[*].id') AS ids"
+        ' FROM "LiteLLM_Config" WHERE param_name = %s',
+        ("general_settings",),
+    )
+    ids: Final = rows[0]["ids"] if rows else []
+    assert isinstance(ids, list), rows
+    return ids
+
+
+def test_deleting_a_route_never_drops_a_route_created_right_before(gateway: Gateway) -> None:
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-account-{marker}"
+    handle: Final = register_scenario(marker, JsonResponse(content_type="application/json", body={"quota": 7}))
+    with gateway.scenario() as scenario:
+        scenario.cleanups.callback(delete_scenario, handle)
+        credential: Final = _credential(gateway, scenario, account, f"synthetic-provider-{marker}")
+
+        def command(name: str) -> dict[str, JsonValue]:
+            return {
+                "route": {
+                    "id": f"integration-{name}-{marker}",
+                    "path": f"/cube_api/integration-{marker}/{name}",
+                    "target": f"{handle.api_base()}/v1/{name}",
+                    "methods": ["GET"],
+                    "account_credential": {
+                        "account_id": account,
+                        "credential_name": credential,
+                        "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+                    },
+                }
+            }
+
+        older_id: Final = f"integration-older-{marker}"
+        gateway.post("/cube_control/account_routes", command("older"))
+        scenario.cleanups.callback(_delete_route_if_present, gateway, older_id)
+        view: Final = eventually(
+            lambda: gateway.request("GET", "/config/field/info", params={"field_name": "pass_through_endpoints"}),
+            lambda response: response.status_code == 200 and older_id in response.text,
+            seconds=60,
+        )
+        assert view.status_code == 200 and older_id in view.text, view.text
+        kept: Final = gateway.post("/cube_control/account_routes", command("newer"))
+        scenario.cleanups.callback(_delete_route_if_present, gateway, f"integration-newer-{marker}")
+        assert kept["created"] is True
+        deleted: Final = gateway.request("DELETE", "/config/pass_through_endpoint", params={"endpoint_id": older_id})
+        assert deleted.status_code == 200, deleted.text
+        ids: Final = _stored_route_ids()
+        assert f"integration-newer-{marker}" in ids, ids
+        assert older_id not in ids, ids
+        assert gateway.get(f"/cube_control/account_routes/integration-newer-{marker}")["route_id"] == (
+            f"integration-newer-{marker}"
+        )

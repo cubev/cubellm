@@ -5,7 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from itertools import chain
 from types import MappingProxyType
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, Protocol, TypeAlias
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError, model_validator
@@ -288,3 +288,55 @@ async def create_account_route(
         ):
             raise RuntimeError("Account route transaction verification failed")
         return AccountRouteReceipt(created=True, route=verified)
+
+
+WRITE_ROUTES_SQL: Final = """UPDATE "LiteLLM_Config" SET "param_value" = jsonb_set(
+    current.settings, ARRAY['pass_through_endpoints'], $1::jsonb, true
+) FROM (
+    SELECT CASE jsonb_typeof("param_value") WHEN 'string' THEN ("param_value" #>> '{}')::jsonb ELSE "param_value" END
+        AS settings
+    FROM "LiteLLM_Config" WHERE "param_name" = $2
+) AS current WHERE "LiteLLM_Config"."param_name" = $2"""
+DELETE_ROUTE_OWNERSHIP_SQL: Final = 'DELETE FROM "LiteLLM_AccountResourceOwnership" WHERE "route_id" = $1'
+
+StoredRoutes: TypeAlias = tuple[Mapping[str, JsonValue], ...]
+
+
+class RoutesPlan(Protocol):
+    def __call__(self, routes: StoredRoutes, /) -> StoredRoutes | GrantFailure: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RoutesMutation:
+    before: Mapping[str, JsonValue]
+    after: Mapping[str, JsonValue]
+
+
+async def mutate_settings_routes(
+    database: GrantDatabase, plan: RoutesPlan, removed_route_id: str | None = None
+) -> RoutesMutation | GrantFailure:
+    async with database.tx() as transaction:
+        _ = await transaction.execute_raw(INSERT_SETTINGS_SQL, "general_settings")
+        settings: Final = settings_from_rows(await transaction.query_raw(LOCK_SETTINGS_SQL, "general_settings"))
+        if isinstance(settings, GrantFailure):
+            return settings
+        current: Final = _routes(settings)
+        if isinstance(current, GrantFailure):
+            return current
+        proposed: Final = plan(current)
+        if isinstance(proposed, GrantFailure):
+            return proposed
+        planned: Final = _ROUTES.validate_python(proposed)
+        written: Final = await transaction.execute_raw(
+            WRITE_ROUTES_SQL, _ROUTES.dump_json(planned).decode(), "general_settings"
+        )
+        if written != 1:
+            raise RuntimeError("Pass-through route update did not change exactly one configuration row")
+        stored: Final = settings_from_rows(await transaction.query_raw(READ_SETTINGS_SQL, "general_settings"))
+        if isinstance(stored, GrantFailure) or _routes(stored) != planned:
+            raise RuntimeError("Pass-through route update verification failed")
+        if any(key != "pass_through_endpoints" and stored.get(key) != value for key, value in settings.items()):
+            raise RuntimeError("Pass-through route update changed other settings")
+        if removed_route_id is not None:
+            _ = await transaction.execute_raw(DELETE_ROUTE_OWNERSHIP_SQL, removed_route_id)
+        return RoutesMutation(before=settings, after=stored)

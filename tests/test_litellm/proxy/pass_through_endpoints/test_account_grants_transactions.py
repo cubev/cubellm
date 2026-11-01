@@ -49,14 +49,29 @@ from litellm.proxy.pass_through_endpoints.account_grants import (
 )
 from litellm.proxy.pass_through_endpoints.account_routes import (
     APPEND_ROUTE_SQL,
+    DELETE_ROUTE_OWNERSHIP_SQL,
     INSERT_SETTINGS_SQL,
+    WRITE_ROUTES_SQL,
     AccountRouteCreateCommand,
     AccountRouteDefinition,
     AccountRouteReceipt,
+    RoutesMutation,
     create_account_route,
+    mutate_settings_routes,
 )
+from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+    InitPassThroughEndpointHelpers,
+    RoutesPublisher,
+    pass_through_settings_database,
+    settings_routes_publisher,
+)
+from litellm.proxy.pass_through_endpoints.pass_through_endpoints import router as passthrough_router
 
 DSN: Final = os.environ.get("CUBELLM_ACCOUNT_GRANTS_TEST_DATABASE_URL", "")
+OWNERSHIP_MIGRATION: Final = (
+    Path(__file__).resolve().parents[4]
+    / "litellm-proxy-extras/litellm_proxy_extras/migrations/20261101120000_add_account_resource_ownership/migration.sql"
+)
 CONFIG: Final = {
     "unrelated": {"keep": "inert-private-value"},
     "pass_through_endpoints": [
@@ -77,7 +92,15 @@ CONFIG: Final = {
 
 
 def postgres_query(query: str) -> sql.SQL:
-    if query not in {LOCK_SETTINGS_SQL, READ_SETTINGS_SQL, WRITE_SETTINGS_SQL, INSERT_SETTINGS_SQL, APPEND_ROUTE_SQL}:
+    if query not in {
+        LOCK_SETTINGS_SQL,
+        READ_SETTINGS_SQL,
+        WRITE_SETTINGS_SQL,
+        INSERT_SETTINGS_SQL,
+        APPEND_ROUTE_SQL,
+        WRITE_ROUTES_SQL,
+        DELETE_ROUTE_OWNERSHIP_SQL,
+    }:
         raise ValueError("Unexpected SQL outside the account configuration transaction contract")
     marked: Final = re.sub(r"\$(\d+)", r"%(p\1)s", query)
     return sql.SQL(cast(LiteralString, marked))  # cast-ok: allowlisted SQL with only parameter markers changed
@@ -93,10 +116,12 @@ class PostgresTransaction:
         connection: psycopg.AsyncConnection[tuple[object, ...]],
         entered: asyncio.Event | None,
         release: asyncio.Event | None,
+        alter_readback: bool = False,
     ) -> None:
         self.connection: Final = connection
         self.entered: Final = entered
         self.release: Final = release
+        self.alter_readback: Final = alter_readback
 
     async def query_raw(self, query: str, *parameters: str) -> object:
         cursor: Final = await self.connection.execute(postgres_query(query), numbered(parameters))
@@ -104,6 +129,8 @@ class PostgresTransaction:
         if query == LOCK_SETTINGS_SQL and self.entered is not None and self.release is not None:
             self.entered.set()
             await self.release.wait()
+        if query == READ_SETTINGS_SQL and self.alter_readback:
+            return tuple({"param_value": {**cast(dict[str, object], row[0]), "unrelated": "altered"}} for row in rows)
         return tuple({"param_value": row[0]} for row in rows)
 
     async def execute_raw(self, query: str, *parameters: str) -> int:
@@ -111,11 +138,22 @@ class PostgresTransaction:
         return cursor.rowcount
 
 
+async def awaited(operation: Awaitable[object]) -> object:
+    return await operation
+
+
 class PostgresDatabase:
-    def __init__(self, schema: str, entered: asyncio.Event | None = None, release: asyncio.Event | None = None) -> None:
+    def __init__(
+        self,
+        schema: str,
+        entered: asyncio.Event | None = None,
+        release: asyncio.Event | None = None,
+        alter_readback: bool = False,
+    ) -> None:
         self.schema: Final = schema
         self.entered: Final = entered
         self.release: Final = release
+        self.alter_readback: Final = alter_readback
         self.connections: Final[asyncio.Queue[int]] = asyncio.Queue()
 
     @asynccontextmanager
@@ -124,7 +162,7 @@ class PostgresDatabase:
         async with connection:
             await connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
             self.connections.put_nowait(connection.info.backend_pid)
-            yield PostgresTransaction(connection, self.entered, self.release)
+            yield PostgresTransaction(connection, self.entered, self.release, self.alter_readback)
 
 
 class ManagementContractTransport(httpx.BaseTransport):
@@ -206,6 +244,11 @@ class AccountGrantTransactions(unittest.IsolatedAsyncioTestCase):
         )
         await self.connection.execute(
             'INSERT INTO "LiteLLM_Config" VALUES (%s, %s)', ("general_settings", Jsonb(CONFIG))
+        )
+        await self.connection.execute(
+            sql.SQL(
+                cast(LiteralString, OWNERSHIP_MIGRATION.read_text())
+            )  # cast-ok: the repository's own migration file
         )
         self.database = PostgresDatabase(self.schema)
         descriptor: Final = await read_account_route(self.database, "fixture-route")
@@ -754,3 +797,280 @@ class AccountGrantTransactions(unittest.IsolatedAsyncioTestCase):
             tuple((grant.application_id, grant.key_hash, grant.methods) for grant in descriptor.grants),
             ((spec.application_id, bridge.key_hash, ("GET",)),),
         )
+
+    def settings_application(
+        self, role: LitellmUserRoles = LitellmUserRoles.PROXY_ADMIN
+    ) -> tuple[FastAPI, asyncio.Queue[RoutesMutation]]:
+        app: Final = FastAPI()
+        app.include_router(passthrough_router)
+        published: Final[asyncio.Queue[RoutesMutation]] = asyncio.Queue()
+
+        async def caller() -> UserAPIKeyAuth:
+            return UserAPIKeyAuth(user_role=role)
+
+        def database() -> GrantDatabase:
+            return self.database
+
+        async def publish(mutation: RoutesMutation, user_api_key_dict: UserAPIKeyAuth, /) -> None:
+            published.put_nowait(mutation)
+
+        def publisher() -> RoutesPublisher:
+            return publish
+
+        app.dependency_overrides[user_api_key_auth] = caller
+        app.dependency_overrides[pass_through_settings_database] = database
+        app.dependency_overrides[settings_routes_publisher] = publisher
+        return app, published
+
+    async def settings_row(self) -> object:
+        row: Final = await (
+            await self.connection.execute(
+                'SELECT param_value FROM "LiteLLM_Config" WHERE param_name = %s', ("general_settings",)
+            )
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    async def test_deleting_a_route_keeps_a_route_stored_after_the_settings_view_was_loaded(self) -> None:
+        created: Final = await create_account_route(self.database, self.route_command())
+        self.assertIsInstance(created, AccountRouteReceipt)
+        app, published = self.settings_application()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            deleted = await client.delete("/config/pass_through_endpoint", params={"endpoint_id": "fixture-route"})
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(tuple(route["id"] for route in await self.stored_routes()), ("managed-route",))
+        stored: Final = await self.settings_row()
+        assert isinstance(stored, dict)
+        self.assertEqual(stored["unrelated"], {"keep": "inert-private-value"})
+        self.assertEqual(published.get_nowait().after, stored)
+
+    async def test_http_route_writers_preserve_other_routes_and_reject_conflicting_ids(self) -> None:
+        app, published = self.settings_application()
+        route: Final[dict[str, JsonValue]] = {
+            "id": "written-route",
+            "path": "/written/quota",
+            "target": "https://vendor.example/written",
+            "auth": False,
+        }
+        before: Final = await self.stored_routes()
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                created = await client.post("/config/pass_through_endpoint", json=route)
+                duplicate = await client.post("/config/pass_through_endpoint", json=route)
+                updated = await client.post(
+                    "/config/pass_through_endpoint/written-route",
+                    json={"path": "/written/quota", "target": "https://vendor.example/changed"},
+                )
+                renamed_onto_other = await client.post(
+                    "/config/pass_through_endpoint/written-route",
+                    json={"id": "fixture-route", "path": "/written/quota", "target": "https://vendor.example/changed"},
+                )
+                missing = await client.post(
+                    "/config/pass_through_endpoint/absent-route",
+                    json={"path": "/absent", "target": "https://x.example"},
+                )
+        finally:
+            InitPassThroughEndpointHelpers.remove_endpoint_routes("written-route")
+        self.assertEqual((created.status_code, duplicate.status_code), (200, 409), created.text)
+        self.assertEqual((updated.status_code, renamed_onto_other.status_code), (200, 409), updated.text)
+        self.assertEqual(missing.status_code, 404, missing.text)
+        routes: Final = await self.stored_routes()
+        self.assertEqual(routes[0], before[0])
+        self.assertEqual(
+            (routes[1]["id"], routes[1]["path"], routes[1]["target"]),
+            ("written-route", "/written/quota", "https://vendor.example/changed"),
+        )
+        self.assertEqual(len(routes), 2)
+        stored: Final = await self.settings_row()
+        assert isinstance(stored, dict)
+        self.assertEqual(stored["unrelated"], {"keep": "inert-private-value"})
+        self.assertEqual(published.qsize(), 2)
+
+    async def test_non_admin_route_writes_change_neither_the_database_nor_the_runtime_routes(self) -> None:
+        before: Final = await self.settings_row()
+        for role in (LitellmUserRoles.INTERNAL_USER, LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY):
+            app, published = self.settings_application(role)
+            route_count = len(app.routes)
+            with self.subTest(role=role):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                    responses = (
+                        await client.post(
+                            "/config/pass_through_endpoint",
+                            json={"id": "intruder", "path": "/intruder", "target": "https://vendor.example/x"},
+                        ),
+                        await client.post(
+                            "/config/pass_through_endpoint/fixture-route",
+                            json={"path": "/fixture/quota", "target": "https://x.example"},
+                        ),
+                        await client.delete("/config/pass_through_endpoint", params={"endpoint_id": "fixture-route"}),
+                    )
+                self.assertEqual(tuple(response.status_code for response in responses), (400, 400, 400))
+                self.assertEqual(len(app.routes), route_count)
+                self.assertIsNone(InitPassThroughEndpointHelpers.get_registered_pass_through_route(route="/intruder"))
+                self.assertEqual(published.qsize(), 0)
+        self.assertEqual(await self.settings_row(), before)
+
+    async def test_a_failed_route_write_rolls_back_and_changes_no_runtime_state(self) -> None:
+        await self.connection.execute(
+            "ALTER TABLE \"LiteLLM_Config\" ADD CHECK (jsonb_array_length(param_value->'pass_through_endpoints') <= 1)"
+        )
+        before: Final = await self.settings_row()
+        app, published = self.settings_application()
+        route_count: Final = len(app.routes)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            with self.assertRaises(psycopg.errors.CheckViolation):
+                await client.post(
+                    "/config/pass_through_endpoint",
+                    json={"id": "second-route", "path": "/second", "target": "https://vendor.example/second"},
+                )
+        self.assertIsNone(InitPassThroughEndpointHelpers.get_registered_pass_through_route(route="/second"))
+        self.assertEqual(len(app.routes), route_count)
+        self.assertEqual(published.qsize(), 0)
+        self.assertEqual(await self.settings_row(), before)
+
+    async def test_deleting_a_route_removes_only_its_resource_ownership(self) -> None:
+        await self.connection.execute(
+            'INSERT INTO "LiteLLM_AccountResourceOwnership" (account_id, resource_type, resource_id, route_id,'
+            " owner_application_id, provenance, creator_key_hash) VALUES"
+            " ('fixture-account', 'job', 'deleted-1', 'fixture-route', 'app', 'adopted', NULL),"
+            " ('fixture-account', 'job', 'kept-1', 'other-route', 'app', 'adopted', NULL)"
+        )
+        deleted: Final = await mutate_settings_routes(
+            self.database,
+            lambda routes: tuple(route for route in routes if route.get("id") != "fixture-route"),
+            "fixture-route",
+        )
+        self.assertIsInstance(deleted, RoutesMutation)
+        remaining: Final = await (
+            await self.connection.execute(
+                'SELECT resource_id FROM "LiteLLM_AccountResourceOwnership" ORDER BY resource_id'
+            )
+        ).fetchall()
+        self.assertEqual(remaining, [("kept-1",)])
+        self.assertEqual(await self.stored_routes(), ())
+
+    async def test_a_plan_failure_writes_nothing(self) -> None:
+        before: Final = await self.settings_row()
+        result: Final = await mutate_settings_routes(self.database, lambda routes: GrantFailure("not_found"))
+        self.assertEqual(result, GrantFailure("not_found"))
+        self.assertEqual(await self.settings_row(), before)
+
+    async def contend(
+        self,
+        holder: Callable[[GrantDatabase], Awaitable[object]],
+        waiter: Callable[[GrantDatabase], Awaitable[object]],
+    ) -> tuple[object, object]:
+        entered: Final = asyncio.Event()
+        release: Final = asyncio.Event()
+        waiting_database: Final = PostgresDatabase(self.schema)
+        first: Final = asyncio.create_task(awaited(holder(PostgresDatabase(self.schema, entered, release))))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        second: Final = asyncio.create_task(awaited(waiter(waiting_database)))
+        try:
+            backend: Final = await asyncio.wait_for(waiting_database.connections.get(), timeout=5)
+            for _ in range(100):
+                self.assertFalse(second.done(), "The second writer passed a row still locked by the first one")
+                if await self.backend_wait_event(backend) == ("Lock",):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("The second writer did not enter a PostgreSQL lock wait")
+        finally:
+            release.set()
+            outcomes: Final = await asyncio.gather(first, second)
+        return outcomes[0], outcomes[1]
+
+    def delete_fixture_route(self, database: GrantDatabase) -> Awaitable[RoutesMutation | GrantFailure]:
+        return mutate_settings_routes(
+            database,
+            lambda routes: tuple(route for route in routes if route.get("id") != "fixture-route"),
+            "fixture-route",
+        )
+
+    def add_extra_route(self, database: GrantDatabase) -> Awaitable[RoutesMutation | GrantFailure]:
+        extra: Final[dict[str, JsonValue]] = {
+            "id": "extra-route",
+            "path": "/extra",
+            "target": "https://vendor.example/x",
+        }
+        return mutate_settings_routes(database, lambda routes: (*routes, extra))
+
+    async def test_a_route_write_waiting_on_route_creation_keeps_the_created_route(self) -> None:
+        created, deleted = await self.contend(
+            lambda database: create_account_route(database, self.route_command()), self.delete_fixture_route
+        )
+        self.assertIsInstance(created, AccountRouteReceipt)
+        self.assertIsInstance(deleted, RoutesMutation)
+        self.assertEqual(tuple(route["id"] for route in await self.stored_routes()), ("managed-route",))
+
+    async def test_route_creation_waiting_on_a_route_write_appends_after_it(self) -> None:
+        deleted, created = await self.contend(
+            self.delete_fixture_route, lambda database: create_account_route(database, self.route_command())
+        )
+        self.assertIsInstance(deleted, RoutesMutation)
+        self.assertIsInstance(created, AccountRouteReceipt)
+        self.assertEqual(tuple(route["id"] for route in await self.stored_routes()), ("managed-route",))
+
+    async def test_a_route_write_waiting_on_a_grant_keeps_the_grant(self) -> None:
+        granted, added = await self.contend(
+            lambda database: append_account_grant(database, "fixture-route", self.command()), self.add_extra_route
+        )
+        self.assertIsInstance(granted, AccountGrantReceipt)
+        self.assertIsInstance(added, RoutesMutation)
+        await self.assert_grant_and_extra_route()
+
+    async def test_a_grant_waiting_on_a_route_write_is_stored_on_the_current_row(self) -> None:
+        added, granted = await self.contend(
+            self.add_extra_route, lambda database: append_account_grant(database, "fixture-route", self.command())
+        )
+        self.assertIsInstance(added, RoutesMutation)
+        self.assertIsInstance(granted, AccountGrantReceipt)
+        await self.assert_grant_and_extra_route()
+
+    async def assert_grant_and_extra_route(self) -> None:
+        routes: Final = await self.stored_routes()
+        self.assertEqual(tuple(route["id"] for route in routes), ("fixture-route", "extra-route"))
+        current: Final = await read_account_route(self.database, "fixture-route")
+        assert isinstance(current, AccountRouteDescriptor)
+        self.assertEqual(
+            tuple((grant.application_id, grant.key_hash, grant.methods) for grant in current.grants),
+            (("fixture-app", "a" * 64, ("GET",)),),
+        )
+
+    async def test_an_altered_readback_rolls_back_the_route_write(self) -> None:
+        before: Final = await self.settings_row()
+        with self.assertRaises(RuntimeError):
+            await self.add_extra_route(PostgresDatabase(self.schema, alter_readback=True))
+        self.assertEqual(await self.settings_row(), before)
+
+    async def test_a_failed_ownership_delete_rolls_back_the_route_deletion(self) -> None:
+        await self.connection.execute('DROP TABLE "LiteLLM_AccountResourceOwnership"')
+        before: Final = await self.settings_row()
+        with self.assertRaises(psycopg.errors.UndefinedTable):
+            await self.delete_fixture_route(self.database)
+        self.assertEqual(await self.settings_row(), before)
+
+    async def test_updating_an_account_route_keeps_its_credential_policy(self) -> None:
+        before: Final = await self.stored_routes()
+        app, published = self.settings_application()
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                updated = await client.post(
+                    "/config/pass_through_endpoint/fixture-route",
+                    json={"path": "/fixture/quota", "target": "https://vendor.example/changed"},
+                )
+        finally:
+            InitPassThroughEndpointHelpers.remove_endpoint_routes("fixture-route")
+        self.assertEqual(updated.status_code, 200, updated.text)
+        after: Final = await self.stored_routes()
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0]["target"], "https://vendor.example/changed")
+        self.assertEqual(
+            AccountHeaderCredential.model_validate(after[0]["account_credential"]),
+            AccountHeaderCredential.model_validate(before[0]["account_credential"]),
+        )
+        self.assertEqual(
+            {key: value for key, value in after[0].items() if key not in ("target", "account_credential")},
+            {key: value for key, value in before[0].items() if key not in ("target", "account_credential")}
+            | {key: value for key, value in after[0].items() if key not in before[0]},
+        )
+        self.assertEqual(published.qsize(), 1)

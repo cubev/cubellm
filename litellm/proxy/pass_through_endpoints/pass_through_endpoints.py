@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import count, groupby
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Any, Final, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlencode, urlparse
 
 import httpx
@@ -26,7 +26,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.websockets import WebSocketState
 from websockets.asyncio.client import connect
@@ -68,9 +68,11 @@ from litellm.llms.base_llm.managed_resources.utils import (
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 from litellm.passthrough import BasePassthroughUtils
 from litellm.proxy._types import (
+    CommonProxyErrors,
     ConfigFieldInfo,
     ConfigFieldUpdate,
     LiteLLMRoutes,
+    LitellmUserRoles,
     PassThroughEndpointResponse,
     PassThroughGenericEndpoint,
     ProxyException,
@@ -105,7 +107,7 @@ from litellm.proxy.litellm_pre_call_utils import (
     _get_dynamic_logging_metadata,  # pyright: ignore[reportPrivateUsage]  # shared proxy helper, same import style as _read_request_body above
 )
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
-from litellm.proxy.utils import normalize_route_for_root_path
+from litellm.proxy.utils import invalidate_config_param, normalize_route_for_root_path
 from litellm.repositories.team_repository import TeamRepository
 from litellm.secret_managers.main import get_secret_str
 from litellm.types import utils as types_utils
@@ -131,6 +133,7 @@ from .account_credentials import (
     validate_account_resources,
     validate_account_route,
 )
+from .account_grants import GrantDatabase, GrantFailure
 from .account_ownership import (
     capture_created_resources,
     proxy_ownership_lookup,
@@ -138,6 +141,7 @@ from .account_ownership import (
     resource_access_allowed,
     resource_path_match,
 )
+from .account_routes import RoutesMutation, RoutesPlan, mutate_settings_routes
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
@@ -3808,19 +3812,165 @@ async def get_pass_through_endpoints(
     return PassThroughEndpointResponse(endpoints=pass_through_endpoints)
 
 
-@router.post(
-    "/config/pass_through_endpoint/{endpoint_id}",
-    dependencies=[Depends(user_api_key_auth)],
-)
-async def update_pass_through_endpoints(
-    endpoint_id: str,
-    data: PassThroughGenericEndpoint,
-    request: Request,
-    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
-):
-    """
-    Update a pass-through endpoint by ID.
-    """
+_ENDPOINT_JSON: Final[TypeAdapter[dict[str, JsonValue]]] = TypeAdapter(dict[str, JsonValue])
+
+
+def pass_through_settings_database() -> GrantDatabase | None:
+    from litellm.proxy import proxy_server
+
+    if proxy_server.prisma_client is None or proxy_server.proxy_config.settings.owned_by_config(
+        "pass_through_endpoints"
+    ):
+        return None
+    return cast(  # cast-ok: PrismaClient provides the tx() protocol used for account configuration
+        GrantDatabase, proxy_server.prisma_client
+    )
+
+
+SettingsDatabase: TypeAlias = Annotated[GrantDatabase | None, Depends(pass_through_settings_database)]
+
+
+def _stored_routes(settings: Mapping[str, JsonValue]) -> tuple[Mapping[str, JsonValue], ...]:
+    value: Final = settings.get("pass_through_endpoints")
+    return tuple(entry for entry in value if isinstance(entry, Mapping)) if isinstance(value, list) else ()
+
+
+def _route_with_id(routes: tuple[Mapping[str, JsonValue], ...], endpoint_id: str) -> Mapping[str, JsonValue] | None:
+    matches: Final = tuple(route for route in routes if route.get("id") == endpoint_id)
+    return matches[0] if len(matches) == 1 else None
+
+
+class RoutesPublisher(Protocol):
+    async def __call__(self, mutation: RoutesMutation, user_api_key_dict: UserAPIKeyAuth, /) -> None: ...
+
+
+async def publish_settings_routes(mutation: RoutesMutation, user_api_key_dict: UserAPIKeyAuth, /) -> None:
+    from litellm.proxy.proxy_server import create_config_audit_log, proxy_config
+
+    await invalidate_config_param("general_settings")
+    proxy_config.settings.apply_db_row("general_settings", mutation.after)
+    asyncio.create_task(
+        create_config_audit_log(
+            "general_settings", "updated", dict(mutation.before), dict(mutation.after), user_api_key_dict
+        )
+    )
+
+
+def settings_routes_publisher() -> RoutesPublisher:
+    return publish_settings_routes
+
+
+SettingsPublisher: TypeAlias = Annotated[RoutesPublisher | None, Depends(settings_routes_publisher)]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredRoutes:
+    database: GrantDatabase
+    publish: RoutesPublisher
+
+
+async def _commit_stored_routes(
+    stored: StoredRoutes,
+    plan: RoutesPlan,
+    user_api_key_dict: UserAPIKeyAuth,
+    removed_route_id: str | None = None,
+) -> RoutesMutation | GrantFailure:
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(status_code=400, detail={"error": CommonProxyErrors.not_allowed_access.value})
+    mutation: Final = await mutate_settings_routes(stored.database, plan, removed_route_id)
+    if isinstance(mutation, GrantFailure):
+        return mutation
+    await stored.publish(mutation, user_api_key_dict)
+    return mutation
+
+
+async def _create_stored_endpoint(
+    stored_routes: StoredRoutes, data_dict: Mapping[str, JsonValue], user_api_key_dict: UserAPIKeyAuth
+) -> None:
+    def plan(routes: tuple[Mapping[str, JsonValue], ...]) -> tuple[Mapping[str, JsonValue], ...] | GrantFailure:
+        if any(route.get("id") == data_dict.get("id") for route in routes):
+            return GrantFailure("conflict")
+        return (*routes, data_dict)
+
+    created: Final = await _commit_stored_routes(stored_routes, plan, user_api_key_dict)
+    if isinstance(created, GrantFailure):
+        raise HTTPException(
+            status_code=409 if created.kind == "conflict" else 400,
+            detail={"error": "A pass-through endpoint with this ID already exists"}
+            if created.kind == "conflict"
+            else {"error": "Stored pass-through endpoints are invalid"},
+        )
+
+
+async def _update_stored_endpoint(
+    stored_routes: StoredRoutes, endpoint_id: str, data: PassThroughGenericEndpoint, user_api_key_dict: UserAPIKeyAuth
+) -> PassThroughGenericEndpoint:
+    # Only fields the caller sent are merged, so omitted fields keep their stored value
+    update_data: Final = _ENDPOINT_JSON.validate_python(
+        data.model_dump(mode="json", exclude_unset=True, exclude_none=True, exclude={"is_from_config"})
+    )
+
+    def plan(routes: tuple[Mapping[str, JsonValue], ...]) -> tuple[Mapping[str, JsonValue], ...] | GrantFailure:
+        existing: Final = _route_with_id(routes, endpoint_id)
+        if existing is None:
+            return GrantFailure("not_found")
+        new_id: Final = update_data.get("id", endpoint_id)
+        if new_id != endpoint_id and any(route.get("id") == new_id for route in routes):
+            return GrantFailure("conflict")
+        merged: Final = {
+            **PassThroughGenericEndpoint.model_validate(existing).model_dump(mode="json", exclude={"is_from_config"}),
+            **update_data,
+            "id": update_data.get("id", existing.get("id")),
+        }
+        replacement: Final = PassThroughGenericEndpoint.model_validate(merged).model_dump(
+            mode="json", exclude={"is_from_config"}
+        )
+        return tuple(replacement if route.get("id") == endpoint_id else route for route in routes)
+
+    updated: Final = await _commit_stored_routes(stored_routes, plan, user_api_key_dict)
+    if isinstance(updated, GrantFailure):
+        raise HTTPException(
+            status_code={"not_found": 404, "conflict": 409}.get(updated.kind, 400),
+            detail={
+                "not_found": {"error": f"Endpoint with ID '{endpoint_id}' not found"},
+                "conflict": {"error": "A pass-through endpoint with this ID already exists"},
+            }.get(updated.kind, {"error": "Stored pass-through endpoints are invalid"}),
+        )
+    requested_id: Final = update_data.get("id")
+    stored: Final = _route_with_id(
+        _stored_routes(updated.after), requested_id if isinstance(requested_id, str) else endpoint_id
+    )
+    if stored is None:
+        raise HTTPException(status_code=500, detail={"error": "Updated pass-through endpoint could not be read back"})
+    return PassThroughGenericEndpoint.model_validate(stored)
+
+
+async def _delete_stored_endpoint(
+    stored_routes: StoredRoutes, endpoint_id: str, user_api_key_dict: UserAPIKeyAuth
+) -> PassThroughEndpointResponse:
+    def plan(routes: tuple[Mapping[str, JsonValue], ...]) -> tuple[Mapping[str, JsonValue], ...] | GrantFailure:
+        if _route_with_id(routes, endpoint_id) is None:
+            return GrantFailure("not_found")
+        return tuple(route for route in routes if route.get("id") != endpoint_id)
+
+    deleted: Final = await _commit_stored_routes(stored_routes, plan, user_api_key_dict, endpoint_id)
+    if isinstance(deleted, GrantFailure):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"Endpoint with ID '{endpoint_id}' was not found in pass-through endpoint list."}
+            if deleted.kind == "not_found"
+            else {"error": "Stored pass-through endpoints are invalid"},
+        )
+    removed: Final = _route_with_id(_stored_routes(deleted.before), endpoint_id)
+    InitPassThroughEndpointHelpers.remove_endpoint_routes(endpoint_id)
+    return PassThroughEndpointResponse(
+        endpoints=[PassThroughGenericEndpoint.model_validate(removed)] if removed is not None else []
+    )
+
+
+async def _update_endpoint_in_settings_view(
+    endpoint_id: str, data: PassThroughGenericEndpoint, user_api_key_dict: UserAPIKeyAuth
+) -> PassThroughGenericEndpoint:
     from litellm.proxy.proxy_server import (
         get_config_general_settings,
         update_config_general_settings,
@@ -3892,9 +4042,6 @@ async def update_pass_through_endpoints(
     # Update the list
     pass_through_endpoint_data[endpoint_index] = endpoint_dict
 
-    # Remove old routes from registry before they get re-registered
-    InitPassThroughEndpointHelpers.remove_endpoint_routes(endpoint_id)
-
     ## Update db
     updated_data: Final = ConfigFieldUpdate(
         field_name="pass_through_endpoints",
@@ -3903,6 +4050,36 @@ async def update_pass_through_endpoints(
     )
 
     await update_config_general_settings(data=updated_data, user_api_key_dict=user_api_key_dict)
+    return updated_endpoint
+
+
+@router.post(
+    "/config/pass_through_endpoint/{endpoint_id}",
+    dependencies=[Depends(user_api_key_auth)],
+)
+async def update_pass_through_endpoints(
+    endpoint_id: str,
+    data: PassThroughGenericEndpoint,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    settings_database: SettingsDatabase = None,
+    settings_publisher: SettingsPublisher = None,
+):
+    """
+    Update a pass-through endpoint by ID.
+    """
+    updated_endpoint: Final = await (
+        _update_stored_endpoint(
+            StoredRoutes(settings_database, settings_publisher or publish_settings_routes),
+            endpoint_id,
+            data,
+            user_api_key_dict,
+        )
+        if settings_database is not None
+        else _update_endpoint_in_settings_view(endpoint_id, data, user_api_key_dict)
+    )
+    # Remove old routes from registry before they get re-registered
+    InitPassThroughEndpointHelpers.remove_endpoint_routes(endpoint_id)
 
     # Re-register the route with updated headers
     _custom_headers: dict | None = updated_endpoint.headers or {}
@@ -3957,19 +4134,9 @@ async def update_pass_through_endpoints(
     return PassThroughEndpointResponse(endpoints=[updated_endpoint] if updated_endpoint else [])
 
 
-@router.post(
-    "/config/pass_through_endpoint",
-    dependencies=[Depends(user_api_key_auth)],
-)
-async def create_pass_through_endpoints(
-    data: PassThroughGenericEndpoint,
-    request: Request,
-    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
-):
-    """
-    Create new pass-through endpoint
-    """
-    from litellm._uuid import uuid
+async def _create_endpoint_in_settings_view(
+    data_dict: Mapping[str, JsonValue], user_api_key_dict: UserAPIKeyAuth
+) -> None:
     from litellm.proxy.proxy_server import (
         get_config_general_settings,
         update_config_general_settings,
@@ -3984,16 +4151,10 @@ async def create_pass_through_endpoints(
     except Exception:
         response = ConfigFieldInfo(field_name="pass_through_endpoints", field_value=None)
 
-    ## Auto-generate ID if not provided
-    # Exclude is_from_config as it's a response-only field (computed at read time)
-    data_dict: Final = data.model_dump(exclude={"is_from_config"})
-    if data_dict.get("id") is None:
-        data_dict["id"] = str(uuid.uuid4())
-
     if response.field_value is None:
-        response.field_value = [data_dict]
+        response.field_value = [dict(data_dict)]
     elif isinstance(response.field_value, list):
-        response.field_value.append(data_dict)
+        response.field_value.append(dict(data_dict))
 
     ## Update db
     updated_data: Final = ConfigFieldUpdate(
@@ -4002,6 +4163,35 @@ async def create_pass_through_endpoints(
         config_type="general_settings",
     )
     await update_config_general_settings(data=updated_data, user_api_key_dict=user_api_key_dict)
+
+
+@router.post(
+    "/config/pass_through_endpoint",
+    dependencies=[Depends(user_api_key_auth)],
+)
+async def create_pass_through_endpoints(
+    data: PassThroughGenericEndpoint,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    settings_database: SettingsDatabase = None,
+    settings_publisher: SettingsPublisher = None,
+):
+    """
+    Create new pass-through endpoint
+    """
+    from litellm._uuid import uuid
+
+    ## Auto-generate ID if not provided
+    # Exclude is_from_config as it's a response-only field (computed at read time)
+    dumped: Final = _ENDPOINT_JSON.validate_python(data.model_dump(mode="json", exclude={"is_from_config"}))
+    data_dict: Final = MappingProxyType({**dumped, "id": dumped.get("id") or str(uuid.uuid4())})
+
+    if settings_database is not None:
+        await _create_stored_endpoint(
+            StoredRoutes(settings_database, settings_publisher or publish_settings_routes), data_dict, user_api_key_dict
+        )
+    else:
+        await _create_endpoint_in_settings_view(data_dict, user_api_key_dict)
 
     # Return the created endpoint with the generated ID
     created_endpoint: Final = PassThroughGenericEndpoint.model_validate(data_dict)
@@ -4067,12 +4257,20 @@ async def create_pass_through_endpoints(
 async def delete_pass_through_endpoints(
     endpoint_id: str,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    settings_database: SettingsDatabase = None,
+    settings_publisher: SettingsPublisher = None,
 ):
     """
     Delete a pass-through endpoint by ID.
 
     Returns - the deleted endpoint
     """
+    if settings_database is not None:
+        return await _delete_stored_endpoint(
+            StoredRoutes(settings_database, settings_publisher or publish_settings_routes),
+            endpoint_id,
+            user_api_key_dict,
+        )
     from litellm.proxy.proxy_server import (
         get_config_general_settings,
         update_config_general_settings,
