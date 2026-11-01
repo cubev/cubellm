@@ -40,6 +40,7 @@ from litellm.proxy.pass_through_endpoints.account_ownership import (
     adopt_resource,
     read_ownership,
     record_ownership,
+    record_ownerships,
 )
 
 DSN: Final = os.environ.get("CUBELLM_ACCOUNT_GRANTS_TEST_DATABASE_URL", "")
@@ -86,11 +87,8 @@ def claim(**changes: str | None) -> ResourceClaim:
 def postgres_query(query: str) -> sql.SQL:
     if query not in {CLAIM_CREATED_SQL, CLAIM_ADOPTED_SQL, READ_OWNERSHIP_SQL, LOCK_SETTINGS_SQL, READ_SETTINGS_SQL}:
         raise ValueError("Unexpected SQL outside the ownership transaction contract")
-    return sql.SQL(
-        cast(
-            LiteralString, re.sub(r"\$(\d+)", r"%(p\1)s", query)
-        )  # cast-ok: allowlisted SQL; only parameter markers change
-    )
+    marked: Final = re.sub(r"\$(\d+)", r"%(p\1)s", query)
+    return sql.SQL(cast(LiteralString, marked))  # cast-ok: allowlisted SQL with only parameter markers changed
 
 
 def numbered(parameters: tuple[str, ...]) -> dict[str, str]:
@@ -103,7 +101,9 @@ class PostgresTransaction:
         self.connection: Final = connection
 
     async def query_raw(self, query: str, *parameters: str) -> object:
-        if query == READ_OWNERSHIP_SQL and self.database.hide_readback:
+        if query == READ_OWNERSHIP_SQL and (
+            self.database.hide_readback or parameters[1] == self.database.hide_readback_of
+        ):
             return ()
         cursor: Final = await self.connection.execute(postgres_query(query), numbered(parameters))
         names: Final = tuple(column.name for column in cursor.description or ())
@@ -123,11 +123,13 @@ class PostgresDatabase:
         schema: str,
         *,
         hide_readback: bool = False,
+        hide_readback_of: str | None = None,
         entered: asyncio.Event | None = None,
         release: asyncio.Event | None = None,
     ) -> None:
         self.schema: Final = schema
         self.hide_readback: Final = hide_readback
+        self.hide_readback_of: Final = hide_readback_of
         self.entered: Final = entered
         self.release: Final = release
         self.connections: Final[asyncio.Queue[int]] = asyncio.Queue()
@@ -177,7 +179,7 @@ class AccountOwnershipTransactions(unittest.IsolatedAsyncioTestCase):
     async def rows(self) -> list[tuple[object, ...]]:
         cursor: Final = await self.connection.execute(
             'SELECT resource_id, owner_application_id, provenance, creator_key_hash FROM "LiteLLM_AccountResourceOwnership"'
-            " ORDER BY resource_id"
+            " ORDER BY resource_id, resource_type DESC"
         )
         return await cursor.fetchall()
 
@@ -438,4 +440,37 @@ class AccountOwnershipTransactions(unittest.IsolatedAsyncioTestCase):
                 "creator_key_hash": None,
             },
         )
+        self.assertEqual(await self.rows(), [("legacy_7", "fixture-app", "adopted", None)])
+
+    async def test_one_creation_records_every_declared_resource_type_in_one_transaction(self) -> None:
+        await record_ownership(self.database, claim(resource_type="audio-job", owner_application_id="other-app"))
+        recorded: Final = await record_ownerships(self.database, (claim(), claim(resource_type="audio-job")))
+        self.assertEqual(
+            recorded[0],
+            OwnershipRecorded(
+                ResourceOwnership(
+                    route_id="fixture-route",
+                    owner_application_id="fixture-app",
+                    provenance="created",
+                    creator_key_hash=CREATOR,
+                ),
+                True,
+            ),
+        )
+        assert isinstance(recorded[1], OwnershipConflict)
+        self.assertEqual(recorded[1].ownership.owner_application_id, "other-app")
+        self.assertEqual(
+            await self.rows(),
+            [("vid_1", "fixture-app", "created", CREATOR), ("vid_1", "other-app", "created", CREATOR)],
+        )
+
+    async def test_a_failure_on_the_second_claim_rolls_back_the_first_one_too(self) -> None:
+        await record_ownership(
+            self.database, claim(resource_id="legacy_7", provenance="adopted", creator_key_hash=None)
+        )
+        with self.assertRaises(RuntimeError):
+            await record_ownerships(
+                PostgresDatabase(self.schema, hide_readback_of="audio-job"),
+                (claim(), claim(resource_type="audio-job")),
+            )
         self.assertEqual(await self.rows(), [("legacy_7", "fixture-app", "adopted", None)])

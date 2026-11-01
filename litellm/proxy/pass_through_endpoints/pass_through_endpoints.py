@@ -26,6 +26,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.websockets import WebSocketState
 from websockets.asyncio.client import connect
@@ -123,13 +124,20 @@ from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, Usage
 from .account_credentials import (
     AccountHeaderCredential,
     AccountRouteBinding,
+    ResolvedAccountCredential,
     account_application_allowed,
     resolve_account_credential,
     validate_account_request,
     validate_account_resources,
     validate_account_route,
 )
-from .account_ownership import proxy_ownership_lookup, resource_access_allowed, resource_path_match
+from .account_ownership import (
+    capture_created_resources,
+    proxy_ownership_lookup,
+    proxy_ownership_record,
+    resource_access_allowed,
+    resource_path_match,
+)
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
@@ -1971,6 +1979,117 @@ def _update_metadata_with_tags_in_header(request: Request, metadata: dict) -> di
     return metadata
 
 
+class _KeyMetadata(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+    metadata: Mapping[str, object] | None = None
+
+
+class _AccountRouteParams(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+    forward_headers: bool | None = None
+    default_query_params: Mapping[str, object] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenRelay:
+    def outbound_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        return headers
+
+    def validate_query(self, names: tuple[str, ...]) -> None:
+        return None
+
+    def relay_options(self) -> Mapping[str, AccountRouteBinding]:
+        return MappingProxyType({})
+
+    async def capture(self, path: str, method: str, response: Response) -> None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountRelay:
+    policy: AccountHeaderCredential
+    credential: ResolvedAccountCredential
+    route_id: str | None
+    application_id: str | None
+    key_hash: str | None
+
+    def outbound_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        return {**headers, **self.credential.headers}
+
+    def validate_query(self, names: tuple[str, ...]) -> None:
+        try:
+            validate_account_request(self.policy, {}, names)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
+
+    def relay_options(self) -> Mapping[str, AccountRouteBinding]:
+        return MappingProxyType({"account_binding": self.credential.binding})
+
+    async def capture(self, path: str, method: str, response: Response) -> None:
+        await capture_created_resources(
+            self.policy,
+            self.route_id,
+            self.application_id,
+            self.key_hash,
+            path,
+            method,
+            response.status_code,
+            None if isinstance(response, StreamingResponse) else response.body,
+            proxy_ownership_record,
+        )
+
+
+async def _account_relay(
+    target_params: Mapping[str, object],
+    passthrough_params: Mapping[str, object] | None,
+    user_api_key_dict: object,
+    request: Request,
+    path: str,
+    full_target: str,
+    headers: Mapping[str, object],
+) -> _OpenRelay | _AccountRelay:
+    raw_policy: Final = target_params.get("account_credential")
+    if raw_policy is None:
+        return _OpenRelay()
+    policy: Final = AccountHeaderCredential.model_validate(raw_policy)
+    key: Final = user_api_key_dict if isinstance(user_api_key_dict, UserAPIKeyAuth) else None
+    application_id: Final = (
+        application_id_from_key_metadata(_KeyMetadata.model_validate(key, from_attributes=True).metadata)
+        if key is not None
+        else None
+    )
+    key_hash: Final = key.token if key is not None else None
+    endpoint_id: Final = passthrough_params.get("endpoint_id") if passthrough_params is not None else None
+    route_id: Final = endpoint_id if isinstance(endpoint_id, str) else None
+    resource_match: Final = resource_path_match(policy, path)
+    allowed: Final = (
+        await resource_access_allowed(
+            policy, resource_match, route_id, application_id, key_hash, request.method, proxy_ownership_lookup
+        )
+        if resource_match is not None
+        else account_application_allowed(policy, application_id, key_hash, path, request.method)
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Application is not granted this account route method")
+    try:
+        validate_account_request(policy, request.headers, tuple(request.query_params.keys()))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
+    try:
+        params: Final = _AccountRouteParams.model_validate(target_params)
+        validate_account_route(
+            full_target, True, params.forward_headers, headers, params.default_query_params, policy, (request.method,)
+        )
+        credential: Final = resolve_account_credential(
+            policy, CredentialAccessor.find_credential(policy.credential_name), full_target
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=503, detail="Account route credential or request policy is unavailable"
+        ) from None
+    return _AccountRelay(policy, credential, route_id, application_id, key_hash)
+
+
 class _PassThroughRequestEnvelope(TypedDict, total=False):
     query_params: Mapping[str, object] | None
     custom_body: Mapping[str, object] | None
@@ -2154,75 +2273,16 @@ def create_pass_through_route(
             # Ensure custom_headers is a dict. Botocore returns a HeadersDict
             # for SigV4-prepared requests, which is a Mapping but not a dict.
             headers_dict: Final = dict(param_custom_headers) if isinstance(param_custom_headers, Mapping) else {}
-            account_policy_raw: Final = target_params.get("account_credential")
-            account_policy: Final = (
-                AccountHeaderCredential.model_validate(account_policy_raw) if account_policy_raw is not None else None
+            account: Final = await _account_relay(
+                target_params, passthrough_params, user_api_key_dict, request, path, full_target, headers_dict
             )
-            if account_policy is not None:
-                application_id: Final = (
-                    application_id_from_key_metadata(cast(Mapping[str, object] | None, user_api_key_dict.metadata))
-                    if isinstance(user_api_key_dict, UserAPIKeyAuth)
-                    else None
-                )
-                key_hash: Final = user_api_key_dict.token if isinstance(user_api_key_dict, UserAPIKeyAuth) else None
-                resource_match: Final = resource_path_match(account_policy, path)
-                registered_route_id: Final = (
-                    passthrough_params.get("endpoint_id") if passthrough_params is not None else None
-                )
-                account_access: Final = (
-                    await resource_access_allowed(
-                        account_policy,
-                        resource_match,
-                        registered_route_id if isinstance(registered_route_id, str) else None,
-                        application_id,
-                        key_hash,
-                        request.method,
-                        proxy_ownership_lookup,
-                    )
-                    if resource_match is not None
-                    else account_application_allowed(account_policy, application_id, key_hash, path, request.method)
-                )
-                if not account_access:
-                    raise HTTPException(status_code=403, detail="Application is not granted this account route method")
-                try:
-                    validate_account_request(account_policy, request.headers, tuple(request.query_params.keys()))
-                except ValueError:
-                    raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
-            try:
-                if account_policy is not None:
-                    validate_account_route(
-                        full_target,
-                        True,
-                        cast(bool | None, param_forward_headers),
-                        headers_dict,
-                        cast(Mapping[str, object] | None, param_default_query_params),
-                        account_policy,
-                        (request.method,),
-                    )
-                resolved_account: Final = (
-                    resolve_account_credential(
-                        account_policy, CredentialAccessor.find_credential(account_policy.credential_name), full_target
-                    )
-                    if account_policy is not None
-                    else None
-                )
-            except ValueError:
-                raise HTTPException(
-                    status_code=503, detail="Account route credential or request policy is unavailable"
-                ) from None
-            outbound_headers: Final = (
-                {**headers_dict, **resolved_account.headers} if resolved_account is not None else headers_dict
-            )
+            outbound_headers: Final = account.outbound_headers(headers_dict)
 
             # Ensure query_params and custom_body are dicts or None
             final_query_params: Final = query_params_data if isinstance(query_params_data, dict) else {}
             if query_params:
                 final_query_params.update(query_params)
-            if account_policy is not None:
-                try:
-                    validate_account_request(account_policy, {}, tuple(final_query_params.keys()))
-                except ValueError:
-                    raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
+            account.validate_query(tuple(final_query_params.keys()))
             # Programmatic callers set LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY on
             # request.state (see Bedrock proxy). Parsed JSON envelope otherwise.
             state_custom_body: Final[dict | None] = getattr(
@@ -2240,7 +2300,7 @@ def create_pass_through_route(
 
             async def _relay() -> Response:
                 try:
-                    return await pass_through_request(
+                    relayed: Final = await pass_through_request(
                         request=request,
                         target=full_target,
                         custom_headers=outbound_headers,
@@ -2255,8 +2315,10 @@ def create_pass_through_route(
                         custom_llm_provider=custom_llm_provider,
                         guardrails_config=cast(dict | None, param_guardrails),
                         timeout=cast(float | None, param_timeout),
-                        **({"account_binding": resolved_account.binding} if resolved_account is not None else {}),
+                        **account.relay_options(),
                     )
+                    await account.capture(path, request.method, relayed)
+                    return relayed
                 finally:
                     if hasattr(request.state, LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY):
                         delattr(request.state, LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY)
@@ -3374,6 +3436,14 @@ def _get_combined_pass_through_endpoints(
     return pass_through_endpoints + config_pass_through_endpoints
 
 
+def _registered_account_policy(raw: object, path: str, include_subpath: bool) -> AccountHeaderCredential | None:
+    if raw is None:
+        return None
+    policy: Final = AccountHeaderCredential.model_validate(raw)
+    validate_account_resources(path, include_subpath, policy)
+    return policy
+
+
 async def _register_pass_through_endpoint(
     endpoint: dict[str, object] | PassThroughGenericEndpoint,
     app: FastAPI,
@@ -3415,12 +3485,9 @@ async def _register_pass_through_endpoint(
 
     if target is None:
         return
-    if endpoint_data.get("account_credential") is not None:
-        validate_account_resources(
-            path,
-            endpoint_data.get("include_subpath", False) is True,
-            AccountHeaderCredential.model_validate(endpoint_data["account_credential"]),
-        )
+    account_policy: Final = _registered_account_policy(
+        endpoint_data.get("account_credential"), path, endpoint_data.get("include_subpath", False) is True
+    )
 
     guardrails: Final = endpoint_data.get("guardrails")
     methods: Final = endpoint_data.get("methods")
@@ -3444,11 +3511,7 @@ async def _register_pass_through_endpoint(
         config_file_path=config_file_path,
         auth=auth_enforced,
         timeout=timeout,
-        **(
-            {"account_credential": AccountHeaderCredential.model_validate(endpoint_data["account_credential"])}
-            if endpoint_data.get("account_credential") is not None
-            else {}
-        ),
+        account_credential=account_policy,
     )
 
     methods_for_key: Final = methods if methods else ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -3476,11 +3539,7 @@ async def _register_pass_through_endpoint(
             config_file_path=config_file_path,
             auth=auth_enforced,
             timeout=timeout,
-            **(
-                {"account_credential": AccountHeaderCredential.model_validate(endpoint_data["account_credential"])}
-                if endpoint_data.get("account_credential") is not None
-                else {}
-            ),
+            account_credential=account_policy,
         )
         visited_endpoints.add(f"{endpoint_id}:subpath:{path}:{methods_str}")
 

@@ -1,7 +1,8 @@
 from dataclasses import dataclass
-from typing import Annotated, Final, Literal, Protocol, cast
+from types import MappingProxyType
+from typing import Annotated, Final, Literal, Protocol, TypeAlias, cast
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError, model_validator
 from typing_extensions import Self
 
 from litellm._logging import verbose_proxy_logger
@@ -15,7 +16,14 @@ from .account_grants import (
     describe_account_policy,
     settings_from_rows,
 )
-from .account_resources import ResourcePathMatch, ResourceTypeName, canonical_resource_id, find_resource
+from .account_resources import (
+    ResourceCreation,
+    ResourcePathMatch,
+    ResourceTypeName,
+    canonical_resource_id,
+    find_resource,
+    select_resource_id,
+)
 
 _COLUMNS: Final = '"account_id", "resource_type", "resource_id", "route_id", "owner_application_id", "provenance"'
 CLAIM_CREATED_SQL: Final = f"""INSERT INTO "LiteLLM_AccountResourceOwnership" ({_COLUMNS}, "creator_key_hash")
@@ -161,15 +169,137 @@ async def resource_access_allowed(
     return ownership is not None and ownership.owner_application_id == application_id and ownership.route_id == route_id
 
 
-async def proxy_ownership_lookup(account_id: str, resource_type: str, resource_id: str, /) -> ResourceOwnership | None:
+def _proxy_database() -> GrantDatabase:
     from litellm.proxy import proxy_server
 
     if proxy_server.prisma_client is None:
         raise RuntimeError("Account resource ownership requires the proxy database")
-    database: Final = cast(  # cast-ok: PrismaClient provides the tx() protocol used for account configuration
+    return cast(  # cast-ok: PrismaClient provides the tx() protocol used for account configuration
         GrantDatabase, proxy_server.prisma_client
     )
-    return await read_ownership(database, account_id, resource_type, resource_id)
+
+
+async def proxy_ownership_lookup(account_id: str, resource_type: str, resource_id: str, /) -> ResourceOwnership | None:
+    return await read_ownership(_proxy_database(), account_id, resource_type, resource_id)
+
+
+async def record_ownerships(
+    database: GrantDatabase, claims: tuple[ResourceClaim, ...]
+) -> tuple[OwnershipRecorded | OwnershipConflict, ...]:
+    async with database.tx() as transaction:
+        return tuple([await record_in_transaction(transaction, claim) for claim in claims])
+
+
+class OwnershipRecorder(Protocol):
+    async def __call__(
+        self, claims: tuple[ResourceClaim, ...], /
+    ) -> tuple[OwnershipRecorded | OwnershipConflict, ...]: ...
+
+
+async def proxy_ownership_record(
+    claims: tuple[ResourceClaim, ...], /
+) -> tuple[OwnershipRecorded | OwnershipConflict, ...]:
+    return await record_ownerships(_proxy_database(), claims)
+
+
+CaptureSkip: TypeAlias = Literal[
+    "unsuccessful_response", "unbuffered_response", "missing_identity", "invalid_json", "missing_id", "capture_failed"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceNotCaptured:
+    reason: CaptureSkip
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedResource:
+    resource_type: str
+    outcome: OwnershipRecorded | OwnershipConflict | ResourceNotCaptured
+
+
+_JSON: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
+
+
+def _skipped(creations: tuple[tuple[str, ResourceCreation], ...], reason: CaptureSkip) -> tuple[CapturedResource, ...]:
+    return tuple(CapturedResource(name, ResourceNotCaptured(reason)) for name, _ in creations)
+
+
+async def _capture(
+    creations: tuple[tuple[str, ResourceCreation], ...],
+    account_id: str,
+    route_id: str | None,
+    application_id: str | None,
+    key_hash: str | None,
+    status_code: int,
+    body: bytes | memoryview | None,
+    record: OwnershipRecorder,
+) -> tuple[CapturedResource, ...]:
+    if not 200 <= status_code < 300:
+        return _skipped(creations, "unsuccessful_response")
+    if body is None:
+        return _skipped(creations, "unbuffered_response")
+    if route_id is None or application_id is None or key_hash is None:
+        return _skipped(creations, "missing_identity")
+    try:
+        document: Final = _JSON.validate_json(bytes(body))
+    except ValidationError:
+        return _skipped(creations, "invalid_json")
+    selected: Final = tuple((name, select_resource_id(document, creation.id_selector)) for name, creation in creations)
+    claims: Final = tuple(
+        ResourceClaim(
+            account_id=account_id,
+            resource_type=name,
+            resource_id=resource_id,
+            route_id=route_id,
+            owner_application_id=application_id,
+            provenance="created",
+            creator_key_hash=key_hash,
+        )
+        for name, resource_id in selected
+        if resource_id is not None
+    )
+    recorded: Final = MappingProxyType(
+        dict(zip((claim.resource_type for claim in claims), await record(claims) if claims else (), strict=True))
+    )
+    return tuple(CapturedResource(name, recorded.get(name, ResourceNotCaptured("missing_id"))) for name, _ in selected)
+
+
+async def capture_created_resources(
+    policy: AccountHeaderCredential,
+    route_id: str | None,
+    application_id: str | None,
+    key_hash: str | None,
+    path: str,
+    method: str,
+    status_code: int,
+    body: bytes | memoryview | None,
+    record: OwnershipRecorder,
+) -> tuple[CapturedResource, ...]:
+    creations: Final = tuple(
+        (resource.name, resource.creation)
+        for resource in policy.resource_types
+        if resource.creation is not None and resource.creation.path == path and method in resource.creation.methods
+    )
+    if not creations:
+        return ()
+    try:
+        captured: Final = await _capture(
+            creations, policy.account_id, route_id, application_id, key_hash, status_code, body, record
+        )
+    except Exception:
+        verbose_proxy_logger.warning("Account resource capture failed; created resources stay unowned")
+        return _skipped(creations, "capture_failed")
+    for item in captured:
+        if not isinstance(item.outcome, OwnershipRecorded):
+            verbose_proxy_logger.warning(
+                "Account resource %s was not captured: %s",
+                item.resource_type,
+                item.outcome.reason
+                if isinstance(item.outcome, ResourceNotCaptured)
+                else "owned by another application",
+            )
+    return captured
 
 
 class ResourceAdoptionCommand(BaseModel):

@@ -39,6 +39,7 @@ from litellm.proxy.pass_through_endpoints.account_credentials import (
     AccountRouteBinding,
     CredentialHeader,
 )
+from litellm.proxy.pass_through_endpoints.account_resources import AccountResourceType, ResourceCreation
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     DEFAULT_PASS_THROUGH_REQUEST_TIMEOUT_SECONDS,
     LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY,
@@ -98,7 +99,7 @@ def test_generic_passthrough_persists_authenticated_application_snapshot(client_
     )
     passthrough_payload: Final[PassthroughStandardLoggingPayload] = {"url": "https://vendor.example/check"}
     helper: Final = HttpPassThroughEndpointHelpers
-    kwargs: Final = cast(
+    kwargs: Final = cast(  # cast-ok: the legacy helper returns an untyped dict
         dict[str, object],
         helper._init_kwargs_for_pass_through_endpoint(  # pyright: ignore[reportUnknownMemberType, reportPrivateUsage]
             request=request,
@@ -114,7 +115,8 @@ def test_generic_passthrough_persists_authenticated_application_snapshot(client_
             },
         ),
     )
-    cast(dict[str, object], auth.metadata)["cube_application_id"] = "later-app"
+    stored_metadata_of_key: Final = cast(dict[str, object], auth.metadata)  # cast-ok: mutated in place below
+    stored_metadata_of_key["cube_application_id"] = "later-app"
     now: Final = datetime.now(timezone.utc)
     payload: Final = get_logging_payload(
         kwargs=kwargs,
@@ -7902,7 +7904,10 @@ async def test_account_route_grants_enforce_application_method_and_exact_path_be
                 "/account-fixture" + suffix,
                 json={
                     "custom_body": {
-                        "metadata": {"cube_application_id": "grant-matrix-app", "provider_account_id": "fixture-account"},
+                        "metadata": {
+                            "cube_application_id": "grant-matrix-app",
+                            "provider_account_id": "fixture-account",
+                        },
                         "user_api_key_auth": {
                             "token": hashlib.sha256(b"sk-inert-app-key").hexdigest(),
                             "metadata": {"cube_application_id": "grant-matrix-app"},
@@ -8083,3 +8088,62 @@ async def test_native_relay_and_async_spend_callback_retain_both_identities(monk
             assert "_cube_account_binding" not in stored
         finally:
             await GLOBAL_LOGGING_WORKER.stop()
+
+
+@pytest.mark.usefixtures("isolated_routes")
+@pytest.mark.parametrize("endpoint_id", ("fixture-media-route", "fixture media route with an invalid id"))
+async def test_failed_resource_capture_still_returns_the_upstream_creation_response(
+    monkeypatch: pytest.MonkeyPatch, endpoint_id: str
+) -> None:
+    app: Final = FastAPI()
+    created: Final = b'{"video": {"id": "vid_1"}, "audio": [{"id": "aud_1"}]}'
+    monkeypatch.setattr(litellm, "credential_list", [credential()])
+    media_policy: Final = AccountHeaderCredential(
+        account_id=POLICY.account_id,
+        credential_name=POLICY.credential_name,
+        headers=POLICY.headers,
+        resource_types=tuple(
+            AccountResourceType(
+                name=kind,
+                item_paths=(f"/account-media/{kind}/{{resource_id}}",),
+                creation=ResourceCreation(path="/account-media", methods=("POST",), id_selector=selector),
+            )
+            for kind, selector in (("video", ("video", "id")), ("audio", ("audio", 0, "id")))
+        ),
+        application_grants=(
+            AccountApplicationGrant(
+                application_id="fixture-app",
+                key_hash=hashlib.sha256(b"sk-inert-app-key").hexdigest(),
+                account_id=POLICY.account_id,
+                path="/account-media",
+                methods=("POST",),
+            ),
+        ),
+    )
+
+    async def auth() -> UserAPIKeyAuth:
+        return UserAPIKeyAuth(api_key="sk-inert-app-key", metadata={"cube_application_id": "fixture-app"})
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, content=created, headers=(("content-type", "application/json"),))
+
+    app.dependency_overrides[user_api_key_auth] = auth
+    endpoint: Final = PassThroughGenericEndpoint(
+        id=endpoint_id,
+        path="/account-media",
+        target="https://vendor.example/media",
+        account_credential=media_policy,
+        methods=["POST"],
+        include_subpath=True,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as outbound:
+
+        def client_factory(llm_provider: object = None, params: Mapping[str, object] | None = None) -> ClientFixture:
+            return ClientFixture(outbound)
+
+        monkeypatch.setattr(relay, "get_async_httpx_client", client_factory)
+        await register_route(endpoint, app, False, set())
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+            response: Final = await client.post("/account-media", content=b"{}")
+    assert response.status_code == 201, response.text
+    assert response.content == created
