@@ -846,6 +846,51 @@ specification. Definite rejections (400, 409, 422) are errors. Other outcomes ar
 idempotent. The worker that serves the request registers the route when the
 configuration reloads; worker-wide registration and provider access are not verified
 
+## Query parameter credentials
+
+Some providers expect the key in the URL instead of a header. An account route can
+name a query parameter as the credential destination, alone or next to headers:
+
+```json
+{
+  "headers": [],
+  "query": {"name": "key", "field": "api_key", "prefix": ""},
+  "allowed_query_parameters": ["page"]
+}
+```
+
+The gateway announces this with `passthrough_account_query_credential:
+query_parameter_v1`, and the controller only sends a query route to a gateway that
+does. Existing routes are never converted. The parameter name is a plain token of
+letters, digits and `._~-`, it may not also be an allowed client parameter in any
+letter case, and a client that sends it in any case variant gets 400 before the
+provider is contacted. Other allowed parameters reach the provider. As on every
+pass-through route, a parameter repeated by the client arrives only once. The destination is stored with the route and covered by its
+fingerprint, so creating the same route ID with another parameter name conflicts.
+Header-only routes are stored exactly as before
+
+The key is added by a transport wrapper at the last step before the network, so only
+that physical outbound request carries it. Client-side requests, httpx logs,
+`response.url`, response request metadata and the logged `api_base` keep the URL
+without it. Responses from the provider are cleaned before
+anything else sees them: every header and the body, buffered or streamed, compressed
+or not, has the prefixed and the bare key replaced with `[redacted]` in its raw,
+percent-encoded (in any mix of hex digit case, while the key itself stays
+case-sensitive), form-encoded and JSON-escaped forms. Bodies
+up to 1 MiB with a declared length are buffered and get an exact new
+`Content-Length`. Longer or undeclared bodies are streamed and only hold back the
+few bytes that could still start a key. Digest headers are dropped when bytes
+changed, and protocol headers are never rewritten. Connection and read errors are
+raised again with a cleaned message and without the original exception attached.
+The wrapper sits on the handler's normal transport and proxy mounts, so egress
+proxies, client certificates and HTTP/2 settings still apply and every client keeps
+its own connection pool
+
+Limits: the Deepgram listen logger reads the outbound URL of WebSocket routes, which
+account routes do not use. A provider that echoes the key in a form not listed above
+is not covered. Gateway-reported costs of these routes stay `unverified`, as for
+header routes
+
 
 ## Account resource ownership
 
