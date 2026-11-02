@@ -17,6 +17,7 @@ from typing_extensions import Self
 from .account_credentials import (
     AccountHeaderCredential,
     CredentialHeader,
+    CredentialQuery,
     Identifier,
     validate_account_resources,
     validate_account_route,
@@ -96,7 +97,13 @@ class AccountRouteDefinition(BaseModel):
                 else _StoredCredential.model_validate(self.account_credential, from_attributes=True)
             ),
         )
-        return _OBJECT.validate_json(route.model_dump_json())
+        return _OBJECT.validate_json(
+            route.model_dump_json(
+                exclude={"account_credential": {"query"}}  # mutable-ok: pydantic exclude takes a dict of sets
+                if self.account_credential.query is None
+                else None
+            )
+        )
 
 
 class _StoredCredential(BaseModel):
@@ -104,6 +111,7 @@ class _StoredCredential(BaseModel):
     account_id: str
     credential_name: str
     headers: tuple[CredentialHeader, ...]
+    query: CredentialQuery | None = None
     allowed_query_parameters: tuple[str, ...]
 
 
@@ -112,6 +120,7 @@ class _StoredResourceCredential(BaseModel):
     account_id: str
     credential_name: str
     headers: tuple[CredentialHeader, ...]
+    query: CredentialQuery | None = None
     allowed_query_parameters: tuple[str, ...]
     resource_types: Annotated[tuple[AccountResourceType, ...], Field(min_length=1)]
 

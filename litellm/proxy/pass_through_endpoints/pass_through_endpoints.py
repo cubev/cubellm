@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.websockets import WebSocketState
+from typing_extensions import ReadOnly
 from websockets.asyncio.client import connect
 from websockets.exceptions import (
     ConnectionClosedError,
@@ -145,6 +146,7 @@ from .account_routes import RoutesMutation, RoutesPlan, mutate_settings_routes
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
+from .query_credentials import QueryCredentialAuth, QueryCredentialTransport
 from .streaming_handler import PassThroughStreamingHandler
 from .success_handler import PassThroughEndpointLogging
 from .upstream_usage_headers import (
@@ -464,6 +466,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         forward_multipart: bool = False,
         follow_redirects: bool | None = None,
         isolate_client: bool = False,
+        upstream_auth: httpx.Auth | None = None,
     ) -> httpx.Response:
         """
         Handle non-SSE HTTP requests
@@ -486,7 +489,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             return await async_client.send(
                 get_request,
                 stream=True,
-                **({"auth": None} if isolate_client else {}),
+                **({"auth": upstream_auth} if isolate_client else {}),
                 **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
             )
         if HttpPassThroughEndpointHelpers.is_multipart(request) is True and forward_multipart:
@@ -500,7 +503,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 url=url,
                 headers=headers,
                 requested_query_params=requested_query_params,
-                **({"isolate_client": True} if isolate_client else {}),
+                **({"isolate_client": True, "upstream_auth": upstream_auth} if isolate_client else {}),
                 **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
             )
         generic_request: Final = build_request(
@@ -513,7 +516,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         return await async_client.send(
             generic_request,
             stream=True,
-            **({"auth": None} if isolate_client else {}),
+            **({"auth": upstream_auth} if isolate_client else {}),
             **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
         )
 
@@ -540,6 +543,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         stream: bool = False,
         follow_redirects: bool | None = None,
         isolate_client: bool = False,
+        upstream_auth: httpx.Auth | None = None,
     ) -> httpx.Response:
         """Process multipart/form-data requests, handling both files and form fields.
 
@@ -605,7 +609,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             return await async_client.send(
                 req,
                 stream=stream,
-                **({"auth": None} if isolate_client else {}),
+                **({"auth": upstream_auth} if isolate_client else {}),
                 **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
             )
 
@@ -997,6 +1001,7 @@ async def _log_passthrough_upstream_failure(
     user_api_key_dict: UserAPIKeyAuth,
     request_payload: dict,
     logging_obj: LiteLLMLoggingObj,
+    redact: Callable[[str], str] | None = None,
 ) -> httpx.Response:
     if response.status_code < 400:
         return response
@@ -1006,7 +1011,9 @@ async def _log_passthrough_upstream_failure(
     upstream_error_body: Final = (
         REDACTED_BY_LITELLM
         if should_redact_message_logging(logging_obj.model_call_details)
-        else _truncate_upstream_error_body(_sanitize_upstream_error_body(preview_text))
+        else _truncate_upstream_error_body(
+            _sanitize_upstream_error_body(redact(preview_text) if redact is not None else preview_text)
+        )
     )
     verbose_proxy_logger.warning(
         "pass_through_endpoint: upstream %s %s returned %s: %s",
@@ -1096,6 +1103,7 @@ async def pass_through_request(
     guardrails_config: dict | None = None,
     timeout: float | None = None,
     account_binding: AccountRouteBinding | None = None,
+    account_query: QueryCredentialAuth | None = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -1251,7 +1259,11 @@ async def pass_through_request(
         resolved_timeout: Final = resolve_pass_through_request_timeout(timeout)
         async_client_obj: Final = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
-            params={"timeout": resolved_timeout, **({"follow_redirects": False} if account_binding else {})},
+            params={
+                "timeout": resolved_timeout,
+                **({"follow_redirects": False} if account_binding else {}),
+                **({"transport_wrapper": QueryCredentialTransport} if account_query is not None else {}),
+            },
         )
         async_client: Final = async_client_obj.client
         build_request: Final = httpx.Request if account_binding is not None else async_client.build_request
@@ -1453,7 +1465,11 @@ async def pass_through_request(
                     headers=upstream_headers,
                     requested_query_params=requested_query_params,
                     stream=True,
-                    **({"isolate_client": True, "follow_redirects": False} if account_binding else {}),
+                    **(
+                        {"isolate_client": True, "follow_redirects": False, "upstream_auth": account_query}
+                        if account_binding
+                        else {}
+                    ),
                 )
             else:
                 # SigV4-signed callers (Bedrock) supply the exact pre-signed bytes;
@@ -1477,7 +1493,9 @@ async def pass_through_request(
                 )
 
                 response = await async_client.send(
-                    req, stream=stream, **({"follow_redirects": False, "auth": None} if account_binding else {})
+                    req,
+                    stream=stream,
+                    **({"follow_redirects": False, "auth": account_query} if account_binding else {}),
                 )
 
             upstream_usage = apply_upstream_reported_usage(
@@ -1496,6 +1514,7 @@ async def pass_through_request(
                     upstream_usage=upstream_usage,
                 ),
                 logging_obj=logging_obj,
+                redact=account_query.redact if account_query is not None else None,
             )
 
             # Call response headers hook for streaming pass-through
@@ -1556,7 +1575,9 @@ async def pass_through_request(
                 content=state_raw_body,
             )
             response = await async_client.send(
-                raw_body_request, stream=True, **({"follow_redirects": False, "auth": None} if account_binding else {})
+                raw_body_request,
+                stream=True,
+                **({"follow_redirects": False, "auth": account_query} if account_binding else {}),
             )
         else:
             response = await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
@@ -1567,7 +1588,11 @@ async def pass_through_request(
                 requested_query_params=requested_query_params,
                 _parsed_body=_parsed_body,
                 forward_multipart=is_multipart,
-                **({"follow_redirects": False, "isolate_client": True} if account_binding else {}),
+                **(
+                    {"follow_redirects": False, "isolate_client": True, "upstream_auth": account_query}
+                    if account_binding
+                    else {}
+                ),
             )
         verbose_proxy_logger.debug("response.headers= %s", response.headers)
 
@@ -1591,6 +1616,7 @@ async def pass_through_request(
                     upstream_usage=upstream_usage,
                 ),
                 logging_obj=logging_obj,
+                redact=account_query.redact if account_query is not None else None,
             )
 
             # Call response headers hook for detected streaming pass-through
@@ -1696,6 +1722,7 @@ async def pass_through_request(
             user_api_key_dict=user_api_key_dict,
             request_payload=failure_request_payload,
             logging_obj=logging_obj,
+            redact=account_query.redact if account_query is not None else None,
         )
 
         if response.status_code < 400 and response_body is not None and guardrails_to_run:
@@ -1994,6 +2021,11 @@ class _AccountRouteParams(BaseModel):
     default_query_params: Mapping[str, object] | None = None
 
 
+class _RelayOptions(TypedDict, total=False):
+    account_binding: ReadOnly[AccountRouteBinding]
+    account_query: ReadOnly[QueryCredentialAuth]
+
+
 @dataclass(frozen=True, slots=True)
 class _OpenRelay:
     def outbound_headers(self, headers: dict[str, str]) -> dict[str, str]:
@@ -2002,8 +2034,8 @@ class _OpenRelay:
     def validate_query(self, names: tuple[str, ...]) -> None:
         return None
 
-    def relay_options(self) -> Mapping[str, AccountRouteBinding]:
-        return MappingProxyType({})
+    def relay_options(self) -> _RelayOptions:
+        return _RelayOptions()
 
     async def capture(self, path: str, method: str, response: Response) -> None:
         return None
@@ -2026,8 +2058,11 @@ class _AccountRelay:
         except ValueError:
             raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
 
-    def relay_options(self) -> Mapping[str, AccountRouteBinding]:
-        return MappingProxyType({"account_binding": self.credential.binding})
+    def relay_options(self) -> _RelayOptions:
+        query: Final = self.credential.query
+        if query is None:
+            return _RelayOptions(account_binding=self.credential.binding)
+        return _RelayOptions(account_binding=self.credential.binding, account_query=query)
 
     async def capture(self, path: str, method: str, response: Response) -> None:
         await capture_created_resources(

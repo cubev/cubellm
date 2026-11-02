@@ -18,6 +18,7 @@ from cube_control.account_routes import (
     AccountResourceCreation,
     AccountResourceType,
     AccountRouteHeader,
+    AccountRouteQuery,
     AccountRouteResult,
     AccountRouteSpec,
     adopt_account_resource,
@@ -112,6 +113,37 @@ class AccountRouteTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("inert-master", result.model_dump_json())
+
+    def test_query_credentials_are_sent_only_to_gateways_that_announce_them(self) -> None:
+        spec: Final = SPEC.model_copy(
+            update={"headers": (), "query": AccountRouteQuery(name="ticket", field="api_key", prefix="k:")}
+        )
+        unsupported: Final = RouteGateway()
+        self.assertEqual(
+            (ensure(unsupported, spec).status, unsupported.bodies),
+            ("error", []),
+        )
+        gateway: Final = RouteGateway()
+        gateway.capabilities["passthrough_account_query_credential"] = "query_parameter_v1"
+        self.assertEqual(ensure(gateway, spec).status, "created")
+        credential: Final = gateway.bodies[0]["route"]
+        self.assertIsInstance(credential, dict)
+        self.assertEqual(
+            credential["account_credential"] if isinstance(credential, dict) else None,
+            {
+                "account_id": "fixture-account",
+                "credential_name": "fixture-credential",
+                "headers": [],
+                "query": {"name": "ticket", "field": "api_key", "prefix": "k:"},
+                "allowed_query_parameters": [],
+            },
+        )
+        for changes in (
+            {"query": None},
+            {"query": {"name": "ticket", "field": "api_key"}, "allowed_query_parameters": ["TICKET"]},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                AccountRouteSpec.model_validate(spec.model_dump() | changes)
 
     def test_existing_identical_route_is_reported_as_existing(self) -> None:
         gateway: Final = RouteGateway()

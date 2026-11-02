@@ -8019,6 +8019,7 @@ async def test_registered_routes_capture_the_selected_native_credential_and_foll
 
 @pytest.mark.usefixtures("isolated_routes")
 async def test_native_relay_and_async_spend_callback_retain_both_identities(monkeypatch: pytest.MonkeyPatch) -> None:
+    await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
     app: Final = FastAPI()
     observer: Final = SpendObserver()
     monkeypatch.setattr(litellm, "callbacks", [])

@@ -14,6 +14,7 @@ from typing_extensions import Self
 from litellm.models.credentials import CredentialItem
 
 from .account_resources import AccountResourceType, is_resource_template, template_segment, validate_resource_types
+from .query_credentials import QueryCredentialAuth
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
 
@@ -40,6 +41,13 @@ class CredentialHeader(BaseModel):
         }:
             raise ValueError("Credential header cannot control HTTP routing or framing")
         return self
+
+
+class CredentialQuery(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    name: Annotated[str, Field(pattern=r"^[A-Za-z0-9._~-]{1,128}$")]
+    field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    prefix: Annotated[str, Field(pattern=r"^[ -~]{0,32}$")] = ""
 
 
 class AccountApplicationGrant(BaseModel):
@@ -69,13 +77,20 @@ class AccountHeaderCredential(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     account_id: Identifier
     credential_name: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
-    headers: Annotated[tuple[CredentialHeader, ...], Field(min_length=1, max_length=8)]
+    headers: Annotated[tuple[CredentialHeader, ...], Field(max_length=8)] = ()
+    query: CredentialQuery | None = None
     allowed_query_parameters: tuple[Annotated[str, Field(min_length=1, max_length=128)], ...] = ()
     application_grants: Annotated[tuple[AccountApplicationGrant, ...], Field(max_length=256)] = ()
     resource_types: Annotated[tuple[AccountResourceType, ...], Field(max_length=16)] = ()
 
     @model_validator(mode="after")
     def validate_policy(self) -> Self:
+        if not self.headers and self.query is None:
+            raise ValueError("Account credentials need a header or a query parameter destination")
+        if self.query is not None and any(
+            name.casefold() == self.query.name.casefold() for name in self.allowed_query_parameters
+        ):
+            raise ValueError("The credential query parameter cannot also be a client query parameter")
         if any(grant.account_id != self.account_id for grant in self.application_grants):
             raise ValueError("Application grant account must match its credential policy")
         templates: Final = frozenset(chain.from_iterable(resource.item_paths for resource in self.resource_types))
@@ -162,6 +177,7 @@ def credential_origin(value: str, origin_only: bool = False) -> str:
 class ResolvedAccountCredential:
     binding: AccountRouteBinding
     headers: Mapping[str, str] = field(repr=False)
+    query: QueryCredentialAuth | None = field(default=None, repr=False)
 
 
 def _validate_account_target(target: str) -> None:
@@ -215,6 +231,8 @@ def validate_account_request(
 ) -> None:
     if any(name.lower().startswith("x-pass-") for name in headers):
         raise ValueError("Account credential routes do not accept client header overrides")
+    if policy.query is not None and any(name.casefold() == policy.query.name.casefold() for name in query_names):
+        raise ValueError("Clients cannot supply the account credential query parameter")
     if not set(query_names).issubset(policy.allowed_query_parameters):
         raise ValueError("Account credential route query parameter is not allowed")
 
@@ -241,8 +259,8 @@ def resolve_account_credential(
         raise ValueError("Named account credential is not allowed for this origin")
     values: Final = MappingProxyType(payload.credential_values)
 
-    def header_value(header: CredentialHeader) -> str:
-        raw: Final = values.get(header.field)
+    def bare_secret(destination: CredentialHeader | CredentialQuery) -> str:
+        raw: Final = values.get(destination.field)
         text: Final = raw.get_secret_value() if isinstance(raw, SecretStr) else raw
         from litellm.secret_managers.main import get_secret_str
 
@@ -253,7 +271,7 @@ def resolve_account_credential(
             or any(ord(character) < 32 or ord(character) > 126 for character in value)
         ):
             raise ValueError("Named account credential field is unavailable or invalid")
-        return header.prefix + value
+        return value
 
     return ResolvedAccountCredential(
         binding=AccountRouteBinding(
@@ -262,5 +280,10 @@ def resolve_account_credential(
             origin=origin,
             provider=info.cube_provider_id,
         ),
-        headers=MappingProxyType({header.name: header_value(header) for header in policy.headers}),
+        headers=MappingProxyType({header.name: header.prefix + bare_secret(header) for header in policy.headers}),
+        query=_query_auth(policy.query, bare_secret(policy.query)) if policy.query is not None else None,
     )
+
+
+def _query_auth(destination: CredentialQuery, secret: str) -> QueryCredentialAuth:
+    return QueryCredentialAuth(destination.name, destination.prefix + secret, secret)

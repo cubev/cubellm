@@ -10,6 +10,7 @@ from litellm.proxy.pass_through_endpoints.account_credentials import (
     AccountApplicationGrant,
     AccountHeaderCredential,
     CredentialHeader,
+    CredentialQuery,
     account_application_allowed,
     credential_origin,
     resolve_account_credential,
@@ -332,3 +333,36 @@ def test_concrete_grants_outside_item_shapes_keep_their_exact_behavior(path: str
     )
     assert account_application_allowed(policy, "fixture-app", "a" * 64, path, "POST")
     assert not account_application_allowed(policy, "fixture-app", "a" * 64, path + "/child", "POST")
+
+
+QUERY_SECRET: Final = "fixture +/ credential&ticket=forged%"
+QUERY_POLICY: Final = AccountHeaderCredential(
+    account_id="fixture-account",
+    credential_name="fixture credential",
+    query=CredentialQuery(name="ticket.v2~", field="access value", prefix="k:"),
+    allowed_query_parameters=("page", "tag"),
+)
+
+
+def test_query_credentials_need_a_destination_that_clients_cannot_name() -> None:
+    with pytest.raises(ValidationError, match="header or a query parameter"):
+        AccountHeaderCredential(account_id="fixture-account", credential_name="fixture credential")
+    with pytest.raises(ValidationError, match="also be a client query parameter"):
+        AccountHeaderCredential.model_validate(QUERY_POLICY.model_dump() | {"allowed_query_parameters": ["TICKET.V2~"]})
+    for name in ("ticket.v2~", "TICKET.v2~"):
+        with pytest.raises(ValueError, match="Clients cannot supply the account credential query parameter"):
+            validate_account_request(QUERY_POLICY, {}, ("page", name))
+    validate_account_request(QUERY_POLICY, {}, ("page", "tag"))
+
+
+@pytest.mark.parametrize("name", ("api key", "a&b", "a=b", "", "x" * 129))
+def test_query_credential_names_are_plain_unreserved_tokens(name: str) -> None:
+    with pytest.raises(ValidationError):
+        CredentialQuery(name=name, field="access value")
+
+
+def test_query_credential_resolution_keeps_the_value_private_and_headers_empty() -> None:
+    resolved: Final = resolve_account_credential(QUERY_POLICY, credential(QUERY_SECRET), "https://vendor.example/v1")
+    assert resolved.headers == {} and resolved.query is not None
+    assert QUERY_SECRET not in repr(resolved) and QUERY_SECRET not in repr(resolved.query)
+    assert resolved.query.redact(f"k:{QUERY_SECRET} and {QUERY_SECRET}") == "[redacted] and [redacted]"

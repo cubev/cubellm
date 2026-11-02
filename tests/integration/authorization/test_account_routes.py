@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from hashlib import sha256
 from pathlib import Path
 from typing import Final
+from urllib.parse import quote, quote_plus
 
 import httpx
 import pytest
@@ -146,6 +147,111 @@ def test_created_account_route_serves_only_the_granted_application_key(gateway: 
         )
         assert blocked.status_code in (401, 403), blocked.text
         assert _observed(gateway) == []
+
+
+def _encoded(value: str) -> tuple[str, ...]:
+    return (value, quote(value, safe=""), quote(value), quote_plus(value))
+
+
+def test_query_credential_route_injects_only_for_the_granted_application_and_keeps_the_key_private(
+    gateway: Gateway,
+) -> None:
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-account-{marker}"
+    provider_value: Final = f"synthetic +/&= {marker}"
+    path: Final = f"/cube_api/integration-{marker}/quota"
+    route_id: Final = f"integration-query-route-{marker}"
+    application: Final = f"integration-app-{marker}"
+    handle: Final = register_scenario(
+        marker, JsonResponse(content_type="application/json", body={"quota": 42, "echo": f"k:{provider_value}"})
+    )
+    with gateway.scenario() as scenario:
+        scenario.cleanups.callback(delete_scenario, handle)
+        credential: Final = _credential(gateway, scenario, account, provider_value)
+        route_definition: Final[dict[str, JsonValue]] = {
+            "id": route_id,
+            "path": path,
+            "target": f"{handle.api_base()}/v1/quota",
+            "methods": ["POST"],
+            "account_credential": {
+                "account_id": account,
+                "credential_name": credential,
+                "query": {"name": "ticket.v2~", "field": "api_key", "prefix": "k:"},
+                "allowed_query_parameters": ["page"],
+            },
+        }
+        created: Final = gateway.post("/cube_control/account_routes", {"route": route_definition})
+        scenario.cleanups.callback(_delete_route, gateway, route_id)
+        route: Final = object_value(created["route"])
+        assert gateway.get("/cube_control/capabilities")["passthrough_account_query_credential"] == (
+            "query_parameter_v1"
+        )
+        repeated: Final = gateway.post("/cube_control/account_routes", {"route": route_definition})
+        assert (created["created"], repeated["created"]) == (True, False)
+        assert object_value(repeated["route"])["fingerprint"] == route["fingerprint"]
+        moved: Final = {
+            **route_definition,
+            "account_credential": {
+                **object_value(route_definition["account_credential"]),
+                "query": {"name": "token", "field": "api_key", "prefix": "k:"},
+            },
+        }
+        assert gateway.request("POST", "/cube_control/account_routes", {"route": moved}).status_code == 409
+        assert not [form for form in _encoded(provider_value) if form in str(created)]
+
+        key, key_hash = _application_key(scenario, application, [path])
+        other_key, _ = _application_key(scenario, f"integration-other-{marker}", [path])
+        _grant(
+            gateway,
+            route_id,
+            string_value(route["fingerprint"]),
+            {
+                "application_id": application,
+                "key_hash": key_hash,
+                "account_id": account,
+                "path": path,
+                "methods": ["POST"],
+            },
+        )
+        _observed(gateway)
+        served: Final = eventually(
+            lambda: gateway.request("POST", path, {"marker": marker}, key=key, params={"page": "7"}),
+            lambda response: response.status_code != 404,
+            seconds=60,
+        )
+        assert (served.status_code, served.json()) == (200, {"quota": 42, "echo": "[redacted]"}), served.text
+        observed: Final = [object_value(value) for value in _observed(gateway)]
+        assert [(value["path"], value["authorization"], value["body"]) for value in observed] == [
+            (f"/{marker}/v1/quota", "", {"marker": marker})
+        ]
+        assert httpx.QueryParams(string_value(observed[0]["query"])).multi_items() == [
+            ("page", "7"),
+            ("ticket.v2~", f"k:{provider_value}"),
+        ]
+
+        for params in ({"ticket.v2~": "forged"}, {"TICKET.V2~": "forged"}, {"page": "7", "other": "x"}):
+            assert gateway.request("POST", path, {"marker": marker}, key=key, params=params).status_code == 400
+        assert gateway.request("POST", path, {"marker": marker}, key=other_key, params={"page": "7"}).status_code == 403
+        assert gateway.request("POST", path, {"marker": marker}, params={"page": "7"}).status_code == 403
+        assert _observed(gateway) == []
+
+        rows: Final = eventually(
+            lambda: read_rows(
+                'SELECT call_type, spend, api_base, metadata, response FROM "LiteLLM_SpendLogs" WHERE api_key = %s',
+                (key_hash,),
+            ),
+            lambda values: len(values) == 1,
+            seconds=70,
+        )
+        metadata: Final = object_value(rows[0]["metadata"])
+        assert (
+            rows[0]["call_type"],
+            metadata["provider_account_id"],
+            metadata["user_api_key_application_id"],
+            metadata["provider_account_source"],
+            metadata["provider_cost_status"],
+        ) == ("pass_through_endpoint", account, application, "configured_credential", "unverified")
+        assert not [form for form in _encoded(provider_value) if form in json.dumps(rows, default=str)]
 
 
 def _grant(gateway: Gateway, route_id: str, fingerprint: str, grant: dict[str, JsonValue]) -> None:

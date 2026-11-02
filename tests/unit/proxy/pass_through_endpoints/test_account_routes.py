@@ -419,3 +419,33 @@ def test_declared_resource_types_are_persisted_and_change_the_fingerprint() -> N
     assert not isinstance(with_resources, GrantFailure) and not isinstance(without_resources, GrantFailure)
     assert with_resources.fingerprint != without_resources.fingerprint
     assert plan_account_route(settings(without), definition) == GrantFailure("conflict")
+
+
+def query_definition(name: str) -> AccountRouteDefinition:
+    return AccountRouteDefinition.model_validate(
+        {
+            **DEFINITION.model_dump(),
+            "account_credential": {
+                "account_id": "fixture-account",
+                "credential_name": "fixture-credential",
+                "query": {"name": name, "field": "api_key"},
+                "allowed_query_parameters": ["page"],
+            },
+        }
+    )
+
+
+def test_query_destination_is_stored_only_when_set_and_bound_into_the_fingerprint() -> None:
+    header_credential: Final = DEFINITION.stored()["account_credential"]
+    assert isinstance(header_credential, dict) and "query" not in header_credential
+    stored: Final = query_definition("ticket").stored()
+    credential: Final = stored["account_credential"]
+    assert isinstance(credential, dict)
+    assert (credential["headers"], credential["query"]) == ([], {"name": "ticket", "field": "api_key", "prefix": ""})
+    assert plan_account_route(settings(stored), query_definition("ticket")) is False
+    assert plan_account_route(settings(stored), query_definition("token")) == GrantFailure("conflict")
+    fingerprints: Final = tuple(
+        describe_account_route(settings(query_definition(name).stored()), DEFINITION.id) for name in ("ticket", "token")
+    )
+    assert not any(isinstance(descriptor, GrantFailure) for descriptor in fingerprints)
+    assert len({descriptor.fingerprint for descriptor in fingerprints if not isinstance(descriptor, GrantFailure)}) == 2

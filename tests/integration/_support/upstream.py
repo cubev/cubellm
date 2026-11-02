@@ -64,6 +64,7 @@ class Observation:
     path: str
     authorization: str
     body: dict[str, JsonValue]
+    query: str = ""
 
 
 class _ScenarioRegistration(BaseModel):
@@ -89,9 +90,12 @@ def _aws_event_frame(
     scenario_id: str,
     unique_id: str,
 ) -> bytes:
-    payload_bytes: Final = json.dumps(payload, separators=(",", ":")).replace(
-        "$REQUEST_ID", scenario_id
-    ).replace("$UNIQUE_ID", unique_id).encode()
+    payload_bytes: Final = (
+        json.dumps(payload, separators=(",", ":"))
+        .replace("$REQUEST_ID", scenario_id)
+        .replace("$UNIQUE_ID", unique_id)
+        .encode()
+    )
     headers_bytes: Final = (
         _aws_str_header(":event-type", event_type)
         + _aws_str_header(":content-type", "application/json")
@@ -147,7 +151,13 @@ class Provider:
             status: Final = script.popleft()
             if status != 200:
                 return JSONResponse(
-                    {"error": {"message": "Controlled provider failure", "type": error_type(status), "code": str(status)}},
+                    {
+                        "error": {
+                            "message": "Controlled provider failure",
+                            "type": error_type(status),
+                            "code": str(status),
+                        }
+                    },
                     status_code=status,
                 )
         return await chat_completions(request)
@@ -198,7 +208,9 @@ class Provider:
         return JSONResponse(
             {
                 "requests": [
-                    {"path": value.path, "authorization": value.authorization, "body": value.body} for value in values
+                    {"path": value.path, "authorization": value.authorization, "body": value.body}
+                    | ({"query": value.query} if value.query else {})
+                    for value in values
                 ]
             }
         )
@@ -245,7 +257,7 @@ class Provider:
                 body: Final = JSON_OBJECT.validate_json(raw_body)
                 if isinstance(body, dict):
                     self.observations.put(
-                        Observation(request.url.path, request.headers.get("authorization", ""), body)
+                        Observation(request.url.path, request.headers.get("authorization", ""), body, request.url.query)
                     )
         if isinstance(response, RoutedResponse):
             route_key: Final = f"{request.method} /{'/'.join(segments[1:])}"
@@ -300,11 +312,10 @@ class Provider:
         match response:
             case JsonResponse():
                 return Response(
-                    content=json.dumps(response.body, separators=(",", ":")).replace(
-                        "$REQUEST_ID", scenario_id
-                    ).replace(
-                        "$UNIQUE_ID", unique_id
-                    ).encode(),
+                    content=json.dumps(response.body, separators=(",", ":"))
+                    .replace("$REQUEST_ID", scenario_id)
+                    .replace("$UNIQUE_ID", unique_id)
+                    .encode(),
                     media_type=response.content_type,
                     status_code=response.status,
                 )
@@ -321,6 +332,7 @@ class Provider:
                 )
             case SseResponse():
                 if response.frame_delay_ms > 0:
+
                     async def stream() -> AsyncIterator[bytes]:
                         for frame in response.frames:
                             yield (
@@ -329,9 +341,11 @@ class Provider:
                             await asyncio.sleep(response.frame_delay_ms / 1000)
 
                     return StreamingResponse(stream(), media_type=response.content_type)
-                stream_body: Final = ("\n\n".join(response.frames) + "\n\n").replace(
-                    "$REQUEST_ID", scenario_id
-                ).replace("$UNIQUE_ID", unique_id)
+                stream_body: Final = (
+                    ("\n\n".join(response.frames) + "\n\n")
+                    .replace("$REQUEST_ID", scenario_id)
+                    .replace("$UNIQUE_ID", unique_id)
+                )
                 return Response(content=stream_body.encode(), media_type=response.content_type)
             case EventStreamResponse():
                 events: Final = (

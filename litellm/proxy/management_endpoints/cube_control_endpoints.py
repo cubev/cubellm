@@ -57,6 +57,7 @@ class CubeControlCapabilities(BaseModel):
     passthrough_account_grant_management: Literal["atomic_append_v1"] = "atomic_append_v1"
     passthrough_account_route_management: Literal["atomic_create_v1"] = "atomic_create_v1"
     passthrough_account_resources: Literal["application_ownership_v1"] = "application_ownership_v1"
+    passthrough_account_query_credential: Literal["query_parameter_v1"] = "query_parameter_v1"
     account_inventory: Literal["gateway_bindings_v1"] = "gateway_bindings_v1"
     credential_values_full_masking: Literal[True] = True
     virtual_key_log_redaction: Literal[True] = True

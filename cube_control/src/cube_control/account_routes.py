@@ -3,7 +3,7 @@ from typing import Annotated, Final, Literal, Self
 from urllib.parse import quote, unquote
 
 import httpx
-from pydantic import BaseModel, Field, JsonValue, SecretStr, StrictInt, StrictStr, model_validator
+from pydantic import BaseModel, Field, JsonValue, SecretStr, StrictInt, StrictStr, ValidationError, model_validator
 
 from cube_control.application_accounts import (
     AccountCapabilities,
@@ -49,6 +49,12 @@ class AccountRouteHeader(FrozenModel):
     prefix: Annotated[str, Field(pattern=r"^[ -~]{0,32}$")] = ""
 
 
+class AccountRouteQuery(FrozenModel):
+    name: Annotated[str, Field(pattern=r"^[A-Za-z0-9._~-]{1,128}$")]
+    field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    prefix: Annotated[str, Field(pattern=r"^[ -~]{0,32}$")] = ""
+
+
 ResourceTypeName = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
 ResourceId = Annotated[str, Field(pattern=r"^[A-Za-z0-9._~:@-]{1,256}$")]
 ResourceSelector = Annotated[
@@ -89,7 +95,8 @@ class AccountRouteSpec(FrozenModel):
     route_id: Identifier
     account_id: Identifier
     credential_name: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
-    headers: Annotated[tuple[AccountRouteHeader, ...], Field(min_length=1, max_length=8)]
+    headers: Annotated[tuple[AccountRouteHeader, ...], Field(max_length=8)] = ()
+    query: AccountRouteQuery | None = None
     allowed_query_parameters: Annotated[tuple[str, ...], Field(max_length=32)] = ()
     target: Annotated[str, Field(min_length=1, max_length=2048)]
     path: AccountPath
@@ -101,6 +108,12 @@ class AccountRouteSpec(FrozenModel):
     def validate_route(self) -> Self:
         require_admin_origin(self.gateway_origin)
         require_managed_path(self.path)
+        if not self.headers and self.query is None:
+            raise ValueError("Account routes need a credential header or query parameter")
+        if self.query is not None and any(
+            name.casefold() == self.query.name.casefold() for name in self.allowed_query_parameters
+        ):
+            raise ValueError("The credential query parameter cannot also be a client query parameter")
         if self.path.endswith("/"):
             raise ValueError("Managed account routes cannot end with a slash")
         if has_placeholder(self.path):
@@ -131,6 +144,7 @@ class AccountRouteSpec(FrozenModel):
                     "account_id": self.account_id,
                     "credential_name": self.credential_name,
                     "headers": [header.model_dump(mode="json") for header in self.headers],
+                    **({"query": self.query.model_dump(mode="json")} if self.query is not None else {}),
                     "allowed_query_parameters": list(self.allowed_query_parameters),
                     **(
                         {
@@ -158,6 +172,10 @@ class _RouteCapabilities(AccountCapabilities):
     passthrough_account_route_management: Literal["atomic_create_v1"]
 
 
+class _QueryCredentialCapabilities(_RouteCapabilities):
+    passthrough_account_query_credential: Literal["query_parameter_v1"]
+
+
 class _RouteReceipt(BaseModel):
     stored: Literal[True]
     created: bool
@@ -180,6 +198,11 @@ def _ensure(client: httpx.Client, spec: AccountRouteSpec) -> AccountRouteResult:
     if caps_code != 200:
         return result("error", "Gateway route management capabilities unavailable")
     _RouteCapabilities.model_validate_json(caps_raw)
+    if spec.query is not None:
+        try:
+            _ = _QueryCredentialCapabilities.model_validate_json(caps_raw)
+        except ValidationError:
+            return result("error", "Gateway does not support query parameter credentials; nothing stored")
     if spec.resource_types:
         AccountResourceCapabilities.model_validate_json(caps_raw)
     code, raw = request_gateway(client, "POST", "/cube_control/account_routes", spec.command())

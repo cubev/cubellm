@@ -178,6 +178,7 @@ async def test_capabilities_reports_running_policy_without_configuration_secrets
         "passthrough_account_grant_management": "atomic_append_v1",
         "passthrough_account_route_management": "atomic_create_v1",
         "passthrough_account_resources": "application_ownership_v1",
+        "passthrough_account_query_credential": "query_parameter_v1",
         "account_inventory": "gateway_bindings_v1",
         "virtual_key_log_redaction": True,
         "custom_keys_allowed": disable_custom_keys not in (True, "true"),
