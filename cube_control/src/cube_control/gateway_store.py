@@ -1,6 +1,7 @@
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
-from typing import Final, Literal, LiteralString
+from typing import Final, Literal, LiteralString, Protocol
 
 import psycopg
 from psycopg import Connection
@@ -56,12 +57,40 @@ def current_records(connection: Connection[tuple[str, ...]]) -> tuple[GatewayRec
     )
 
 
+def period_records(
+    connection: Connection[tuple[str, ...]], start: datetime, end: datetime
+) -> tuple[GatewayRecord, ...]:
+    return tuple(
+        GatewayRecord.model_validate_json(row[0])
+        for row in connection.execute(
+            "SELECT payload::text FROM cube_control.gateway_records "
+            "WHERE (payload->>'occurred_at')::timestamptz >= %s AND (payload->>'occurred_at')::timestamptz < %s",
+            (start, end),
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayPeriod:
+    scans: tuple[GatewayScanView, ...]
+    records: tuple[GatewayRecord, ...]
+
+
+class GatewayPeriodReader(Protocol):
+    def period(self, start: datetime, end: datetime) -> GatewayPeriod: ...
+
+
 @dataclass(frozen=True, slots=True)
 class GatewayRepository:
     dsn: str
 
     def connect(self) -> Connection[tuple[str, ...]]:
         return psycopg.connect(self.dsn, connect_timeout=5)
+
+    def period(self, start: datetime, end: datetime) -> GatewayPeriod:
+        with self.connect() as connection:
+            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            return GatewayPeriod(latest_scans(connection), period_records(connection, start, end))
 
     def import_batch(self, batch: GatewayBatch) -> GatewayResult:
         fingerprint: Final = sha256(batch.model_dump_json().encode()).hexdigest()

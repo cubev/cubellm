@@ -42,6 +42,23 @@ class Account(FrozenModel):
     note: Annotated[str, Field(max_length=300)] = ""
 
 
+def absent(value: object) -> bool:
+    return value is None
+
+
+class SpendCoverage(FrozenModel):
+    start: AwareDatetime
+    end: AwareDatetime
+    basis: Literal["final_billing_statement", "usage_to_date"]
+    scope: Literal["account_total"]
+
+    @model_validator(mode="after")
+    def ordered(self) -> Self:
+        if self.start >= self.end:
+            raise ValueError("Coverage must end after it starts")
+        return self
+
+
 class Observation(FrozenModel):
     account_id: Identifier
     external_id: Identifier
@@ -74,9 +91,18 @@ class Observation(FrozenModel):
     expires_at: AwareDatetime | None = None
     fresh_for_seconds: Annotated[int, Field(ge=30, le=2678400)] = 900
     message: Annotated[str, Field(max_length=300)] = ""
+    coverage: SpendCoverage | None = Field(default=None, exclude_if=absent)
 
     @model_validator(mode="after")
     def validate_measurement(self) -> Self:
+        if self.coverage is not None and self.metric != "spend":
+            raise ValueError("Structured coverage applies to spending only")
+        if (
+            self.coverage is not None
+            and self.coverage.basis == "final_billing_statement"
+            and self.observed_at < self.coverage.end
+        ):
+            raise ValueError("A final billing statement cannot be observed before its coverage ends")
         if self.status in ("unknown", "error", "not_configured") and self.value is not None:
             raise ValueError("Unavailable observations cannot carry a current value")
         if self.status in ("known", "manual", "estimated") and (self.value is None or self.unit is None):
@@ -374,6 +400,7 @@ class GatewayScan(FrozenModel):
     unassigned_rows: Annotated[int, Field(ge=0)] = 0
     rejected_rows: Annotated[int, Field(ge=0)] = 0
     message: Annotated[str, Field(max_length=300)] = ""
+    coverage_start: AwareDatetime | None = Field(default=None, exclude_if=absent)
 
 
 class GatewayBatch(FrozenModel):

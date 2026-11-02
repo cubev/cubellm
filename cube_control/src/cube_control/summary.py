@@ -49,7 +49,11 @@ def current_measurement(
         return False
     if reading.metric in ("spend", "budget") and reading.period != period:
         return False
-    return not any(
+    return not superseded(reading, observations)
+
+
+def superseded(reading: Observation, observations: tuple[Observation, ...]) -> bool:
+    return any(
         o.account_id == reading.account_id
         and o.source == reading.source
         and o.snapshot_scope == reading.snapshot_scope

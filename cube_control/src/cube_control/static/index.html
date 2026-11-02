@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="de">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CubeLLM · Übersicht</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/usage.js" defer></script><script src="/manage.js" defer></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CubeLLM · Übersicht</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/usage.js" defer></script><script src="/reconciliation.js" defer></script><script src="/manage.js" defer></script></head>
 <body>
 <header><a class="brand" href="/" aria-label="CubeLLM Übersicht"><span class="mark">C</span><span>CubeLLM<small>Deine AI-Dienste im Blick</small></span></a><div class="live"><i></i><span id="connection">Verbinde …</span><button id="refresh" type="button">Aktualisieren</button></div></header>
 <main>
@@ -11,6 +11,18 @@
 <nav class="filters" aria-label="Konten filtern"><button data-filter="all" class="selected">Alle Konten</button><button data-filter="subscription">Subscriptions</button><button data-filter="api">API-Zugänge</button><span id="count"></span></nav>
 <section id="accounts" class="grid" aria-label="Anbieterkonten"><div class="empty">Kontodaten werden geladen …</div></section>
 <section class="inventory-section" aria-labelledby="inventory-heading"><h2 id="inventory-heading">Konteninventar</h2><p class="explanation">Gateway-Bindungen je Quelle. Aus früheren Scans behaltene Einträge sind markiert und nicht als aktuell gelesen dargestellt. Unbekannte Konten bleiben sichtbar, bis sie ausdrücklich aufgenommen werden.</p><div id="inventory"><div class="empty">Inventar wird geladen …</div></div></section>
+<section class="usage-section" aria-labelledby="reconcile-heading">
+<h2 id="reconcile-heading">Monatsabgleich Anbieter und Gateway</h2>
+<p class="explanation">Vergleicht nur finale Anbieter-Monatsabrechnungen in USD mit vollständig erfassten Gateway-Anbieteraufrufen desselben Kontos. Die Anbietersumme umfasst auch Nutzung außerhalb des Gateways, daher ist eine höhere Anbietersumme vereinbar und keine Gleichheit. Zwischenstände, unbekannte Kosten und unvollständige Erfassung bleiben nicht vergleichbar.</p>
+<form id="reconcile-form" class="usage-filters"><label>Monat (UTC)<input id="reconcile-period" type="month" required></label><label>Konto, Anbieter oder Quelle<input id="reconcile-search" type="search" maxlength="128" placeholder="Alle"></label><button id="reconcile-load" type="submit">Abgleich laden</button></form>
+<p id="reconcile-status" role="status">Monat auswählen und Abgleich laden.</p>
+<p id="reconcile-sources"></p>
+<ul id="reconcile-scans" aria-label="Gateway-Quellen"></ul>
+<p id="reconcile-unattributed"></p>
+<div class="usage-table-scroll" tabindex="0" role="region" aria-label="Monatsabgleich, horizontal scrollbar">
+<table class="usage-table"><thead><tr><th scope="col">Konto</th><th scope="col">Anbieterwert</th><th scope="col">Gateway</th><th scope="col">Differenz</th><th scope="col">Ergebnis</th><th scope="col">Nachweise</th></tr></thead><tbody id="reconcile-rows"></tbody></table>
+</div>
+</section>
 <section class="usage-section" aria-labelledby="usage-heading">
 <h2 id="usage-heading">Einzelne Gateway-Aufrufe prüfen</h2>
 <p class="explanation">Gespeicherte Gateway-Aufrufe mit Originalbeträgen. Gateway-Kosten sind keine bestätigte Anbieterabrechnung. Fehlende Konten- und Anwendungszuordnungen bleiben ausdrücklich unbekannt.</p>

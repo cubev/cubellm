@@ -43,6 +43,7 @@ from cube_control.media import JobCommand, PostgresJobManager
 from cube_control.models import GatewayBatch, Identifier, ImportBatch, ManualCommand
 from cube_control.native_gateway import PROJECTION_COLUMNS, prepare_native_gateway
 from cube_control.openrouter import collect_openrouter
+from cube_control.reconciliation import PERIOD_REJECTED, parse_period, reconcile_stored
 from cube_control.provider_access import Unavailable, read_private_key
 from cube_control.store import PostgresRepository
 from cube_control.usage import PostgresUsageReader
@@ -66,6 +67,7 @@ class CommandArguments(argparse.Namespace):
     source_id: str
     register: Path
     plan: Path
+    period: str | None
 
 
 SOURCE_IDENTIFIER: Final = TypeAdapter[str](Identifier)
@@ -152,6 +154,8 @@ def main() -> int:
     credential_parser.add_argument("--plan", required=True, type=Path)
     import_parser: Final = sub.add_parser("import")
     import_parser.add_argument("path", nargs="?", default="-")
+    reconcile_parser: Final = sub.add_parser("reconcile")
+    reconcile_parser.add_argument("--period")
     serve_parser: Final = sub.add_parser("serve")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=4001)
@@ -291,6 +295,22 @@ def main() -> int:
     if args.command == "init":
         repository.initialize()
         print("CubeLLM Control schema ready")
+        return 0
+    if args.command == "reconcile":
+        reconcile_now: Final = datetime.now(UTC)
+        period: Final = args.period or reconcile_now.strftime("%Y-%m")
+        bounds: Final = parse_period(period)
+        if bounds is None:
+            print(PERIOD_REJECTED, file=sys.stderr)
+            return 2
+        try:
+            report: Final = reconcile_stored(
+                repository.state(), GatewayRepository(dsn).period(*bounds), period, reconcile_now
+            )
+        except psycopg.Error:
+            print("Central database is unavailable", file=sys.stderr)
+            return 1
+        print(report.model_dump_json(indent=2))
         return 0
     if args.command == "manage-job":
         with sys.stdin if args.path == "-" else Path(args.path).open() as job_input:
@@ -478,6 +498,7 @@ def main() -> int:
             usage_reader=PostgresUsageReader(dsn),
             job_reader=PostgresJobManager(dsn),
             authority=authority,
+            gateway_reader=GatewayRepository(dsn),
         ),
         host=args.host,
         port=args.port,

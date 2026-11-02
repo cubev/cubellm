@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Final, Literal
 
@@ -13,6 +13,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from cube_control.browser_management import add_browser_management
 from cube_control.browser_session import SessionAuthority
 from cube_control.gateway import gateway_metrics
+from cube_control.gateway_store import GatewayPeriodReader
 from cube_control.inventory import AccountInventoryReport, account_inventory
 from cube_control.media import JobHistory, JobReader, JobSnapshot
 from cube_control.models import (
@@ -23,6 +24,7 @@ from cube_control.models import (
     ProviderId,
     utc_now,
 )
+from cube_control.reconciliation import PERIOD_REJECTED, ReconciliationReport, parse_period, reconcile_stored
 from cube_control.store import Repository
 from cube_control.summary import ReadingView, account_view, reading_view
 from cube_control.usage import UsageFailure, UsageHistory, UsagePage, UsageQuery, UsageReader
@@ -74,6 +76,7 @@ def create_app(
     usage_reader: UsageReader | None = None,
     job_reader: JobReader | None = None,
     authority: SessionAuthority | None = None,
+    gateway_reader: GatewayPeriodReader | None = None,
 ) -> FastAPI:
     app: Final[FastAPI] = FastAPI(title="CubeLLM Control", docs_url=None, redoc_url=None, openapi_url=None)
     static: Final[Path] = Path(__file__).parent / "static"
@@ -129,6 +132,21 @@ def create_app(
         except psycopg.Error:
             raise HTTPException(503, detail="Zentrale Datenbank ist nicht erreichbar") from None
         return account_inventory(state, clock())
+
+    def reconciliation(
+        period: Annotated[str | None, Query(max_length=7)] = None,
+    ) -> ReconciliationReport:
+        now: Final[datetime] = clock()
+        selected: Final = period or now.astimezone(UTC).strftime("%Y-%m")
+        bounds: Final = parse_period(selected)
+        if bounds is None:
+            raise HTTPException(422, detail=PERIOD_REJECTED)
+        try:
+            state: Final = repository.state()
+            gateway: Final = gateway_reader.period(*bounds) if gateway_reader is not None else None
+        except psycopg.Error:
+            raise HTTPException(503, detail="Zentrale Datenbank ist nicht erreichbar") from None
+        return reconcile_stored(state, gateway, selected, now)
 
     def fleet() -> FleetSnapshot | None:
         try:
@@ -196,6 +214,9 @@ def create_app(
     def usage_script() -> FileResponse:
         return FileResponse(static / "usage.js", media_type="application/javascript")
 
+    def reconciliation_script() -> FileResponse:
+        return FileResponse(static / "reconciliation.js", media_type="application/javascript")
+
     def manage_script() -> FileResponse:
         return FileResponse(static / "manage.js", media_type="application/javascript")
 
@@ -204,6 +225,7 @@ def create_app(
     app.add_api_route("/api/v1/capabilities", capabilities, methods=["GET"], response_model=CapabilitiesResponse)
     app.add_api_route("/api/v1/summary", summary, methods=["GET"], response_model=SummaryResponse)
     app.add_api_route("/api/v1/inventory", inventory, methods=["GET"], response_model=AccountInventoryReport)
+    app.add_api_route("/api/v1/reconciliation", reconciliation, methods=["GET"], response_model=ReconciliationReport)
     app.add_api_route("/api/v1/fleet", fleet, methods=["GET"], response_model=FleetSnapshot | None)
     app.add_api_route("/api/v1/usage", usage, methods=["GET"], response_model=UsagePage)
     app.add_api_route(
@@ -222,4 +244,5 @@ def create_app(
     app.add_api_route("/style.css", stylesheet, methods=["GET"])
     app.add_api_route("/usage.js", usage_script, methods=["GET"])
     app.add_api_route("/manage.js", manage_script, methods=["GET"])
+    app.add_api_route("/reconciliation.js", reconciliation_script, methods=["GET"])
     return app
