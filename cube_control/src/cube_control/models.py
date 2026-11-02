@@ -51,11 +51,14 @@ class SpendCoverage(FrozenModel):
     end: AwareDatetime
     basis: Literal["final_billing_statement", "usage_to_date"]
     scope: Literal["account_total"]
+    query_end: AwareDatetime | None = Field(default=None, exclude_if=absent)
 
     @model_validator(mode="after")
     def ordered(self) -> Self:
         if self.start >= self.end:
             raise ValueError("Coverage must end after it starts")
+        if self.query_end is not None and self.query_end < self.end:
+            raise ValueError("Coverage cannot extend beyond the provider query")
         return self
 
 

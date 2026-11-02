@@ -34,6 +34,7 @@ from cube_control.reconciliation import (
     reconcile_stored,
 )
 from cube_control.store import ImportResult, ManualResult, PostgresRepository, StoredState
+from cube_control.summary import latest_measurements
 
 
 class UntouchedStore:
@@ -231,6 +232,17 @@ class ReconciliationTests(unittest.TestCase):
         at_end: Final = row(observations=(statement("10.3", observed_at=END),))
         self.assertEqual((at_end.reasons, at_end.comparison), ((), "consistent_with_provider_total"))
 
+    def test_enriched_evidence_wins_a_tie_with_its_legacy_projection_in_any_order(self) -> None:
+        enriched: Final = statement("10.10", external_id="enriched")
+        legacy: Final = enriched.model_copy(update={"coverage": None, "external_id": "legacy"})
+        for observations in ((legacy, enriched), (enriched, legacy)):
+            with self.subTest(first=observations[0].external_id):
+                self.assertEqual(latest_measurements(ACCOUNT.id, observations), (enriched,))
+        with self.assertRaisesRegex(ValidationError, "beyond the provider query"):
+            SpendCoverage(
+                start=START, end=END, basis="usage_to_date", scope="account_total", query_end=END - timedelta(1)
+            )
+
     def test_month_to_date_figures_never_count_as_a_closed_comparison(self) -> None:
         now: Final = datetime(2026, 9, 20, tzinfo=UTC)
         result: Final = row(
@@ -396,6 +408,31 @@ class ReconciliationStoreTests(unittest.TestCase):
         self.assertEqual(
             (report.period, report.gateway_loaded, own.gateway.provider_request_usd, own.delta),
             ("2026-09", True, Decimal("2.500000000000000001"), Decimal("1.499999999999999999")),
+        )
+
+    def test_a_downgraded_import_and_its_enriched_retry_coexist_without_identity_conflicts(self) -> None:
+        enriched: Final = statement("4", source="import", external_id="local-enriched").model_copy(
+            update={"account_id": self.account.id}
+        )
+        legacy: Final = enriched.model_copy(update={"coverage": None, "external_id": "local-legacy"})
+        results: Final = tuple(
+            self.repository.import_batch(ImportBatch(accounts=(self.account,), observations=observations))
+            for observations in ((legacy,), (enriched,), (enriched,), (legacy,))
+        )
+        self.assertEqual([result.ok for result in results], [True] * 4)
+        self.assertEqual([result.inserted for result in results], [1, 1, 0, 0])
+        conflicting: Final = enriched.model_copy(update={"value": Decimal("5")})
+        self.assertFalse(self.repository.import_batch(ImportBatch(observations=(conflicting,))).ok)
+        state: Final = self.repository.state()
+        stored: Final = tuple(item for item in state.observations if item.account_id == self.account.id)
+        self.assertEqual(sorted(item.external_id for item in stored), ["local-enriched", "local-legacy"])
+        self.assertEqual(latest_measurements(self.account.id, stored), (enriched,))
+        own: Final = next(
+            item for item in reconcile_stored(state, None, "2026-09", CLOSED).rows if item.account_id == self.account.id
+        )
+        self.assertEqual(
+            own.provider_reading.coverage if own.provider_reading else None,
+            enriched.coverage,
         )
 
 

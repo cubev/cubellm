@@ -37,7 +37,7 @@ def latest_measurements(account_id: str, observations: tuple[Observation, ...]) 
         o for o in account_readings if o.snapshot_scope is None or o.collected_at == generations[snapshot_key(o)]
     )
     return tuple(
-        max(group, key=lambda o: (o.observed_at, o.collected_at))
+        max(group, key=lambda o: (o.observed_at, o.collected_at, o.coverage is not None))
         for _, group in groupby(sorted(matching, key=measurement_key), key=measurement_key)
     )
 

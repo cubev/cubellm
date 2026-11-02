@@ -59,6 +59,7 @@ class CapabilitiesResponse(BaseModel):
     gateway_native_account_projection: Literal["credential_snapshot_v1"] = "credential_snapshot_v1"
     account_inventory: Literal["gateway_bindings_v1"] = "gateway_bindings_v1"
     browser_management: Literal["disabled", "session_v1"] = "disabled"
+    spend_coverage: Literal["v1"] = "v1"
     gateway_projection_fields: tuple[str, ...] = (
         "account_id",
         "account_evidence",
