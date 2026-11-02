@@ -18,6 +18,7 @@ from pydantic import SecretStr, TypeAdapter
 
 from cube_control.api import create_app
 from cube_control.browser_session import private_authority
+from cube_control.credential_binding import CredentialBindingCommand
 from cube_control.credential_inventory import public_reference
 from cube_control.gateway_inventory import GatewayInventoryAttempt, InventoryCredential
 from cube_control.models import Account, ImportBatch, ManualChange, ManualCommand
@@ -72,18 +73,34 @@ def main() -> None:
         kind="api",
     )
     discovered: Final = f"ui-discovered-{marker}"
+    collision: Final = Account(
+        id=f"binding:{public_reference(f'ui-credentials-{marker}', credential_fixtures.COIN_KEY)}",
+        provider="custom-collision-api",
+        name=f"Collision {marker}",
+        kind="api",
+    )
+    constructor_owned: Final = all(item.id != "constructor" for item in repository.state().accounts)
+    constructor_account: Final = Account(
+        id="constructor", provider="custom-probe-api", name=f"Constructor probe {marker}", kind="api"
+    )
     gateway: Final = f"http://ui-gateway-{marker}.test"
     credential_source: Final = f"ui-credentials-{marker}"
+    orphan_source: Final = f"ui-orphans-{marker}"
+    coin_reference: Final = public_reference(credential_source, credential_fixtures.COIN_KEY)
+    orphan_reference: Final = public_reference(orphan_source, credential_fixtures.OPENAI_KEY)
     proof: Final = Path(os.environ.get("CUBE_CONTROL_BROWSER_PROOF", f"/tmp/cubellm-ui-management-{marker}"))
     proof.mkdir(parents=True, exist_ok=False)
 
     def forget() -> None:
         with repository.connect() as connection:
             connection.execute("DELETE FROM cube_control.gateway_inventories WHERE gateway_origin=%s", (gateway,))
-            connection.execute(
-                "DELETE FROM cube_control.credential_inventories WHERE source_id=%s", (credential_source,)
-            )
-            for account_id in (managed.id, discovered):
+            for reference in (coin_reference, orphan_reference):
+                connection.execute(
+                    "DELETE FROM cube_control.credential_binding_commands WHERE reference=%s", (reference,)
+                )
+            for source in (credential_source, orphan_source):
+                connection.execute("DELETE FROM cube_control.credential_inventories WHERE source_id=%s", (source,))
+            for account_id in (managed.id, discovered, collision.id, *(("constructor",) if constructor_owned else ())):
                 connection.execute("DELETE FROM cube_control.manual_commands WHERE account_id=%s", (account_id,))
                 connection.execute("DELETE FROM cube_control.accounts WHERE id=%s", (account_id,))
 
@@ -100,7 +117,9 @@ def main() -> None:
         )
         cleanup.callback(forget)
         with ExitStack() as running:
-            if not repository.import_batch(ImportBatch(accounts=(managed,))).ok:
+            if not repository.import_batch(
+                ImportBatch(accounts=(managed, collision, *((constructor_account,) if constructor_owned else ())))
+            ).ok:
                 raise AssertionError("fixture import failed")
             first: Final = datetime.now(UTC) - timedelta(minutes=20)
             later: Final = datetime.now(UTC) - timedelta(minutes=1)
@@ -149,6 +168,38 @@ def main() -> None:
                 credential_source, datetime.now(UTC), ("unreadable", "Credential inventory files are not readable")
             )
             assert failed_import == "unreadable", failed_import
+            orphan_scan: Final = datetime.now(UTC) - timedelta(days=2)
+            assert (
+                repository.record_credential_import(
+                    orphan_source,
+                    orphan_scan,
+                    credential_fixtures.parsed(credential_fixtures.standard(scanned=orphan_scan), orphan_source),
+                )
+                == "imported"
+            )
+            orphaned: Final = repository.bind_credential(
+                CredentialBindingCommand(
+                    command_id=f"orphan-{marker}",
+                    reference=orphan_reference,
+                    expected_version=0,
+                    action="bind",
+                    account_id=managed.id,
+                ),
+                "fixture-operator",
+                datetime.now(UTC),
+            )
+            assert orphaned.status == "applied", orphaned
+            cleared_scan: Final = datetime.now(UTC) - timedelta(days=1)
+            assert (
+                repository.record_credential_import(
+                    orphan_source,
+                    datetime.now(UTC),
+                    credential_fixtures.parsed(
+                        credential_fixtures.sources([], [], scanned=cleared_scan), orphan_source
+                    ),
+                )
+                == "imported"
+            )
             thread: Final = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
             thread.start()
             running.callback(stop, server, thread)
@@ -234,6 +285,146 @@ def main() -> None:
                     )
                 ), "private credential provenance reached the page"
                 coin_card.screenshot(path=str(proof / "06-credential-candidate.png"))
+
+                orphan_card: Final = inventory_box.locator(".credential-orphan").filter(has_text=orphan_reference)
+                expect(orphan_card).to_contain_text(f"Zugeordnet zu {managed.id} (Stand 1)")
+                expect(orphan_card).to_contain_text(f"Herkunft {orphan_source}")
+                expect(orphan_card).to_contain_text("Fund im letzten Scan nicht mehr enthalten")
+                expect(page.locator(".binding-form")).to_have_count(0)
+                orphan_card.get_by_role("button", name="Umhängen …").click()
+                orphan_card.locator(".binding-form input[type=text]").fill("openai-api")
+                orphan_card.locator(".binding-form input[type=checkbox]").check()
+                orphan_card.locator(".binding-form button[type=submit]").click()
+                settled(page, "Gespeichert (Stand 2)")
+                moved_orphan: Final = inventory_box.locator(".credential-orphan").filter(has_text=orphan_reference)
+                expect(moved_orphan).to_contain_text("Zugeordnet zu openai-api (Stand 2)")
+                expect(moved_orphan).to_contain_text(f"Herkunft {orphan_source}")
+                expect(page.locator(".binding-form")).to_have_count(0)
+
+                def binding_form(account: str) -> None:
+                    card = inventory_box.locator(".credential-candidate").filter(has_text=coin_reference)
+                    card.get_by_role("button", name="Zuordnen …").or_(
+                        card.get_by_role("button", name="Umhängen …")
+                    ).click()
+                    expect(page.locator(".binding-form")).to_have_count(1)
+                    card.locator(".binding-form input[type=text]").fill(account)
+                    card.locator(".binding-form input[type=checkbox]").check()
+                    card.locator(".binding-form button[type=submit]").click()
+
+                legacy_command: Final[dict[str, object]] = {
+                    "schema_version": 1,
+                    "command_id": f"legacy-{marker}",
+                    "account_id": collision.id,
+                    "expected_version": 0,
+                    "changes": [{"field": "note", "action": "set", "value": "legacy pending"}],
+                }
+                committed_legacy: Final = repository.manage(
+                    ManualCommand.model_validate(legacy_command), OPERATOR, datetime.now(UTC)
+                )
+                assert committed_legacy.status == "applied", committed_legacy
+                page.evaluate(
+                    "([key, command]) => sessionStorage.setItem('cube-control-pending-commands', JSON.stringify({[key]: command}))",
+                    [collision.id, legacy_command],
+                )
+                page.reload()
+                expect(page.locator("#management-pending")).to_contain_text(
+                    f"Befehl legacy-{marker} für {collision.id}: Ergebnis unbekannt"
+                )
+                binding_form(managed.id)
+                settled(page, "Gespeichert (Stand 1)")
+                page.get_by_role("button", name="Denselben Befehl erneut senden").click()
+                settled(page, "Bereits gespeichert (Stand 1)")
+                assert [
+                    entry.revision
+                    for entry in repository.state().manual_entries
+                    if entry.command.account_id == collision.id
+                ] == [1]
+                expect(page.locator("#management-pending")).to_be_empty()
+                if constructor_owned:
+                    constructor_card = page.locator("#accounts .card").filter(has_text=f"Constructor probe {marker}")
+                    constructor_card.get_by_role("button", name="Bearbeiten").click()
+                    expect(constructor_card.locator("form.edit-form")).to_be_visible()
+                    constructor_card.get_by_role("button", name="Bearbeiten").click()
+                coin_bound: Final = inventory_box.locator(".credential-candidate").filter(has_text=coin_reference)
+                expect(coin_bound).to_contain_text(f"Vom Bediener zugeordnet zu {managed.id} (Stand 1")
+                expect(coin_bound).to_contain_text("Gültigkeit und Anbieterzugehörigkeit ungeprüft")
+                outside_binding: Final = repository.bind_credential(
+                    CredentialBindingCommand(
+                        command_id=f"outside-binding-{marker}",
+                        reference=coin_reference,
+                        expected_version=1,
+                        action="bind",
+                        account_id="openai-api",
+                    ),
+                    "another-operator",
+                    datetime.now(UTC),
+                )
+                assert outside_binding.status == "applied", outside_binding
+                binding_form("anthropic-api")
+                settled(page, "Zwischenzeitlich geändert (Stand 2)")
+
+                def commit_then_drop(route: Route) -> None:
+                    _ = route.fetch()
+                    route.abort()
+
+                page.route("**/api/v1/credential-bindings/*/commands", commit_then_drop)
+                binding_form(managed.id)
+                expect(page.locator("#management-status")).to_contain_text("Ergebnis unbekannt")
+                page.unroute("**/api/v1/credential-bindings/*/commands")
+                expect(page.locator("#management-pending")).to_contain_text(
+                    f"Fund {coin_reference}: Zuordnung zu {managed.id}"
+                )
+                locked_card: Final = inventory_box.locator(".credential-candidate").filter(has_text=coin_reference)
+                expect(locked_card.locator(".binding-form input[type=text]")).to_be_disabled()
+                expect(locked_card.locator(".binding-form input[type=text]")).to_have_value(managed.id)
+                locked_card.get_by_role("button", name="Umhängen …").click()
+                expect(page.locator("#management-status")).to_contain_text("Befehl mit unbekanntem Ergebnis offen")
+                expect(page.locator(".binding-form")).to_have_count(1)
+                expect(locked_card.locator(".binding-form button[type=submit]")).to_be_disabled()
+                pending_binding: Final = TEXT.validate_python(
+                    page.evaluate("sessionStorage.getItem('cube-control-pending-commands') || ''")
+                )
+                page.reload()
+                expect(page.locator("#management-pending")).to_contain_text(
+                    f"Fund {coin_reference}: Zuordnung zu {managed.id}"
+                )
+                inventory_box.locator(".credential-candidate").filter(has_text=coin_reference).get_by_role(
+                    "button", name="Umhängen …"
+                ).click()
+                expect(page.locator("#management-status")).to_contain_text("Befehl mit unbekanntem Ergebnis offen")
+                expect(page.locator(".binding-form")).to_have_count(0)
+                assert (
+                    TEXT.validate_python(page.evaluate("sessionStorage.getItem('cube-control-pending-commands') || ''"))
+                    == pending_binding
+                )
+                page.get_by_role("button", name="Abmelden").click()
+                settled(page, "Abgemeldet.")
+                page.locator("#management-token").fill(TOKEN)
+                page.get_by_role("button", name="Anmelden").click()
+                expect(page.locator("#management-session")).to_contain_text(f"Angemeldet als {OPERATOR}")
+                page.get_by_role("button", name="Denselben Befehl erneut senden").click()
+                settled(page, "Bereits gespeichert (Stand 3)")
+                binding_journal: Final = [
+                    (entry.revision, entry.command.command_id, entry.actor)
+                    for entry in repository.state().credential_bindings
+                    if entry.command.reference == coin_reference
+                ]
+                assert [item[0] for item in binding_journal] == [1, 2, 3], binding_journal
+                assert binding_journal[-1][1] in pending_binding and binding_journal[-1][2] == OPERATOR, binding_journal
+
+                coin_release: Final = inventory_box.locator(".credential-candidate").filter(has_text=coin_reference)
+                coin_release.get_by_role("button", name="Aufheben").click()
+                coin_release.get_by_role("button", name="Zuordnung wirklich aufheben?").click()
+                settled(page, "Gespeichert (Stand 4)")
+                coin_history: Final = inventory_box.locator(".credential-candidate").filter(has_text=coin_reference)
+                expect(coin_history).to_contain_text("Ungebunden")
+                coin_history.locator(".binding-history summary").click()
+                expect(coin_history.locator(".binding-history")).to_contain_text("Zuordnungsverlauf (4 Einträge)")
+                expect(coin_history.locator(".binding-history")).to_contain_text(
+                    "Stand 2: zugeordnet zu openai-api · another-operator"
+                )
+                expect(coin_history.locator(".binding-history")).to_contain_text("Stand 4: aufgehoben")
+                coin_history.screenshot(path=str(proof / "08-binding-history.png"))
 
                 def record(observed: datetime, unavailable: bool) -> None:
                     repository.record_gateway_inventory(
@@ -571,6 +762,9 @@ def main() -> None:
                 )
                 expect(phone_candidate).to_be_visible()
                 phone_candidate.screenshot(path=str(proof / "07-mobile-credential-candidate.png"))
+                phone_orphan: Final = phone.locator(".credential-orphan").filter(has_text=orphan_reference)
+                expect(phone_orphan).to_contain_text(f"Herkunft {orphan_source}")
+                phone_orphan.screenshot(path=str(proof / "09-mobile-binding-orphan.png"))
                 browser.close()
         print("browser management acceptance passed")
 

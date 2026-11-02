@@ -19,6 +19,7 @@ from pydantic import BaseModel, SecretStr, TypeAdapter
 
 from cube_control.api import CapabilitiesResponse, create_app
 from cube_control.browser_session import FAILED_LOGIN_LIMIT, MAX_SESSIONS, SESSION_LIFETIME, private_authority
+from cube_control.credential_binding import CredentialBindingCommand
 from cube_control.models import CATALOG, ImportBatch, ManualCommand
 from cube_control.store import ImportResult, ManualResult, PostgresRepository, Repository, StoredState
 
@@ -64,6 +65,9 @@ class RecordingRepository:
     def manage(self, command: ManualCommand, actor: str, now: datetime) -> ManualResult:
         self.commands = (*self.commands, (command, actor))
         return ManualResult("applied", len(self.commands))
+
+    def bind_credential(self, command: CredentialBindingCommand, actor: str, now: datetime) -> ManualResult:
+        return ManualResult("rejected", message="Read only fixture")
 
 
 def authority(origin: str = ORIGIN):

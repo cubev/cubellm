@@ -7,6 +7,7 @@ from pydantic import AwareDatetime
 
 from cube_control.credential_reconciliation import (
     CandidateView,
+    CredentialBindingView,
     CredentialFinding,
     CredentialSourceView,
     credential_views,
@@ -33,6 +34,7 @@ Reference = Literal[
     "gateway_record",
     "media_job",
     "manual_entry",
+    "credential_binding",
 ]
 AccountGap = Literal[
     "inventory_not_collected",
@@ -47,6 +49,7 @@ AccountGap = Literal[
     "no_verified_provider_usage",
     "provider_usage_not_current",
     "no_confirmed_credential_binding",
+    "confirmed_credential_not_in_latest_scan",
 ]
 VerifiedUsage = Literal["current", "historical", "none"]
 GatewayState = Literal["current", "stale", "last_attempt_failed", "never_collected"]
@@ -82,6 +85,7 @@ class AccountInventoryEntry(FrozenModel):
     last_observed_at: AwareDatetime | None = None
     last_usage_at: AwareDatetime | None = None
     gaps: tuple[AccountGap, ...] = ()
+    confirmed_credentials: tuple[CredentialBindingView, ...] = ()
 
 
 class GatewayCoverage(FrozenModel):
@@ -124,6 +128,7 @@ class AccountInventoryReport(FrozenModel):
     findings: tuple[InventoryFinding, ...]
     credential_sources: tuple[CredentialSourceView, ...] = ()
     credential_candidates: tuple[CandidateView, ...] = ()
+    credential_bindings: tuple[CredentialBindingView, ...] = ()
     credential_findings: tuple[CredentialFinding, ...] = ()
 
 
@@ -336,8 +341,11 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
         )
     )
     catalogued: Final = {account.id: account for account in stored.accounts}
-    credential_sources, credential_candidates, credential_findings = credential_views(
-        stored.credential_inventories, frozenset(str(account.provider) for account in stored.accounts), now
+    credential_sources, credential_candidates, credential_bindings, credential_findings = credential_views(
+        stored.credential_inventories,
+        stored.credential_bindings,
+        frozenset(str(account.provider) for account in stored.accounts),
+        now,
     )
     account_ids: Final = sorted(
         frozenset(
@@ -350,6 +358,11 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
                 (record.account_id for record in gateway_records if record.account_id is not None),
                 (job.account_id for job in stored.jobs),
                 (entry.command.account_id for entry in stored.manual_entries),
+                (
+                    entry.command.account_id
+                    for entry in stored.credential_bindings
+                    if entry.command.account_id is not None
+                ),
             )
         )
     )
@@ -371,6 +384,10 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
             ("gateway_record", bool(own_records)),
             ("media_job", any(job.account_id == account_id for job in stored.jobs)),
             ("manual_entry", any(entry.command.account_id == account_id for entry in stored.manual_entries)),
+            (
+                "credential_binding",
+                any(entry.command.account_id == account_id for entry in stored.credential_bindings),
+            ),
         )
         latest: Final = latest_measurements(account_id, stored.observations)
         evidence: Final = tuple(
@@ -385,6 +402,7 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
         invalid: Final = any(item.credential.binding == "invalid" for item in own_credentials) or any(
             item.route.binding == "invalid" for item in own_routes
         )
+        confirmed: Final = tuple(item for item in credential_bindings if item.account_id == account_id)
         return AccountInventoryEntry(
             account_id=account_id,
             provider=str(account.provider) if account is not None else None,
@@ -413,10 +431,16 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
                 ),
                 *(
                     ("no_confirmed_credential_binding",)
-                    if credential_candidates and account is not None and account.kind == "api"
+                    if credential_candidates and account is not None and account.kind == "api" and not confirmed
+                    else ()
+                ),
+                *(
+                    ("confirmed_credential_not_in_latest_scan",)
+                    if confirmed and all(item.candidate != "current" for item in confirmed)
                     else ()
                 ),
             ),
+            confirmed_credentials=confirmed,
         )
 
     coverage: Final = tuple(_coverage(state, now) for state in gateways)
@@ -435,5 +459,6 @@ def account_inventory(stored: StoredState, now: datetime) -> AccountInventoryRep
         ),
         credential_sources=credential_sources,
         credential_candidates=credential_candidates,
+        credential_bindings=credential_bindings,
         credential_findings=credential_findings,
     )

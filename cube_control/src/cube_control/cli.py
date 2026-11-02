@@ -26,6 +26,7 @@ from cube_control.application_access import (
     provision_application_access,
     revoke_application_access,
 )
+from cube_control.credential_binding import CredentialBindingCommand
 from cube_control.credential_inventory import (
     MAX_SOURCE_BYTES,
     CredentialInventorySnapshot,
@@ -70,6 +71,19 @@ class CommandArguments(argparse.Namespace):
 SOURCE_IDENTIFIER: Final = TypeAdapter[str](Identifier)
 
 
+COMMAND_LIMIT: Final = 65536
+
+
+def bounded_command(path: str) -> str | None:
+    try:
+        if path == "-":
+            return sys.stdin.read(COMMAND_LIMIT + 1)
+        with Path(path).open("rb") as source:
+            return source.read(COMMAND_LIMIT + 1).decode()
+    except (OSError, UnicodeError):
+        return None
+
+
 def credential_sources(register: Path, plan: Path) -> tuple[bytes, bytes] | None:
     try:
         with register.open("rb") as register_file, plan.open("rb") as plan_file:
@@ -106,6 +120,9 @@ def main() -> int:
     manage_parser: Final = sub.add_parser("manage")
     manage_parser.add_argument("path", nargs="?", default="-")
     manage_parser.add_argument("--actor", default=getpass.getuser())
+    binding_parser: Final = sub.add_parser("bind-credential")
+    binding_parser.add_argument("path", nargs="?", default="-")
+    binding_parser.add_argument("--actor", default=getpass.getuser())
     job_parser: Final = sub.add_parser("manage-job")
     job_parser.add_argument("path", nargs="?", default="-")
     job_parser.add_argument("--actor", default=getpass.getuser())
@@ -402,6 +419,22 @@ def main() -> int:
         managed: Final = repository.manage(command, args.actor, datetime.now(UTC))
         print(json.dumps({"status": managed.status, "version": managed.version, "message": managed.message}))
         return 0 if managed.status in ("applied", "duplicate") else 1
+    if args.command == "bind-credential":
+        raw_binding: Final = bounded_command(args.path)
+        if raw_binding is None:
+            print("Binding command is not readable", file=sys.stderr)
+            return 2
+        if len(raw_binding) > COMMAND_LIMIT:
+            print("Binding command exceeds size limit", file=sys.stderr)
+            return 2
+        try:
+            binding_command: Final = CredentialBindingCommand.model_validate_json(raw_binding)
+        except ValidationError:
+            print("Binding command rejected: invalid data; input values are not logged", file=sys.stderr)
+            return 2
+        bound: Final = repository.bind_credential(binding_command, args.actor, datetime.now(UTC))
+        print(json.dumps({"status": bound.status, "version": bound.version, "message": bound.message}))
+        return 0 if bound.status in ("applied", "duplicate") else 1
     if args.command == "import":
         raw: Final[str] = sys.stdin.read(8_000_001) if args.path == "-" else Path(args.path).read_text()
         if len(raw) > 8_000_000:

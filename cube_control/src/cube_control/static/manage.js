@@ -22,17 +22,41 @@ const management = (() => {
  let enabled = false, csrf = null, actor = "", unknownOnly = false, inventoryTicket = 0, inventoryLoadedAt = null;
  const inFlight = new Set();
  const editors = new Map();
+ const bindingEditors = new Map();
+ let catalogueAccounts = [];
  const awaitingFresh = new Map();
  const enrollments = new Map();
- const referenceLabels = {catalogue:"Kontenkatalog",gateway_credential:"Gateway-Zugang",gateway_route:"Gateway-Route",observation:"Messwert",usage_event:"Nutzungsereignis",gateway_record:"Gateway-Aufruf",media_job:"Medienauftrag",manual_entry:"Manuelle Angabe"};
- const gapLabels = {inventory_not_collected:"Kein Gateway-Inventar erfasst",not_in_catalogue:"Nicht im Kontenkatalog",no_gateway_credential:"Kein Gateway-Zugang",credential_only_in_database:"Zugang nur gespeichert, nicht geladen",credential_only_in_runtime:"Zugang nur geladen, nicht gespeichert",credential_unused:"Zugang ungenutzt",binding_not_in_latest_collection:"Bindung nur aus früherem Scan",invalid_binding:"Ungültige Bindung",no_usage_source:"Keine Nutzungsquelle",no_verified_provider_usage:"Keine bestätigte Anbieternutzung",provider_usage_not_current:"Anbieternutzung nicht aktuell",no_confirmed_credential_binding:"Keine bestätigte Zuordnung zu Inventurfunden"};
+ const referenceLabels = {catalogue:"Kontenkatalog",gateway_credential:"Gateway-Zugang",gateway_route:"Gateway-Route",observation:"Messwert",usage_event:"Nutzungsereignis",gateway_record:"Gateway-Aufruf",media_job:"Medienauftrag",manual_entry:"Manuelle Angabe",credential_binding:"Inventurfund-Zuordnung"};
+ const gapLabels = {inventory_not_collected:"Kein Gateway-Inventar erfasst",not_in_catalogue:"Nicht im Kontenkatalog",no_gateway_credential:"Kein Gateway-Zugang",credential_only_in_database:"Zugang nur gespeichert, nicht geladen",credential_only_in_runtime:"Zugang nur geladen, nicht gespeichert",credential_unused:"Zugang ungenutzt",binding_not_in_latest_collection:"Bindung nur aus früherem Scan",invalid_binding:"Ungültige Bindung",no_usage_source:"Keine Nutzungsquelle",no_verified_provider_usage:"Keine bestätigte Anbieternutzung",provider_usage_not_current:"Anbieternutzung nicht aktuell",no_confirmed_credential_binding:"Keine bestätigte Zuordnung zu Inventurfunden",confirmed_credential_not_in_latest_scan:"Zugeordneter Fund nicht im letzten Scan"};
  function labelled_codes(prefix, codes, labels) { const p=node("p","explanation",`${prefix}: ${codes.map((code)=>labels[code]||code).join(", ")}`); p.title=codes.join(", "); return p; }
  function node(tag, cls, text) { const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e; }
  function button(text, cls, handler) { const b=node("button",cls,text); b.type="button"; b.addEventListener("click",handler); return b; }
  function since(value) { const seconds=(Date.now()-Date.parse(value))/1000; if(!Number.isFinite(seconds))return "Zeit unbekannt"; if(seconds<60)return "gerade eben"; if(seconds<3600)return `vor ${Math.floor(seconds/60)} Min`; if(seconds<86400)return `vor ${Math.floor(seconds/3600)} Std`; return `vor ${Math.floor(seconds/86400)} Tagen`; }
- function pending() { try { const value=JSON.parse(sessionStorage.getItem(PENDING)||"{}"); return value&&typeof value==="object"?value:{}; } catch { return {}; } }
- function remember(command) { sessionStorage.setItem(PENDING, JSON.stringify({...pending(), [command.account_id]: command})); }
- function forget(accountId) { const rest={...pending()}; delete rest[accountId]; sessionStorage.setItem(PENDING, JSON.stringify(rest)); }
+ function accountKey(accountId) { return "account "+accountId; }
+ function bindingKey(reference) { return "binding "+reference; }
+ function keyOf(command) { return command.reference?bindingKey(command.reference):accountKey(command.account_id); }
+ function pending() {
+  let stored;
+  try { stored=JSON.parse(sessionStorage.getItem(PENDING)||"{}"); } catch { return {}; }
+  if(!stored||typeof stored!=="object"||Array.isArray(stored))return {};
+  return Object.fromEntries(Object.values(stored).filter((command)=>command&&typeof command==="object"&&typeof command.command_id==="string"&&(typeof command.reference==="string"||typeof command.account_id==="string")).map((command)=>[keyOf(command),command]));
+ }
+ function isPending(key) { return Object.hasOwn(pending(),key); }
+ function targetOf(command) { return command.reference?`Fund ${command.reference}`:command.account_id; }
+ function describe(command) {
+  if(!command.reference)return command.account_id;
+  return `Fund ${command.reference}: ${command.action==="bind"?"Zuordnung zu "+command.account_id:"Zuordnung aufheben"}`;
+ }
+ function syncBindingLocks() {
+  for(const [reference,form] of bindingEditors){
+   const key=bindingKey(reference), locked=inFlight.has(key)||isPending(key);
+   for(const element of form.elements)element.disabled=locked;
+   form.classList.toggle("locked",locked);
+  }
+ }
+ function pathOf(command) { return command.reference?`/api/v1/credential-bindings/${encodeURIComponent(command.reference)}/commands`:`/api/v1/accounts/${encodeURIComponent(command.account_id)}/commands`; }
+ function remember(command) { sessionStorage.setItem(PENDING, JSON.stringify({...pending(), [keyOf(command)]: command})); }
+ function forget(key) { sessionStorage.setItem(PENDING, JSON.stringify(Object.fromEntries(Object.entries(pending()).filter(([stored])=>stored!==key)))); }
  function notify(text, error=false) { const box=byId("management-status"); box.textContent=text; box.classList.toggle("error", error); }
  async function call(method, path, body) {
   const response=await fetch(path,{method,credentials:"same-origin",cache:"no-store",headers:{"Content-Type":"application/json",...(csrf?{"X-CSRF-Token":csrf}:{})},body:body===undefined?undefined:JSON.stringify(body)});
@@ -42,32 +66,36 @@ const management = (() => {
   return {status:response.status,data,valid};
  }
  async function reloadAll() { if(typeof refresh==="function")await refresh(); else await loadInventory(); }
- function blocked(accountId) {
-  if(inFlight.has(accountId)){ notify("Für dieses Konto wird gerade gespeichert.",true); return true; }
-  if(awaitingFresh.has(accountId)){ notify("Die Ansicht dieses Kontos wird nach der letzten Änderung noch aktualisiert.",true); return true; }
-  if(pending()[accountId]){ notify("Für dieses Konto ist ein Befehl mit unbekanntem Ergebnis offen. Erst denselben Befehl erneut senden oder ihn ausdrücklich verwerfen.",true); renderPending(); return true; }
+ function blocked(key) {
+  if(inFlight.has(key)){ notify("Hierfür wird gerade gespeichert.",true); return true; }
+  if(awaitingFresh.has(key)){ notify("Die Ansicht wird nach der letzten Änderung noch aktualisiert.",true); return true; }
+  if(isPending(key)){ notify("Hierfür ist ein Befehl mit unbekanntem Ergebnis offen. Erst denselben Befehl erneut senden oder ihn ausdrücklich verwerfen.",true); renderPending(); return true; }
   return false;
  }
- async function submit(command) { if(blocked(command.account_id))return; remember(command); await deliver(command); }
+ async function submit(command) { if(blocked(keyOf(command)))return; remember(command); await deliver(command); }
  async function deliver(command) {
-  if(inFlight.has(command.account_id))return;
-  inFlight.add(command.account_id); notify("Wird gespeichert …"); renderPending();
+  const key=keyOf(command);
+  if(inFlight.has(key))return;
+  inFlight.add(key); notify("Wird gespeichert …"); renderPending();
   let result;
-  try { result=await call("POST",`/api/v1/accounts/${encodeURIComponent(command.account_id)}/commands`,command); }
+  try { result=await call("POST",pathOf(command),command); }
   catch { result=null; }
-  inFlight.delete(command.account_id);
+  inFlight.delete(key);
   if(result===null){ notify("Ergebnis unbekannt: Die Verbindung brach ab. Der Befehl kann bereits gespeichert sein; denselben Befehl erneut senden.",true); renderPending(); return; }
   if(result.status===401){ csrf=null; renderSession(); notify("Anmeldung abgelaufen. Nach dem Anmelden denselben Befehl erneut senden.",true); renderPending(); return; }
   const outcome=settled(result);
   if(outcome===null){ notify(`Ergebnis unbekannt (HTTP ${result.status}, Antwort nicht eindeutig). Der Befehl kann bereits gespeichert sein; denselben Befehl erneut senden.`,true); renderPending(); return; }
-  forget(command.account_id);
-  editors.get(command.account_id)?.form.remove(); editors.delete(command.account_id);
-  enrollments.get(command.account_id)?.remove(); enrollments.delete(command.account_id);
-  if(command.create_account&&enrollments.get("")&&enrollments.get("").querySelector("input")?.value===command.account_id)enrollments.delete("");
-  awaitingFresh.set(command.account_id, Number.isInteger(result.data.version)?result.data.version:0);
+  forget(key);
+  if(command.reference){ bindingEditors.get(command.reference)?.remove(); bindingEditors.delete(command.reference); }
+  else {
+   editors.get(command.account_id)?.form.remove(); editors.delete(command.account_id);
+   enrollments.get(command.account_id)?.remove(); enrollments.delete(command.account_id);
+   if(command.create_account&&enrollments.get("")&&enrollments.get("").querySelector("input")?.value===command.account_id)enrollments.delete("");
+  }
+  awaitingFresh.set(key, Number.isInteger(result.data.version)?result.data.version:0);
   renderPending(); notify(outcome.text,outcome.error);
   await reloadAll();
-  if(awaitingFresh.has(command.account_id))notify(`${outcome.text} Die Ansicht ist noch nicht aktualisiert; vor weiteren Änderungen an ${command.account_id} „Aktualisieren“ wählen.`,true);
+  if(awaitingFresh.has(key))notify(`${outcome.text} Die Ansicht ist noch nicht aktualisiert; vor weiteren Änderungen an ${targetOf(command)} „Aktualisieren“ wählen.`,true);
  }
  function settled(result) {
   const data=result.data, version=data.version;
@@ -81,21 +109,23 @@ const management = (() => {
   return null;
  }
  function renderPending() {
+  syncBindingLocks();
   const box=byId("management-pending"); box.replaceChildren();
   for(const command of Object.values(pending())){
    const row=node("div","pending-command");
-   row.append(node("p","",`Befehl ${command.command_id} für ${command.account_id}: Ergebnis unbekannt.`));
-   const again=button(inFlight.has(command.account_id)?"Wird gesendet …":"Denselben Befehl erneut senden","",()=>deliver(command));
-   again.disabled=!csrf||inFlight.has(command.account_id);
+   const key=keyOf(command);
+   row.append(node("p","",`Befehl ${command.command_id} für ${describe(command)}: Ergebnis unbekannt.`));
+   const again=button(inFlight.has(key)?"Wird gesendet …":"Denselben Befehl erneut senden","",()=>deliver(command));
+   again.disabled=!csrf||inFlight.has(key);
    const drop=button("Verwerfen","secondary",()=>{
     if(drop.dataset.confirm!=="1"){ drop.dataset.confirm="1"; drop.textContent="Wirklich verwerfen? Er kann bereits angewendet sein"; return; }
-    forget(command.account_id); notify("Befehl verworfen. Sein Ergebnis bleibt unbekannt; vor einer neuen Änderung Ansicht prüfen."); renderPending(); reloadAll();
+    forget(key); notify("Befehl verworfen. Sein Ergebnis bleibt unbekannt; vor einer neuen Änderung Ansicht prüfen."); renderPending(); reloadAll();
    });
-   drop.disabled=inFlight.has(command.account_id);
+   drop.disabled=inFlight.has(key);
    row.append(again,drop); box.append(row);
   }
  }
- function signedOut(message) { csrf=null; actor=""; editors.clear(); enrollments.clear(); notify(message); renderSession(); renderPending(); reloadAll(); }
+ function signedOut(message) { csrf=null; actor=""; editors.clear(); enrollments.clear(); bindingEditors.clear(); notify(message); renderSession(); renderPending(); reloadAll(); }
  function renderSession() {
   const panel=byId("management-session"); panel.replaceChildren(); byId("management").hidden=false;
   if(!enabled){ panel.append(node("p","explanation","Browser-Verwaltung ist auf diesem Dienst nicht eingerichtet. Die Übersicht ist nur lesbar; Änderungen laufen über die lokale Verwaltung.")); return; }
@@ -133,16 +163,16 @@ const management = (() => {
  function decorate(actions, account, data) {
   if(!enabled){ const edit=node("a","manage-link","Lokal bearbeiten"); edit.href="cubellm-control://manage/"+encodeURIComponent(account.id); edit.title="Öffnet die lokale CubeLLM-Kontoverwaltung; speichert keine Änderung"; actions.append(edit); return; }
   if(!csrf){ actions.append(node("span","explanation","Zum Bearbeiten anmelden")); return; }
-  const awaited=awaitingFresh.get(account.id);
-  if(awaited!==undefined&&(data.manual_version||0)>=awaited)awaitingFresh.delete(account.id);
-  if(awaitingFresh.has(account.id)){
+  const key=accountKey(account.id), awaited=awaitingFresh.get(key);
+  if(awaited!==undefined&&(data.manual_version||0)>=awaited)awaitingFresh.delete(key);
+  if(awaitingFresh.has(key)){
    const waiting=button("Wird aktualisiert …","secondary",()=>{}); waiting.disabled=true; waiting.title="Nach der letzten Änderung wird auf die aktualisierte Ansicht gewartet";
    actions.append(waiting); return;
   }
   const draft=editors.get(account.id);
   actions.append(button("Bearbeiten","secondary",()=>{
-   if(awaitingFresh.has(account.id)){ notify("Die Ansicht dieses Kontos wird nach der letzten Änderung noch aktualisiert.",true); return; }
    const open=editors.get(account.id);
+   if(!open&&blocked(key))return;
    if(open){ open.form.hidden=!open.form.hidden; return; }
    const form=editForm(account,data); editors.set(account.id,{form,version:data.manual_version||0}); actions.append(form);
   }));
@@ -221,12 +251,12 @@ const management = (() => {
   const parts=[findingLabels[item.kind]||item.kind,item.gateway_origin,item.source&&item.origin?`${item.source}/${item.origin}`:item.origin,item.name,item.account_id?"Konto "+item.account_id:null,item.detail].filter(Boolean);
   return node("li","",parts.join(" · "));
  }
- const credentialFindingLabels = {unassigned_candidate:"Dienst und Konto unbekannt",provider_hint_without_account:"Anbieterhinweis ohne Katalogkonto",archived_candidate:"Nur in Archiv/Export",unbound_candidate:"Keine bestätigte Kontobindung",quarantined_record:"Unstimmiger Eintrag zurückgehalten",incomplete_scan:"Scan unvollständig"};
+ const credentialFindingLabels = {unassigned_candidate:"Dienst und Konto unbekannt",provider_hint_without_account:"Anbieterhinweis ohne Katalogkonto",archived_candidate:"Nur in Archiv/Export",unbound_candidate:"Keine bestätigte Kontobindung",quarantined_record:"Unstimmiger Eintrag zurückgehalten",incomplete_scan:"Scan unvollständig",binding_candidate_missing:"Zugeordneter Fund fehlt im letzten Scan"};
  const kindLabels = {api_key_or_token:"API-Schlüssel oder Token",connection_string:"Verbindungszeichenfolge",encrypted_material:"Verschlüsseltes Material",local_application_secret:"Lokales Anwendungsgeheimnis",public_firebase_client_configuration:"Öffentliche Firebase-Clientkonfiguration"};
  const importLabels = {imported:"übernommen",older_or_equal_ignored:"älterer oder gleicher Scan ignoriert",rejected:"abgelehnt",unreadable:"Dateien nicht lesbar"};
  function credentialSection(report) {
   const sources=report.credential_sources||[], candidates=report.credential_candidates||[], findings=report.credential_findings||[];
-  if(!sources.length)return [];
+  if(!sources.length&&!(report.credential_bindings||[]).length)return [];
   const sourceList=node("div","inventory-gateways");
   for(const source of sources){
    const card=node("article","inventory-gateway credential-source");
@@ -236,18 +266,90 @@ const management = (() => {
    for(const host of source.hosts)hosts.append(node("li",host.complete?"":"warning",`${host.host}: ${host.files_read} Dateien, ${host.roots} Wurzeln (${host.scope_id})${host.presence==="retained"?" · aus früherem Scan":""}${host.complete?"":" · unvollständig"}`));
    card.append(hosts); sourceList.append(card);
   }
+  catalogueAccounts=(report.accounts||[]).filter((entry)=>entry.references.includes("catalogue")).map((entry)=>entry.account_id);
+  const bindingViews=new Map((report.credential_bindings||[]).map((view)=>[view.reference,view]));
   const list=node("div","inventory-accounts");
   for(const item of candidates){
    const card=node("article","inventory-account credential-candidate");
    card.append(node("h3","",`${item.service} · ${item.reference}`));
-   card.append(node("p","explanation",`Ungebunden · ${item.provider_hint?"Anbieterhinweis "+item.provider_hint+" (kein Kontonachweis)":"kein Anbieterhinweis"}`));
+   const hint=item.provider_hint?"Anbieterhinweis "+item.provider_hint+" (kein Kontonachweis)":"kein Anbieterhinweis";
+   card.append(node("p","explanation binding-state",item.binding==="operator_confirmed"?`Vom Bediener zugeordnet zu ${item.bound_account_id} (Stand ${item.binding_revision}, ${item.binding_actor}, ${since(item.binding_changed_at)}) · Gültigkeit und Anbieterzugehörigkeit ungeprüft · ${hint}`:`Ungebunden · ${hint}`));
    card.append(node("p",item.presence==="retained"||item.state==="archived_only"?"explanation error":"explanation",`${item.state==="current"?"Aktuelle Fundstelle":"Nur Archiv/Export"} · ${item.presence==="retained"?"aus früherem Scan, zuletzt gesehen "+since(item.last_observed_at):"im letzten Scan gesehen"}${item.scan_freshness==="stale"?" · Scan veraltet":""}`));
    card.append(node("p","explanation",`Hosts: ${item.hosts.join(", ")} · Projekte: ${item.projects.join(", ")} · Variablen: ${item.variables.join(", ")} · Art: ${item.kinds.map((kind)=>kindLabels[kind]||kind).join(", ")}`));
+   const view=bindingViews.get(item.reference);
+   if(view)card.append(bindingHistory(view));
+   bindingControls(card,item.reference,item.binding_revision,item.bound_account_id);
    list.append(card);
+  }
+  const orphans=node("div","inventory-accounts");
+  for(const view of (report.credential_bindings||[]).filter((entry)=>entry.candidate==="missing")){
+   const card=node("article","inventory-account credential-orphan");
+   const origin=view.origin;
+   card.append(node("h3","",`${origin?origin.service:"Unbekannter Dienst"} · ${view.reference}`));
+   card.append(node("p","explanation error",`${view.account_id?"Zugeordnet zu "+view.account_id:"Nicht zugeordnet"} (Stand ${view.revision}) · Fund im letzten Scan nicht mehr enthalten${origin?` · Herkunft ${origin.source_id}, zuletzt gesehen ${since(origin.last_observed_at)}, Hosts ${origin.hosts.join(", ")}`:""}`));
+   card.append(bindingHistory(view));
+   bindingControls(card,view.reference,view.revision,view.account_id);
+   orphans.append(card);
   }
   const notes=node("ul","credential-findings");
   for(const item of findings)notes.append(node("li","",[credentialFindingLabels[item.kind]||item.kind,item.service,item.reference,item.host,item.detail].filter(Boolean).join(" · ")));
-  return [node("h3","",`Gefundene Zugangsdaten (${candidates.length}, alle ungebunden)`),node("p","explanation","Nur Metadaten aus der Dienstinventur: keine Schlüsselwerte, keine Dateipfade, keine Prüfung beim Anbieter. Ein Fund belegt weder Gültigkeit noch Kontozugehörigkeit; ein Dienstname ist nur ein Anbieterhinweis."),sourceList,list,node("h3","",`Hinweise zu Zugangsdaten (${findings.length})`),notes];
+  const confirmed=candidates.filter((item)=>item.binding==="operator_confirmed").length;
+  return [node("h3","",`Gefundene Zugangsdaten (${candidates.length}, davon ${confirmed} vom Bediener zugeordnet)`),node("p","explanation","Nur Metadaten aus der Dienstinventur: keine Schlüsselwerte, keine Dateipfade, keine Prüfung beim Anbieter. Ein Fund belegt weder Gültigkeit noch Kontozugehörigkeit; ein Dienstname ist nur ein Anbieterhinweis. Eine Bedienerzuordnung ist keine Prüfung beim Anbieter und keine Routingfreigabe."),sourceList,list,...(orphans.childElementCount?[node("h3","","Zuordnungen ohne aktuellen Fund"),orphans]:[]),node("h3","",`Hinweise zu Zugangsdaten (${findings.length})`),notes];
+ }
+ function bindingHistory(view) {
+  const details=node("details","binding-history");
+  details.append(node("summary","",`Zuordnungsverlauf (${view.history.length} Einträge)`));
+  const steps=node("ul");
+  for(const step of view.history)steps.append(node("li","",`Stand ${step.revision}: ${step.action==="bind"?"zugeordnet zu "+step.account_id:"aufgehoben"} · ${step.actor} · ${since(step.changed_at)}`));
+  details.append(steps);
+  return details;
+ }
+ function accountDatalist() {
+  let list=byId("catalogue-accounts");
+  if(!list){ list=node("datalist"); list.id="catalogue-accounts"; document.body.append(list); }
+  list.replaceChildren(...catalogueAccounts.map((id)=>{ const option=node("option"); option.value=id; return option; }));
+  return list.id;
+ }
+ function bindingForm(reference, revision, current) {
+  const form=node("form","binding-form");
+  const account=node("input"); account.type="text"; account.maxLength=128; account.required=true; account.setAttribute("list",accountDatalist()); account.placeholder="Konto-ID aus dem Katalog";
+  const confirm=node("input"); confirm.type="checkbox"; confirm.required=true;
+  const confirmLabel=node("label","confirm","Ich ordne diesen Fund als Bediener zu. Das prüft weder Gültigkeit noch Anbieterzugehörigkeit."); confirmLabel.prepend(confirm);
+  const send=node("button","",current?"Umhängen":"Zuordnen"); send.type="submit";
+  form.append(labelled("Konto",account),confirmLabel,send);
+  form.addEventListener("submit",async(event)=>{ event.preventDefault();
+   const target=account.value.trim();
+   if(!IDENTIFIER.test(target)||!catalogueAccounts.includes(target)){ notify("Bitte ein vorhandenes Katalogkonto angeben.",true); return; }
+   if(target===current){ notify("Der Fund ist diesem Konto bereits zugeordnet.",true); return; }
+   send.disabled=true;
+   await submit({schema_version:1,command_id:"browser-"+crypto.randomUUID(),reference,expected_version:revision,action:"bind",account_id:target});
+   send.disabled=false; });
+  return form;
+ }
+ function bindingControls(card, reference, revision, current) {
+  if(!enabled||!csrf)return;
+  const key=bindingKey(reference), awaited=awaitingFresh.get(key);
+  if(awaited!==undefined&&revision>=awaited)awaitingFresh.delete(key);
+  if(awaitingFresh.has(key)){ const waiting=button("Wird aktualisiert …","secondary",()=>{}); waiting.disabled=true; card.append(waiting); return; }
+  const actions=node("div","account-actions");
+  const kept=bindingEditors.get(reference);
+  actions.append(button(current?"Umhängen …":"Zuordnen …","secondary",()=>{
+   if(blocked(key))return;
+   const open=bindingEditors.get(reference);
+   if(open){ open.hidden=!open.hidden; return; }
+   const form=bindingForm(reference,revision,current); bindingEditors.set(reference,form); actions.append(form);
+  }));
+  if(current){
+   const release=button("Aufheben","secondary",async()=>{
+    if(release.dataset.confirm!=="1"){ release.dataset.confirm="1"; release.textContent="Zuordnung wirklich aufheben?"; return; }
+    release.disabled=true;
+    await submit({schema_version:1,command_id:"browser-"+crypto.randomUUID(),reference,expected_version:revision,action:"unbind"});
+    release.disabled=false;
+   });
+   actions.append(release);
+  }
+  if(kept){ actions.append(kept); syncBindingLocks(); }
+  card.append(actions);
  }
  async function loadInventory() {
   const box=byId("inventory"); const ticket=++inventoryTicket; let report;

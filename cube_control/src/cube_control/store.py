@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from typing import Final, Literal, LiteralString, Protocol
 
 import psycopg
@@ -7,6 +8,14 @@ from psycopg import Connection
 from pydantic import TypeAdapter, ValidationError
 
 from cube_control.gateway_inventory import GatewayInventoryAttempt, GatewayInventorySnapshot
+from cube_control.credential_binding import (
+    BindingOrigin,
+    CredentialBindingCommand,
+    CredentialBindingEntry,
+    binding_origin,
+    binding_revision,
+    bound_account,
+)
 from cube_control.credential_inventory import (
     CredentialImportAttempt,
     CredentialInventorySnapshot,
@@ -14,6 +23,7 @@ from cube_control.credential_inventory import (
     ImportStatus,
     from_legacy,
     merge_snapshot,
+    public_reference,
 )
 from cube_control.inventory_evidence import GatewayEvidence, GatewayInventoryState, merge_evidence
 from cube_control.gateway_store import SCHEMA as GATEWAY_SCHEMA
@@ -61,6 +71,7 @@ class StoredState:
     gateway_scans: tuple[GatewayScanView, ...] = ()
     gateway_inventories: tuple[GatewayInventoryState, ...] = ()
     credential_inventories: tuple[CredentialInventoryState, ...] = ()
+    credential_bindings: tuple[CredentialBindingEntry, ...] = ()
 
 
 INVENTORY_ROW: Final = TypeAdapter(tuple[str, str, str | None, str | None])
@@ -70,6 +81,14 @@ INVENTORY_COLUMNS: Final = "gateway_origin, attempt::text, last_good::text, evid
 CREDENTIAL_ROW: Final = TypeAdapter(tuple[str, str | None, str | None, str | None])
 SOURCE_ID: Final = TypeAdapter[str](Identifier)
 CREDENTIAL_COLUMNS: Final = "source_id, attempt::text, evidence::text, snapshot::text"
+
+
+def binding_rejection(command: CredentialBindingCommand, current: str | None, origin: BindingOrigin | None) -> str:
+    if command.action == "unbind":
+        return "" if current is not None else "Finding is not bound; nothing changed"
+    if command.account_id == current:
+        return "Finding is already bound to this account; nothing changed"
+    return "" if origin is not None else "Finding is not in any imported inventory"
 
 
 def credential_outcome(
@@ -127,6 +146,7 @@ class Repository(Protocol):
     def healthy(self) -> bool: ...
     def import_batch(self, batch: ImportBatch) -> ImportResult: ...
     def manage(self, command: ManualCommand, actor: str, now: datetime) -> ManualResult: ...
+    def bind_credential(self, command: CredentialBindingCommand, actor: str, now: datetime) -> ManualResult: ...
 
 
 SCHEMA: Final[LiteralString] = """
@@ -159,6 +179,10 @@ ALTER TABLE cube_control.credential_inventories ADD COLUMN IF NOT EXISTS attempt
 ALTER TABLE cube_control.credential_inventories ADD COLUMN IF NOT EXISTS evidence jsonb;
 ALTER TABLE cube_control.credential_inventories ALTER COLUMN snapshot DROP NOT NULL;
 ALTER TABLE cube_control.credential_inventories ALTER COLUMN scanned_at DROP NOT NULL;
+CREATE TABLE IF NOT EXISTS cube_control.credential_binding_commands (
+    command_id text PRIMARY KEY, reference text NOT NULL, revision bigint NOT NULL, payload jsonb NOT NULL,
+    UNIQUE (reference, revision)
+);
 """
 
 
@@ -242,7 +266,86 @@ class PostgresRepository:
                         ),
                     )
                 ),
+                tuple(
+                    CredentialBindingEntry.model_validate_json(row[0])
+                    for row in connection.execute(
+                        "SELECT payload::text FROM cube_control.credential_binding_commands ORDER BY reference, revision"
+                    )
+                ),
             )
+
+    def bind_credential(self, command: CredentialBindingCommand, actor: str, now: datetime) -> ManualResult:
+        try:
+            with self.connect() as connection:
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('cube-control-binding'), hashtext(%s))", (command.reference,)
+                )
+                stored: Final = connection.execute(
+                    "SELECT payload::text FROM cube_control.credential_binding_commands WHERE command_id=%s",
+                    (command.command_id,),
+                ).fetchone()
+                if stored:
+                    previous: Final = CredentialBindingEntry.model_validate_json(stored[0])
+                    if previous.command == command and previous.actor == actor:
+                        return ManualResult("duplicate", previous.revision)
+                    return ManualResult("rejected", message="Command identity conflict; nothing changed")
+                history: Final = tuple(
+                    CredentialBindingEntry.model_validate_json(row[0])
+                    for row in connection.execute(
+                        "SELECT payload::text FROM cube_control.credential_binding_commands WHERE reference=%s "
+                        "ORDER BY revision",
+                        (command.reference,),
+                    )
+                )
+                version: Final = binding_revision(history)
+                current: Final = bound_account(history)
+                if command.expected_version != version:
+                    return ManualResult("conflict", version, "Binding was changed; refresh before applying changes")
+                origin: Final = self.resolve_candidate(connection, command.reference) or next(
+                    (entry.origin for entry in reversed(history) if entry.origin is not None), None
+                )
+                rejection: Final = binding_rejection(command, current, origin)
+                if rejection:
+                    return ManualResult("rejected", version, rejection)
+                if (
+                    command.action == "bind"
+                    and not connection.execute(
+                        "SELECT 1 FROM cube_control.accounts WHERE id=%s", (command.account_id,)
+                    ).fetchone()
+                ):
+                    return ManualResult("rejected", version, "Account is not registered")
+                entry: Final = CredentialBindingEntry(
+                    command=command, revision=version + 1, actor=actor, received_at=now, origin=origin
+                )
+                connection.execute(
+                    "INSERT INTO cube_control.credential_binding_commands (command_id, reference, revision, payload) "
+                    "VALUES (%s, %s, %s, %s::jsonb)",
+                    (command.command_id, command.reference, entry.revision, entry.model_dump_json()),
+                )
+                return ManualResult("applied", entry.revision)
+        except psycopg.Error:
+            return ManualResult("unavailable", message="Management database unavailable; retry the same command ID")
+
+    def resolve_candidate(self, connection: Connection[tuple[str, ...]], reference: str) -> BindingOrigin | None:
+        snapshots: Final = tuple(
+            state.evidence
+            for state in map(
+                credential_state,
+                connection.execute(f"SELECT {CREDENTIAL_COLUMNS} FROM cube_control.credential_inventories"),
+            )
+            if state.evidence is not None
+        )
+        return next(
+            chain.from_iterable(
+                (
+                    binding_origin(snapshot, candidate)
+                    for candidate in snapshot.candidates
+                    if public_reference(snapshot.source_id, candidate.fingerprint) == reference
+                )
+                for snapshot in snapshots
+            ),
+            None,
+        )
 
     def record_credential_import(
         self,

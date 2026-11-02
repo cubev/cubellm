@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
 from cube_control.browser_session import SESSION_COOKIE, SESSION_LIFETIME, BrowserSession, SessionAuthority
+from cube_control.credential_binding import CredentialBindingCommand
 from cube_control.models import ManualCommand
 from cube_control.store import Repository
 
@@ -132,7 +133,27 @@ def add_browser_management(
             status_code=STATUS_CODES[result.status],
         )
 
+    async def binding(request: Request, reference: str) -> JSONResponse:
+        checked: Final = guard(request)
+        if isinstance(checked, JSONResponse):
+            return checked
+        raw: Final = await _bounded_body(request)
+        if raw is None:
+            return _denied(413, "Anfrage zu groß")
+        try:
+            command: Final = CredentialBindingCommand.model_validate_json(raw)
+        except ValidationError:
+            return _denied(422, "Befehl abgelehnt; Eingaben werden nicht protokolliert")
+        if command.reference != reference:
+            return _denied(422, "Befehl gehört zu einem anderen Fund")
+        result: Final = repository.bind_credential(command, authority.operator, clock())
+        return JSONResponse(
+            {"status": result.status, "version": result.version, "message": result.message},
+            status_code=STATUS_CODES[result.status],
+        )
+
     app.add_api_route("/api/v1/session", login, methods=["POST"])
     app.add_api_route("/api/v1/session", current, methods=["GET"])
     app.add_api_route("/api/v1/session", logout, methods=["DELETE"])
     app.add_api_route("/api/v1/accounts/{account_id}/commands", command, methods=["POST"])
+    app.add_api_route("/api/v1/credential-bindings/{reference}/commands", binding, methods=["POST"])

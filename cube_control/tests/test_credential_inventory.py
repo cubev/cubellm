@@ -27,6 +27,7 @@ from cube_control.credential_inventory import (
     public_reference,
 )
 from cube_control.inventory import AccountInventoryReport, account_inventory
+from cube_control.credential_binding import CredentialBindingCommand
 from cube_control.models import Account, ImportBatch, ManualCommand, Provider
 from cube_control.store import ImportResult, ManualResult, PostgresRepository, StoredState
 
@@ -251,6 +252,9 @@ class CredentialCandidateTests(unittest.TestCase):
                 return ImportResult(False)
 
             def manage(self, command: ManualCommand, actor: str, now: datetime) -> ManualResult:
+                return ManualResult("rejected")
+
+            def bind_credential(self, command: CredentialBindingCommand, actor: str, now: datetime) -> ManualResult:
                 return ManualResult("rejected")
 
         response: Final = TestClient(create_app(Fixed())).get("/api/v1/inventory")

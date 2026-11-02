@@ -4,6 +4,7 @@ from typing import Final, Literal
 
 from pydantic import AwareDatetime
 
+from cube_control.credential_binding import BindingOrigin, CredentialBindingEntry, binding_revision, bound_account
 from cube_control.credential_inventory import (
     SCAN_STALE_AFTER,
     SERVICE_PROVIDER_HINTS,
@@ -56,7 +57,11 @@ class CandidateView(FrozenModel):
     service: str
     provider_hint: str | None = None
     state: Literal["current", "archived_only"]
-    binding: Literal["unbound"] = "unbound"
+    binding: Literal["unbound", "operator_confirmed"] = "unbound"
+    bound_account_id: str | None = None
+    binding_revision: int = 0
+    binding_actor: str | None = None
+    binding_changed_at: AwareDatetime | None = None
     presence: Literal["latest_scan", "retained"]
     last_observed_at: AwareDatetime
     retained_locations: int
@@ -72,12 +77,31 @@ class CandidateView(FrozenModel):
     scan_freshness: Freshness
 
 
+class BindingHistoryEntry(FrozenModel):
+    revision: int
+    action: Literal["bind", "unbind"]
+    account_id: str | None = None
+    actor: str
+    changed_at: AwareDatetime
+    origin: BindingOrigin | None = None
+
+
+class CredentialBindingView(FrozenModel):
+    reference: str
+    account_id: str | None = None
+    revision: int
+    candidate: Literal["current", "retained", "missing"]
+    origin: BindingOrigin | None = None
+    history: tuple[BindingHistoryEntry, ...]
+
+
 class CredentialFinding(FrozenModel):
     kind: Literal[
         "unassigned_candidate",
         "provider_hint_without_account",
         "archived_candidate",
         "unbound_candidate",
+        "binding_candidate_missing",
         "quarantined_record",
         "incomplete_scan",
     ]
@@ -161,7 +185,7 @@ def _source(state: CredentialInventoryState, now: datetime) -> CredentialSourceV
     )
 
 
-def _candidate_finding(item: CandidateView, catalogued_providers: frozenset[str]) -> CredentialFinding:
+def _candidate_finding(item: CandidateView, catalogued_providers: frozenset[str]) -> CredentialFinding | None:
     if item.service == UNASSIGNED_SERVICE:
         return CredentialFinding(
             kind="unassigned_candidate",
@@ -183,8 +207,10 @@ def _candidate_finding(item: CandidateView, catalogued_providers: frozenset[str]
             source_id=item.source_id,
             reference=item.reference,
             service=item.service,
-            detail="Nur in Archiv- oder Exportfundstellen; keine bestätigte Kontobindung",
+            detail="Nur in Archiv- oder Exportfundstellen",
         )
+    if item.binding == "operator_confirmed":
+        return None
     return CredentialFinding(
         kind="unbound_candidate",
         source_id=item.source_id,
@@ -220,18 +246,92 @@ def _scan_findings(snapshot: CredentialInventorySnapshot) -> tuple[CredentialFin
     )
 
 
+def _with_binding(item: CandidateView, entries: tuple[CredentialBindingEntry, ...]) -> CandidateView:
+    account: Final = bound_account(entries)
+    latest: Final = max(entries, key=lambda entry: entry.revision, default=None)
+    return item.model_copy(
+        update={
+            "binding": "operator_confirmed" if account is not None else "unbound",
+            "bound_account_id": account,
+            "binding_revision": binding_revision(entries),
+            "binding_actor": latest.actor if latest is not None else None,
+            "binding_changed_at": latest.received_at if latest is not None else None,
+        }
+    )
+
+
+def _binding_view(
+    reference: str, entries: tuple[CredentialBindingEntry, ...], candidates: dict[str, CandidateView]
+) -> CredentialBindingView:
+    candidate: Final = candidates.get(reference)
+    ordered: Final = sorted(entries, key=lambda entry: entry.revision)
+    return CredentialBindingView(
+        reference=reference,
+        account_id=bound_account(entries),
+        revision=binding_revision(entries),
+        candidate="missing" if candidate is None else "retained" if candidate.presence == "retained" else "current",
+        origin=next((entry.origin for entry in reversed(ordered) if entry.origin is not None), None),
+        history=tuple(
+            BindingHistoryEntry(
+                revision=entry.revision,
+                action=entry.command.action,
+                account_id=entry.command.account_id,
+                actor=entry.actor,
+                changed_at=entry.received_at,
+                origin=entry.origin,
+            )
+            for entry in ordered
+        ),
+    )
+
+
 def credential_views(
-    states: tuple[CredentialInventoryState, ...], catalogued_providers: frozenset[str], now: datetime
-) -> tuple[tuple[CredentialSourceView, ...], tuple[CandidateView, ...], tuple[CredentialFinding, ...]]:
+    states: tuple[CredentialInventoryState, ...],
+    bindings: tuple[CredentialBindingEntry, ...],
+    catalogued_providers: frozenset[str],
+    now: datetime,
+) -> tuple[
+    tuple[CredentialSourceView, ...],
+    tuple[CandidateView, ...],
+    tuple[CredentialBindingView, ...],
+    tuple[CredentialFinding, ...],
+]:
     snapshots: Final = tuple(state.evidence for state in states if state.evidence is not None)
+    by_reference: Final = {
+        reference: tuple(entry for entry in bindings if entry.command.reference == reference)
+        for reference in sorted(frozenset(entry.command.reference for entry in bindings))
+    }
     candidates: Final = tuple(
-        chain.from_iterable((_candidate(snapshot, item, now) for item in snapshot.candidates) for snapshot in snapshots)
+        _with_binding(item, by_reference.get(item.reference, ()))
+        for item in chain.from_iterable(
+            (_candidate(snapshot, candidate, now) for candidate in snapshot.candidates) for snapshot in snapshots
+        )
+    )
+    indexed: Final = {item.reference: item for item in candidates}
+    binding_views: Final = tuple(
+        _binding_view(reference, entries, indexed) for reference, entries in by_reference.items()
     )
     return (
         tuple(_source(state, now) for state in states),
         candidates,
+        binding_views,
         (
-            *(_candidate_finding(item, catalogued_providers) for item in candidates),
+            *(
+                finding
+                for finding in (_candidate_finding(item, catalogued_providers) for item in candidates)
+                if finding is not None
+            ),
+            *(
+                CredentialFinding(
+                    kind="binding_candidate_missing",
+                    source_id=view.origin.source_id if view.origin is not None else "",
+                    reference=view.reference,
+                    service=view.origin.service if view.origin is not None else None,
+                    detail=f"Zuordnung zu {view.account_id} besteht, Fund im letzten Scan nicht mehr enthalten",
+                )
+                for view in binding_views
+                if view.account_id is not None and view.candidate == "missing"
+            ),
             *chain.from_iterable(map(_scan_findings, snapshots)),
         ),
     )
