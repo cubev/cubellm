@@ -11,12 +11,15 @@ from litellm.proxy.pass_through_endpoints.account_credentials import (
     AccountHeaderCredential,
     CredentialHeader,
     CredentialQuery,
+    CredentialSigV4,
     account_application_allowed,
     credential_origin,
     resolve_account_credential,
     validate_account_request,
     validate_account_route,
 )
+from litellm.proxy.pass_through_endpoints.query_credentials import QueryCredentialAuth
+from litellm.proxy.pass_through_endpoints.sigv4_credentials import SigV4CredentialAuth
 from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _get_spend_logs_metadata as stored_metadata,  # pyright: ignore[reportPrivateUsage, reportUnknownVariableType]
 )
@@ -345,7 +348,7 @@ QUERY_POLICY: Final = AccountHeaderCredential(
 
 
 def test_query_credentials_need_a_destination_that_clients_cannot_name() -> None:
-    with pytest.raises(ValidationError, match="header or a query parameter"):
+    with pytest.raises(ValidationError, match="header, query parameter or SigV4 destination"):
         AccountHeaderCredential(account_id="fixture-account", credential_name="fixture credential")
     with pytest.raises(ValidationError, match="also be a client query parameter"):
         AccountHeaderCredential.model_validate(QUERY_POLICY.model_dump() | {"allowed_query_parameters": ["TICKET.V2~"]})
@@ -363,6 +366,67 @@ def test_query_credential_names_are_plain_unreserved_tokens(name: str) -> None:
 
 def test_query_credential_resolution_keeps_the_value_private_and_headers_empty() -> None:
     resolved: Final = resolve_account_credential(QUERY_POLICY, credential(QUERY_SECRET), "https://vendor.example/v1")
-    assert resolved.headers == {} and resolved.query is not None
-    assert QUERY_SECRET not in repr(resolved) and QUERY_SECRET not in repr(resolved.query)
-    assert resolved.query.redact(f"k:{QUERY_SECRET} and {QUERY_SECRET}") == "[redacted] and [redacted]"
+    assert resolved.headers == {} and isinstance(resolved.outbound, QueryCredentialAuth)
+    assert QUERY_SECRET not in repr(resolved) and QUERY_SECRET not in repr(resolved.outbound)
+    assert resolved.outbound.redact(f"k:{QUERY_SECRET} and {QUERY_SECRET}") == "[redacted] and [redacted]"
+
+
+SIGV4: Final = CredentialSigV4(
+    region="eu-central-1",
+    service="execute-api",
+    access_key_field="access key",
+    secret_key_field="secret key",
+    session_token_field="session token",
+)
+SIGV4_POLICY: Final = AccountHeaderCredential(
+    account_id="fixture-account", credential_name="fixture credential", sigv4=SIGV4, allowed_query_parameters=("page",)
+)
+
+
+def sigv4_credential(**values: str) -> CredentialItem:
+    return CredentialItem(
+        credential_name=POLICY.credential_name,
+        credential_values=values,
+        credential_info={"cube_account_id": "fixture-account", "cube_allowed_origins": ["https://vendor.example"]},
+    )
+
+
+def test_sigv4_is_the_only_credential_destination_of_its_route() -> None:
+    for changes in (
+        {"headers": [{"name": "X-Api-Key", "field": "access key"}]},
+        {"query": {"name": "key", "field": "access key"}},
+    ):
+        with pytest.raises(ValidationError, match="cannot be combined"):
+            AccountHeaderCredential.model_validate(SIGV4_POLICY.model_dump() | changes)
+    for region, service in (
+        ("EU-central-1", "execute-api"),
+        ("eu-central", "execute-api"),
+        ("eu-central-1", "Execute API"),
+    ):
+        with pytest.raises(ValidationError):
+            CredentialSigV4.model_validate(SIGV4.model_dump() | {"region": region, "service": service})
+
+
+@pytest.mark.parametrize("name", ("Authorization", "X-Amz-Date", "x-amz-security-token", "X-Amz-Content-Sha256"))
+def test_inline_headers_cannot_shadow_the_signature(name: str) -> None:
+    with pytest.raises(ValueError, match="SigV4 signature"):
+        validate_account_route("https://vendor.example/v1", True, False, {name: "forged"}, None, SIGV4_POLICY, ("GET",))
+
+
+def test_sigv4_credentials_resolve_from_the_named_vault_entry_without_exposing_them() -> None:
+    resolved: Final = resolve_account_credential(
+        SIGV4_POLICY,
+        sigv4_credential(
+            **{"access key": "AKIDFIXTURE", "secret key": "fixture/secret+", "session token": "fixture-token"}
+        ),
+        "https://vendor.example/v1",
+    )
+    assert resolved.headers == {} and isinstance(resolved.outbound, SigV4CredentialAuth)
+    assert repr(resolved.outbound) == "SigV4CredentialAuth(execute-api, eu-central-1, <redacted>)"
+    assert (
+        resolved.outbound.redact("AKIDFIXTURE fixture%2Fsecret%2B fixture-token") == "[redacted] [redacted] [redacted]"
+    )
+    with pytest.raises(ValueError, match="unavailable or invalid"):
+        resolve_account_credential(
+            SIGV4_POLICY, sigv4_credential(**{"access key": "AKIDFIXTURE"}), "https://vendor.example/v1"
+        )

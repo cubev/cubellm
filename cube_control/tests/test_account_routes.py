@@ -20,6 +20,7 @@ from cube_control.account_routes import (
     AccountRouteHeader,
     AccountRouteQuery,
     AccountRouteResult,
+    AccountRouteSigV4,
     AccountRouteSpec,
     adopt_account_resource,
     ensure_account_route,
@@ -141,6 +142,46 @@ class AccountRouteTests(unittest.TestCase):
         for changes in (
             {"query": None},
             {"query": {"name": "ticket", "field": "api_key"}, "allowed_query_parameters": ["TICKET"]},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                AccountRouteSpec.model_validate(spec.model_dump() | changes)
+
+    def test_sigv4_routes_are_sent_only_to_gateways_that_announce_signing(self) -> None:
+        sigv4: Final = AccountRouteSigV4(
+            region="eu-central-1",
+            service="execute-api",
+            access_key_field="access_key",
+            secret_key_field="secret_key",
+            session_token_field="session_token",
+        )
+        spec: Final = SPEC.model_copy(update={"headers": (), "sigv4": sigv4})
+        unsupported: Final = RouteGateway()
+        unsupported.capabilities["passthrough_account_query_credential"] = "query_parameter_v1"
+        self.assertEqual((ensure(unsupported, spec).status, unsupported.bodies), ("error", []))
+        gateway: Final = RouteGateway()
+        gateway.capabilities["passthrough_account_sigv4_credential"] = "aws_sigv4_v1"
+        self.assertEqual(ensure(gateway, spec).status, "created")
+        route: Final = gateway.bodies[0]["route"]
+        self.assertEqual(
+            route["account_credential"] if isinstance(route, dict) else None,
+            {
+                "account_id": "fixture-account",
+                "credential_name": "fixture-credential",
+                "headers": [],
+                "sigv4": {
+                    "region": "eu-central-1",
+                    "service": "execute-api",
+                    "access_key_field": "access_key",
+                    "secret_key_field": "secret_key",
+                    "session_token_field": "session_token",
+                },
+                "allowed_query_parameters": [],
+            },
+        )
+        for changes in (
+            {"headers": [{"name": "X-Api-Key", "field": "api_key"}]},
+            {"query": {"name": "key", "field": "api_key"}},
+            {"sigv4": sigv4.model_dump() | {"region": "Frankfurt"}},
         ):
             with self.subTest(changes=changes), self.assertRaises(ValidationError):
                 AccountRouteSpec.model_validate(spec.model_dump() | changes)

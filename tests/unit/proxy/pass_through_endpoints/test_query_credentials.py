@@ -11,11 +11,8 @@ import httpx
 import pytest
 
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
-from litellm.proxy.pass_through_endpoints.query_credentials import (
-    BUFFERED_BODY_LIMIT,
-    QueryCredentialAuth,
-    QueryCredentialTransport,
-)
+from litellm.proxy.pass_through_endpoints.credential_transport import BUFFERED_BODY_LIMIT, CredentialTransport
+from litellm.proxy.pass_through_endpoints.query_credentials import QueryCredentialAuth
 
 NAME: Final = "ticket.v2~"
 SECRET: Final = "fixture +/ credential&ticket=forged%"
@@ -41,7 +38,7 @@ def leaks(*texts: str) -> list[str]:
 async def send(
     provider: Callable[[httpx.Request], httpx.Response], url: str, credential: QueryCredentialAuth | None = None
 ) -> httpx.Response:
-    async with httpx.AsyncClient(transport=QueryCredentialTransport(httpx.MockTransport(provider))) as client:
+    async with httpx.AsyncClient(transport=CredentialTransport(httpx.MockTransport(provider))) as client:
         response: Final = await client.send(
             httpx.Request("GET", url), auth=credential or auth(), follow_redirects=False
         )
@@ -82,7 +79,7 @@ async def test_parallel_routes_keep_their_own_credentials() -> None:
 
     first: Final = QueryCredentialAuth(NAME, "first-route-key", "first-route-key")
     second: Final = QueryCredentialAuth(NAME, "second-route-key", "second-route-key")
-    async with httpx.AsyncClient(transport=QueryCredentialTransport(httpx.MockTransport(provider))) as client:
+    async with httpx.AsyncClient(transport=CredentialTransport(httpx.MockTransport(provider))) as client:
         responses: Final = await asyncio.gather(
             client.send(httpx.Request("GET", "https://vendor.example/v1?page=first"), auth=first),
             client.send(httpx.Request("GET", "https://vendor.example/v1?page=second"), auth=second),
@@ -227,13 +224,13 @@ def test_wrapped_handler_clients_keep_proxy_mounts_and_their_own_pools(monkeypat
     monkeypatch.setenv("HTTPS_PROXY", "http://egress.example:3128")
     monkeypatch.setattr(AsyncHTTPHandler, "_should_use_aiohttp_transport", staticmethod(lambda: False))
     handlers: Final = tuple(
-        AsyncHTTPHandler(transport_wrapper=QueryCredentialTransport, follow_redirects=False) for _ in range(2)
+        AsyncHTTPHandler(transport_wrapper=CredentialTransport, follow_redirects=False) for _ in range(2)
     )
     transports: Final = tuple(handler.client._transport for handler in handlers)  # pyright: ignore[reportPrivateUsage]  # pool ownership is only visible on the client
     mounts: Final = tuple(handler.client._mounts for handler in handlers)  # pyright: ignore[reportPrivateUsage]  # proxy mounts are only visible on the client
-    assert all(isinstance(transport, QueryCredentialTransport) for transport in transports)
+    assert all(isinstance(transport, CredentialTransport) for transport in transports)
     assert transports[0]._pool is not None and transports[0]._pool is not transports[1]._pool  # pyright: ignore[reportPrivateUsage]  # forwarded pool used by eviction
-    assert [[isinstance(mounted, QueryCredentialTransport) for mounted in mapping.values()] for mapping in mounts] == [
+    assert [[isinstance(mounted, CredentialTransport) for mounted in mapping.values()] for mapping in mounts] == [
         [True],
         [True],
     ]
@@ -259,7 +256,7 @@ async def test_body_read_errors_after_partial_output_are_redacted_without_chaine
             await response.aclose()
         return b"".join(received)
 
-    async with httpx.AsyncClient(transport=QueryCredentialTransport(httpx.MockTransport(provider))) as client:
+    async with httpx.AsyncClient(transport=CredentialTransport(httpx.MockTransport(provider))) as client:
         with pytest.raises(httpx.ReadError) as raised:
             await read(client)
     assert "connection lost while reading" in str(raised.value)

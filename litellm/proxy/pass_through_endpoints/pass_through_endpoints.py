@@ -143,10 +143,12 @@ from .account_ownership import (
     resource_path_match,
 )
 from .account_routes import RoutesMutation, RoutesPlan, mutate_settings_routes
+from .credential_transport import CredentialTransport
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
-from .query_credentials import QueryCredentialAuth, QueryCredentialTransport
+from .query_credentials import QueryCredentialAuth
+from .sigv4_credentials import SigV4CredentialAuth
 from .streaming_handler import PassThroughStreamingHandler
 from .success_handler import PassThroughEndpointLogging
 from .upstream_usage_headers import (
@@ -1103,7 +1105,7 @@ async def pass_through_request(
     guardrails_config: dict | None = None,
     timeout: float | None = None,
     account_binding: AccountRouteBinding | None = None,
-    account_query: QueryCredentialAuth | None = None,
+    account_outbound: QueryCredentialAuth | SigV4CredentialAuth | None = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -1262,7 +1264,7 @@ async def pass_through_request(
             params={
                 "timeout": resolved_timeout,
                 **({"follow_redirects": False} if account_binding else {}),
-                **({"transport_wrapper": QueryCredentialTransport} if account_query is not None else {}),
+                **({"transport_wrapper": CredentialTransport} if account_outbound is not None else {}),
             },
         )
         async_client: Final = async_client_obj.client
@@ -1466,7 +1468,7 @@ async def pass_through_request(
                     requested_query_params=requested_query_params,
                     stream=True,
                     **(
-                        {"isolate_client": True, "follow_redirects": False, "upstream_auth": account_query}
+                        {"isolate_client": True, "follow_redirects": False, "upstream_auth": account_outbound}
                         if account_binding
                         else {}
                     ),
@@ -1495,7 +1497,7 @@ async def pass_through_request(
                 response = await async_client.send(
                     req,
                     stream=stream,
-                    **({"follow_redirects": False, "auth": account_query} if account_binding else {}),
+                    **({"follow_redirects": False, "auth": account_outbound} if account_binding else {}),
                 )
 
             upstream_usage = apply_upstream_reported_usage(
@@ -1514,7 +1516,7 @@ async def pass_through_request(
                     upstream_usage=upstream_usage,
                 ),
                 logging_obj=logging_obj,
-                redact=account_query.redact if account_query is not None else None,
+                redact=account_outbound.redact if account_outbound is not None else None,
             )
 
             # Call response headers hook for streaming pass-through
@@ -1577,7 +1579,7 @@ async def pass_through_request(
             response = await async_client.send(
                 raw_body_request,
                 stream=True,
-                **({"follow_redirects": False, "auth": account_query} if account_binding else {}),
+                **({"follow_redirects": False, "auth": account_outbound} if account_binding else {}),
             )
         else:
             response = await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
@@ -1589,7 +1591,7 @@ async def pass_through_request(
                 _parsed_body=_parsed_body,
                 forward_multipart=is_multipart,
                 **(
-                    {"follow_redirects": False, "isolate_client": True, "upstream_auth": account_query}
+                    {"follow_redirects": False, "isolate_client": True, "upstream_auth": account_outbound}
                     if account_binding
                     else {}
                 ),
@@ -1616,7 +1618,7 @@ async def pass_through_request(
                     upstream_usage=upstream_usage,
                 ),
                 logging_obj=logging_obj,
-                redact=account_query.redact if account_query is not None else None,
+                redact=account_outbound.redact if account_outbound is not None else None,
             )
 
             # Call response headers hook for detected streaming pass-through
@@ -1722,7 +1724,7 @@ async def pass_through_request(
             user_api_key_dict=user_api_key_dict,
             request_payload=failure_request_payload,
             logging_obj=logging_obj,
-            redact=account_query.redact if account_query is not None else None,
+            redact=account_outbound.redact if account_outbound is not None else None,
         )
 
         if response.status_code < 400 and response_body is not None and guardrails_to_run:
@@ -2023,7 +2025,7 @@ class _AccountRouteParams(BaseModel):
 
 class _RelayOptions(TypedDict, total=False):
     account_binding: ReadOnly[AccountRouteBinding]
-    account_query: ReadOnly[QueryCredentialAuth]
+    account_outbound: ReadOnly[QueryCredentialAuth | SigV4CredentialAuth]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2059,10 +2061,10 @@ class _AccountRelay:
             raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
 
     def relay_options(self) -> _RelayOptions:
-        query: Final = self.credential.query
-        if query is None:
+        outbound: Final = self.credential.outbound
+        if outbound is None:
             return _RelayOptions(account_binding=self.credential.binding)
-        return _RelayOptions(account_binding=self.credential.binding, account_query=query)
+        return _RelayOptions(account_binding=self.credential.binding, account_outbound=outbound)
 
     async def capture(self, path: str, method: str, response: Response) -> None:
         await capture_created_resources(
