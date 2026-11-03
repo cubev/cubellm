@@ -449,3 +449,49 @@ def test_query_destination_is_stored_only_when_set_and_bound_into_the_fingerprin
     )
     assert not any(isinstance(descriptor, GrantFailure) for descriptor in fingerprints)
     assert len({descriptor.fingerprint for descriptor in fingerprints if not isinstance(descriptor, GrantFailure)}) == 2
+
+
+def sigv4_definition(**changes: str) -> AccountRouteDefinition:
+    return AccountRouteDefinition.model_validate(
+        {
+            **DEFINITION.model_dump(),
+            "account_credential": {
+                "account_id": "fixture-account",
+                "credential_name": "fixture-credential",
+                "sigv4": {
+                    "region": "eu-central-1",
+                    "service": "execute-api",
+                    "access_key_field": "access_key",
+                    "secret_key_field": "secret_key",
+                }
+                | changes,
+            },
+        }
+    )
+
+
+def test_sigv4_scope_and_key_fields_are_stored_and_bound_into_the_fingerprint() -> None:
+    credential: Final = sigv4_definition().stored()["account_credential"]
+    assert isinstance(credential, dict) and "query" not in credential
+    assert credential["sigv4"] == {
+        "region": "eu-central-1",
+        "service": "execute-api",
+        "access_key_field": "access_key",
+        "secret_key_field": "secret_key",
+        "session_token_field": None,
+    }
+    variants: Final = (
+        sigv4_definition(),
+        sigv4_definition(region="us-east-1"),
+        sigv4_definition(service="lambda"),
+        sigv4_definition(secret_key_field="other_secret"),
+        sigv4_definition(session_token_field="token"),
+    )
+    assert plan_account_route(settings(variants[0].stored()), variants[0]) is False
+    assert [plan_account_route(settings(variants[0].stored()), variant) for variant in variants[1:]] == [
+        GrantFailure("conflict")
+    ] * 4
+    descriptors: Final = tuple(
+        describe_account_route(settings(variant.stored()), DEFINITION.id) for variant in variants
+    )
+    assert len({descriptor.fingerprint for descriptor in descriptors if not isinstance(descriptor, GrantFailure)}) == 5

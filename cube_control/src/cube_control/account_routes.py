@@ -49,6 +49,14 @@ class AccountRouteHeader(FrozenModel):
     prefix: Annotated[str, Field(pattern=r"^[ -~]{0,32}$")] = ""
 
 
+class AccountRouteSigV4(FrozenModel):
+    region: Annotated[str, Field(pattern=r"^[a-z]{2}(-[a-z0-9]+)+-[0-9]{1,2}$")]
+    service: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+    access_key_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    secret_key_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    session_token_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")] | None = None
+
+
 class AccountRouteQuery(FrozenModel):
     name: Annotated[str, Field(pattern=r"^[A-Za-z0-9._~-]{1,128}$")]
     field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
@@ -97,6 +105,7 @@ class AccountRouteSpec(FrozenModel):
     credential_name: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
     headers: Annotated[tuple[AccountRouteHeader, ...], Field(max_length=8)] = ()
     query: AccountRouteQuery | None = None
+    sigv4: AccountRouteSigV4 | None = None
     allowed_query_parameters: Annotated[tuple[str, ...], Field(max_length=32)] = ()
     target: Annotated[str, Field(min_length=1, max_length=2048)]
     path: AccountPath
@@ -108,8 +117,10 @@ class AccountRouteSpec(FrozenModel):
     def validate_route(self) -> Self:
         require_admin_origin(self.gateway_origin)
         require_managed_path(self.path)
-        if not self.headers and self.query is None:
-            raise ValueError("Account routes need a credential header or query parameter")
+        if not self.headers and self.query is None and self.sigv4 is None:
+            raise ValueError("Account routes need a credential header, query parameter or SigV4 signature")
+        if self.sigv4 is not None and (self.headers or self.query is not None):
+            raise ValueError("SigV4 account routes cannot add other credential destinations")
         if self.query is not None and any(
             name.casefold() == self.query.name.casefold() for name in self.allowed_query_parameters
         ):
@@ -145,6 +156,7 @@ class AccountRouteSpec(FrozenModel):
                     "credential_name": self.credential_name,
                     "headers": [header.model_dump(mode="json") for header in self.headers],
                     **({"query": self.query.model_dump(mode="json")} if self.query is not None else {}),
+                    **({"sigv4": self.sigv4.model_dump(mode="json")} if self.sigv4 is not None else {}),
                     "allowed_query_parameters": list(self.allowed_query_parameters),
                     **(
                         {
@@ -176,6 +188,10 @@ class _QueryCredentialCapabilities(_RouteCapabilities):
     passthrough_account_query_credential: Literal["query_parameter_v1"]
 
 
+class _SigV4CredentialCapabilities(_RouteCapabilities):
+    passthrough_account_sigv4_credential: Literal["aws_sigv4_v1"]
+
+
 class _RouteReceipt(BaseModel):
     stored: Literal[True]
     created: bool
@@ -203,6 +219,11 @@ def _ensure(client: httpx.Client, spec: AccountRouteSpec) -> AccountRouteResult:
             _ = _QueryCredentialCapabilities.model_validate_json(caps_raw)
         except ValidationError:
             return result("error", "Gateway does not support query parameter credentials; nothing stored")
+    if spec.sigv4 is not None:
+        try:
+            _ = _SigV4CredentialCapabilities.model_validate_json(caps_raw)
+        except ValidationError:
+            return result("error", "Gateway does not support SigV4 credentials; nothing stored")
     if spec.resource_types:
         AccountResourceCapabilities.model_validate_json(caps_raw)
     code, raw = request_gateway(client, "POST", "/cube_control/account_routes", spec.command())

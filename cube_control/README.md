@@ -891,6 +891,50 @@ account routes do not use. A provider that echoes the key in a form not listed a
 is not covered. Gateway-reported costs of these routes stay `unverified`, as for
 header routes
 
+## AWS SigV4 signed account routes
+
+An account route can sign its requests with AWS Signature Version 4 instead of adding
+a key. The signature is the route's only credential destination:
+
+```json
+{
+  "headers": [],
+  "sigv4": {
+    "region": "eu-central-1",
+    "service": "execute-api",
+    "access_key_field": "access_key",
+    "secret_key_field": "secret_key",
+    "session_token_field": "session_token"
+  },
+  "allowed_query_parameters": ["page"]
+}
+```
+
+The three fields name values of the route's named credential, which supplies the
+access key ID, the secret key and an optional session token. Region and service are
+part of the stored route and of its fingerprint, together with the field names, the
+account and the target origin, so creating the same route ID with another region,
+service or field conflicts. The gateway announces this with
+`passthrough_account_sigv4_credential: aws_sigv4_v1`, and the controller only sends a
+signed route to a gateway that does. Nothing is taken from the client: account routes
+never forward client headers, inline route headers may not set `Authorization` or any
+`X-Amz-` header, and the transport removes any `Authorization`, `X-Amz-Date`,
+`X-Amz-Security-Token` and `X-Amz-Content-Sha256` header before it signs
+
+The same transport wrapper as for query credentials signs the physical outbound
+request with botocore's SigV4 implementation at the last step before the network, over
+the method, URL, query, final headers and the exact body bytes. The signing time comes
+from the gateway clock, and the canonical request with a session token is never
+logged. Client-side requests, httpx logs, `response.url` and the logged `api_base`
+carry no signature, and responses are cleaned of the access key ID, secret key and
+session token in the same encodings and with the same framing rules as query
+credentials. The body of a signed request is read into memory once for signing
+
+Limits: only plain SigV4 with a static or session credential is supported. Presigned
+URLs, chunked payload signing, S3's unsigned payload and SigV4a are not. A provider
+that echoes a credential in a form not listed above is not covered. Gateway-reported
+costs stay `unverified`
+
 
 ## Account resource ownership
 

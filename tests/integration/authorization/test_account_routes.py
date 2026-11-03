@@ -268,6 +268,145 @@ def _application_key(scenario: Scenario, application: str, entries: list[JsonVal
     return key, sha256(key.encode()).hexdigest()
 
 
+def _expected_signature(gateway: Gateway, observed: dict[str, JsonValue], secrets: tuple[str, str, str]) -> str:
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    signed: Final = {
+        name: value for name, value in TypeAdapter(list[tuple[str, str]]).validate_python(observed["signed"])
+    }
+    request: Final = AWSRequest(
+        method="POST",
+        url=f"{gateway.upstream_url}{string_value(observed['path'])}?{string_value(observed['query'])}",
+        data=string_value(observed["raw"]).encode(),
+        headers=signed,
+    )
+    request.context["timestamp"] = signed["x-amz-date"]
+    signer: Final = SigV4Auth(Credentials(*secrets), "execute-api", "eu-central-1")
+    return signer.signature(signer.string_to_sign(request, signer.canonical_request(request)), request)
+
+
+def test_sigv4_route_signs_only_for_the_granted_application_and_keeps_every_credential_private(
+    gateway: Gateway,
+) -> None:
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-account-{marker}"
+    secrets: Final = (f"AKIDINTEGRATION{marker[:8].upper()}", f"synthetic/{marker}+secret", f"session-{marker}")
+    path: Final = f"/cube_api/integration-{marker}/quota"
+    route_id: Final = f"integration-sigv4-route-{marker}"
+    application: Final = f"integration-app-{marker}"
+    handle: Final = register_scenario(
+        marker, JsonResponse(content_type="application/json", body={"quota": 42, "echo": f"key {secrets[0]} rejected"})
+    )
+    with gateway.scenario() as scenario:
+        scenario.cleanups.callback(delete_scenario, handle)
+        credential: Final = f"integration-sigv4-{marker}"
+        gateway.post(
+            "/credentials",
+            {
+                "credential_name": credential,
+                "credential_values": dict(zip(("access_key", "secret_key", "session_token"), secrets, strict=True)),
+                "credential_info": {"cube_account_id": account, "cube_allowed_origins": [gateway.upstream_url]},
+            },
+        )
+        scenario.cleanups.callback(_delete_credential, gateway, credential)
+        sigv4: Final[dict[str, JsonValue]] = {
+            "region": "eu-central-1",
+            "service": "execute-api",
+            "access_key_field": "access_key",
+            "secret_key_field": "secret_key",
+            "session_token_field": "session_token",
+        }
+        definition: Final[dict[str, JsonValue]] = {
+            "id": route_id,
+            "path": path,
+            "target": f"{handle.api_base()}/v1/quota",
+            "methods": ["POST"],
+            "account_credential": {
+                "account_id": account,
+                "credential_name": credential,
+                "sigv4": sigv4,
+                "allowed_query_parameters": ["page"],
+            },
+        }
+        assert gateway.get("/cube_control/capabilities")["passthrough_account_sigv4_credential"] == "aws_sigv4_v1"
+        created: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+        scenario.cleanups.callback(_delete_route, gateway, route_id)
+        route: Final = object_value(created["route"])
+        repeated: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+        assert (created["created"], repeated["created"]) == (True, False)
+        assert object_value(repeated["route"])["fingerprint"] == route["fingerprint"]
+        moved: Final = {
+            **definition,
+            "account_credential": {
+                **object_value(definition["account_credential"]),
+                "sigv4": {**sigv4, "region": "us-east-1"},
+            },
+        }
+        assert gateway.request("POST", "/cube_control/account_routes", {"route": moved}).status_code == 409
+
+        key, key_hash = _application_key(scenario, application, [path])
+        other_key, _ = _application_key(scenario, f"integration-other-{marker}", [path])
+        _grant(
+            gateway,
+            route_id,
+            string_value(route["fingerprint"]),
+            {
+                "application_id": application,
+                "key_hash": key_hash,
+                "account_id": account,
+                "path": path,
+                "methods": ["POST"],
+            },
+        )
+        _observed(gateway)
+        forged: Final = {"X-Amz-Date": "19990101T000000Z", "X-Amz-Security-Token": "forged-token"}
+        served: Final = eventually(
+            lambda: gateway.request("POST", path, {"marker": marker}, key=key, params={"page": "7"}, headers=forged),
+            lambda response: response.status_code != 404,
+            seconds=60,
+        )
+        assert (served.status_code, served.json()) == (200, {"quota": 42, "echo": "key [redacted] rejected"}), (
+            served.text
+        )
+        observed: Final = [object_value(value) for value in _observed(gateway)]
+        assert len(observed) == 1, observed
+        authorization: Final = string_value(observed[0]["authorization"])
+        assert authorization.startswith(f"AWS4-HMAC-SHA256 Credential={secrets[0]}/"), authorization
+        assert "/eu-central-1/execute-api/aws4_request, " in authorization
+        signed: Final = dict(TypeAdapter(list[tuple[str, str]]).validate_python(observed[0]["signed"]))
+        assert signed["x-amz-security-token"] == secrets[2] and signed["x-amz-date"] != forged["X-Amz-Date"]
+        assert {"host", "content-type", "content-length"} <= set(signed), signed
+        assert authorization.endswith(f"Signature={_expected_signature(gateway, observed[0], secrets)}")
+        assert (observed[0]["query"], observed[0]["body"]) == ("page=7", {"marker": marker})
+
+        assert gateway.request("POST", path, {"marker": marker}, key=other_key, params={"page": "7"}).status_code == 403
+        assert gateway.request("POST", path, {"marker": marker}, key=key, params={"other": "x"}).status_code == 400
+        assert _observed(gateway) == []
+
+        rows: Final = eventually(
+            lambda: read_rows(
+                'SELECT call_type, api_base, metadata, response FROM "LiteLLM_SpendLogs" WHERE api_key = %s',
+                (key_hash,),
+            ),
+            lambda values: len(values) == 1,
+            seconds=70,
+        )
+        metadata: Final = object_value(rows[0]["metadata"])
+        assert (
+            rows[0]["call_type"],
+            metadata["provider_account_id"],
+            metadata["user_api_key_application_id"],
+            metadata["provider_account_source"],
+            metadata["provider_cost_status"],
+        ) == ("pass_through_endpoint", account, application, "configured_credential", "unverified")
+        stored: Final = json.dumps(rows, default=str)
+        assert [
+            form for secret in secrets for form in _encoded(secret) if form in stored
+        ] == []  # comprehension-ok: every encoding of each credential part
+
+
 def _delete_ownership(account: str) -> None:
     write_rows('DELETE FROM "LiteLLM_AccountResourceOwnership" WHERE account_id = %s', (account,))
     remaining: Final = read_rows(

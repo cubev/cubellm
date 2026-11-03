@@ -65,6 +65,16 @@ class Observation:
     authorization: str
     body: dict[str, JsonValue]
     query: str = ""
+    signed: tuple[tuple[str, str], ...] = ()
+    raw: str = ""
+
+
+def signed_parts(request: Request, raw_body: bytes) -> tuple[tuple[tuple[str, str], ...], str]:
+    authorization: Final = request.headers.get("authorization", "")
+    if not authorization.startswith("AWS4-HMAC-SHA256 "):
+        return (), ""
+    names: Final = authorization.split("SignedHeaders=", 1)[1].split(",", 1)[0].split(";")
+    return tuple((name, request.headers.get(name, "")) for name in names), raw_body.decode()
 
 
 class _ScenarioRegistration(BaseModel):
@@ -210,6 +220,7 @@ class Provider:
                 "requests": [
                     {"path": value.path, "authorization": value.authorization, "body": value.body}
                     | ({"query": value.query} if value.query else {})
+                    | ({"signed": [list(pair) for pair in value.signed], "raw": value.raw} if value.signed else {})
                     for value in values
                 ]
             }
@@ -257,7 +268,13 @@ class Provider:
                 body: Final = JSON_OBJECT.validate_json(raw_body)
                 if isinstance(body, dict):
                     self.observations.put(
-                        Observation(request.url.path, request.headers.get("authorization", ""), body, request.url.query)
+                        Observation(
+                            request.url.path,
+                            request.headers.get("authorization", ""),
+                            body,
+                            request.url.query,
+                            *signed_parts(request, raw_body),
+                        )
                     )
         if isinstance(response, RoutedResponse):
             route_key: Final = f"{request.method} /{'/'.join(segments[1:])}"
