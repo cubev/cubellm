@@ -1020,6 +1020,40 @@ Limits: encrypted private keys, PKCS#12 bundles, certificate revocation checks a
 proxies for mTLS connections are not supported. A rotated certificate is used from the
 next request; pools of replaced certificates are dropped only by the size limit
 
+## WebSocket account routes
+
+An account route whose only method is `WEBSOCKET` and whose target uses `wss://` (or
+`ws://` on literal loopback) is served as a WebSocket route:
+
+```json
+{
+  "target": "wss://api.vendor.example/v1/realtime",
+  "methods": ["WEBSOCKET"],
+  "account_credential": {
+    "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+    "allowed_query_parameters": ["model"]
+  }
+}
+```
+
+Each handshake reads the current route definition, authenticates the gateway key the
+same way as other WebSocket routes, requires an application grant for the method
+`WEBSOCKET` and only allowed query parameters, and resolves the named credential
+against the HTTPS form of the target origin (`wss://host` is checked as
+`https://host`). Only header credentials are supported, so no secret is part of the
+upstream URL: they are added to the upstream handshake, client headers are never
+forwarded, and the logged handshake headers are masked. Frames are relayed unchanged in
+both directions. A deleted route or revoked grant applies to the next handshake; open
+connections are not cut. Spend rows carry the account provenance with `unverified`
+cost. Mixed methods, subpath forwarding, resources and query, SigV4, OAuth or client
+certificate destinations are refused. The gateway announces
+`passthrough_account_websocket_route: websocket_v1`, and the controller only sends a
+WebSocket route to a gateway that does
+
+Limits: frames are not redacted, so a provider echoing the header credential in a frame
+reaches the client, as with HTTP header routes. Per-message usage and cost are not
+derived
+
 ## Account resource ownership
 
 Some provider APIs create resources such as media jobs or files and then address

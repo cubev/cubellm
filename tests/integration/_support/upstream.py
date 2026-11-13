@@ -35,7 +35,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
 CASES_FILE: Final = Path(__file__).resolve().parents[1] / "cost_calculation" / "cost_tracking_cases.json"
@@ -298,6 +298,22 @@ class Provider:
             return self._response(route, scenario_id)
         return self._response(response, scenario_id)
 
+    async def websocket_echo(self, websocket: WebSocket) -> None:
+        """Reports the handshake it received (authorization, query, a client-only header), then echoes text frames."""
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "authorization": websocket.headers.get("authorization", ""),
+                "query": websocket.url.query,
+                "client_header": websocket.headers.get("x-integration-client", ""),
+            }
+        )
+        try:
+            while True:
+                await websocket.send_text(await websocket.receive_text())
+        except WebSocketDisconnect:
+            return
+
     async def realtime(self, websocket: WebSocket) -> None:
         scenario_id: Final = websocket.headers.get("authorization", "").removeprefix("Bearer ")
         response: Final = self.scenario_store.get(scenario_id)
@@ -413,6 +429,7 @@ class Provider:
                 Route("/{path:path}", self.scripted, methods=["POST"]),
                 Route("/{path:path}", self.scripted, methods=["GET"]),
                 WebSocketRoute("/v1/realtime", self.realtime),
+                WebSocketRoute("/__ws_echo/{path:path}", self.websocket_echo),
             ]
         )
 

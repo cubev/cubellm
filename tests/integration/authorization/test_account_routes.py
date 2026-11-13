@@ -716,6 +716,101 @@ def test_client_certificate_route_presents_the_account_certificate_only_for_the_
         assert [form for form in _encoded(query_key) if form in stored] == []
 
 
+def _websocket_handshake(gateway: Gateway, path: str, key: str, query: str = "") -> list[str]:
+    """Opens the gateway WebSocket route, sends one frame and returns what came back, or raises on refusal."""
+    from websockets.sync.client import connect
+
+    url: Final = str(gateway.client.base_url).replace("http://", "ws://", 1).rstrip("/") + path + query
+    with connect(
+        url,
+        additional_headers={"Authorization": f"Bearer {key}", "X-Integration-Client": "must-not-forward"},
+        open_timeout=15,
+    ) as socket:
+        greeting: Final = socket.recv(timeout=15)
+        socket.send("ping")
+        echoed: Final = socket.recv(timeout=15)
+    return [str(greeting), str(echoed)]
+
+
+def test_websocket_route_authenticates_the_handshake_and_injects_only_the_account_header(gateway: Gateway) -> None:
+    from websockets.exceptions import InvalidStatus
+
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-account-{marker}"
+    provider_value: Final = f"synthetic-ws-{marker}"
+    path: Final = f"/cube_api/integration-{marker}/realtime"
+    route_id: Final = f"integration-ws-route-{marker}"
+    application: Final = f"integration-app-{marker}"
+    with gateway.scenario() as scenario:
+        credential: Final = _credential(gateway, scenario, account, provider_value)
+        definition: Final[dict[str, JsonValue]] = {
+            "id": route_id,
+            "path": path,
+            "target": gateway.upstream_url.replace("http://", "ws://", 1) + f"/__ws_echo/{marker}",
+            "methods": ["WEBSOCKET"],
+            "account_credential": {
+                "account_id": account,
+                "credential_name": credential,
+                "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+                "allowed_query_parameters": ["model"],
+            },
+        }
+        assert gateway.get("/cube_control/capabilities")["passthrough_account_websocket_route"] == "websocket_v1"
+        created: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+        scenario.cleanups.callback(_delete_route, gateway, route_id)
+        route: Final = object_value(created["route"])
+        repeated: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+        assert (created["created"], repeated["created"]) == (True, False)
+        assert route["methods"] == ["WEBSOCKET"]
+        mixed: Final = {**definition, "methods": ["WEBSOCKET", "GET"]}
+        assert (
+            gateway.request(
+                "POST", "/cube_control/account_routes", {"route": {**mixed, "id": f"{route_id}-x"}}
+            ).status_code
+            == 422
+        )
+
+        key, key_hash = _application_key(scenario, application, [path])
+        other_key, _ = _application_key(scenario, f"integration-other-{marker}", [path])
+        _grant(
+            gateway,
+            route_id,
+            string_value(route["fingerprint"]),
+            {
+                "application_id": application,
+                "key_hash": key_hash,
+                "account_id": account,
+                "path": path,
+                "methods": ["WEBSOCKET"],
+            },
+        )
+
+        def attempt() -> list[str] | None:
+            try:
+                return _websocket_handshake(gateway, path, key, "?model=fixture")
+            except (InvalidStatus, OSError, TimeoutError):
+                return None
+
+        frames: Final = eventually(attempt, lambda value: value is not None, seconds=60)
+        assert frames is not None
+        greeting: Final = JSON_OBJECT.validate_json(frames[0])
+        assert greeting == {"authorization": f"Bearer {provider_value}", "query": "model=fixture", "client_header": ""}
+        assert frames[1] == "ping"
+
+        for refused_key, query in ((other_key, ""), (key, "?unknown=1")):
+            with pytest.raises((InvalidStatus, OSError)):
+                _ = _websocket_handshake(gateway, path, refused_key, query)
+
+        rows: Final = eventually(
+            lambda: read_rows('SELECT call_type, metadata FROM "LiteLLM_SpendLogs" WHERE api_key = %s', (key_hash,)),
+            lambda values: len(values) >= 1,
+            seconds=70,
+        )
+        metadata: Final = object_value(rows[0]["metadata"])
+        assert (metadata["provider_account_id"], metadata["user_api_key_application_id"]) == (account, application)
+        assert [form for form in _encoded(provider_value) if form in json.dumps(rows, default=str)] == []
+
+
 def _delete_ownership(account: str) -> None:
     write_rows('DELETE FROM "LiteLLM_AccountResourceOwnership" WHERE account_id = %s', (account,))
     remaining: Final = read_rows(
