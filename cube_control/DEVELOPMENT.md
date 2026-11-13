@@ -937,6 +937,6 @@ Evidence against `cubellm-native-dev:b1510df` with `--num_workers 2`, no Redis a
 | default key cache (60 s) | 5.97 s | 58.27 s | 1.75 s | 4.60 s |
 | `user_api_key_cache_ttl: 5` | 4.39 s | 2.93 s | 2.88 s | 1.68 s |
 
-Without Redis a deleted key stays usable on the other workers for up to the key cache lifetime, because each worker caches the key on its own. Route and grant changes follow the config reload interval, and a rotated credential is used once the worker reloads the credential list. Several workers without Redis therefore need a short `general_settings.user_api_key_cache_ttl` (for example 5 seconds) if a key deletion must take effect quickly; with Redis the shared cache applies instead. The single-worker production gateway is not affected
+Without Redis a deleted key stays usable on the other workers for up to the key cache lifetime, because each worker caches the key on its own. Route and grant changes follow the config reload interval, and a rotated credential is used once the worker reloads the credential list. Several workers without Redis therefore need a short `general_settings.user_api_key_cache_ttl` (for example 5 seconds) if a key deletion must take effect quickly; with Redis the shared cache applies instead. The worker count and cache settings of the production gateway were not checked here
 
 Limits: Redis itself, an actual several-host deployment and LAN or Tailscale reachability were not tested here. Open WebSocket connections are not cut by a revocation
