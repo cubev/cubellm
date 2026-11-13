@@ -20,6 +20,7 @@ from .account_credentials import (
     CredentialOAuth,
     CredentialQuery,
     CredentialSigV4,
+    CredentialTLS,
     Identifier,
     validate_account_resources,
     validate_account_route,
@@ -102,7 +103,12 @@ class AccountRouteDefinition(BaseModel):
         credential: Final = self.account_credential
         absent: Final = frozenset(
             name
-            for name, value in (("query", credential.query), ("sigv4", credential.sigv4), ("oauth", credential.oauth))
+            for name, value in (
+                ("query", credential.query),
+                ("sigv4", credential.sigv4),
+                ("oauth", credential.oauth),
+                ("mtls", credential.mtls),
+            )
             if value is None
         )
         return _OBJECT.validate_json(
@@ -122,6 +128,7 @@ class _StoredCredential(BaseModel):
     query: CredentialQuery | None = None
     sigv4: CredentialSigV4 | None = None
     oauth: CredentialOAuth | None = None
+    mtls: CredentialTLS | None = None
     allowed_query_parameters: tuple[str, ...]
 
 
@@ -133,6 +140,7 @@ class _StoredResourceCredential(BaseModel):
     query: CredentialQuery | None = None
     sigv4: CredentialSigV4 | None = None
     oauth: CredentialOAuth | None = None
+    mtls: CredentialTLS | None = None
     allowed_query_parameters: tuple[str, ...]
     resource_types: Annotated[tuple[AccountResourceType, ...], Field(min_length=1)]
 

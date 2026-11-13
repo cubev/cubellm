@@ -14,6 +14,7 @@ from typing_extensions import Self
 from litellm.models.credentials import CredentialItem
 
 from .account_resources import AccountResourceType, is_resource_template, template_segment, validate_resource_types
+from .mtls_credentials import MTLSCredentialAuth, validate_tls_material
 from .oauth_credentials import OAuthClientCredentialsAuth
 from .query_credentials import QueryCredentialAuth
 from .sigv4_credentials import SigV4CredentialAuth
@@ -73,6 +74,15 @@ class CredentialOAuth(BaseModel):
         return self
 
 
+class CredentialTLS(BaseModel):
+    """Client certificate (mTLS) presented on the provider connection; the PEM values come from the credential."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    certificate_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    private_key_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    ca_certificate_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")] | None = None
+
+
 class CredentialQuery(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     name: Annotated[str, Field(pattern=r"^[A-Za-z0-9._~-]{1,128}$")]
@@ -111,14 +121,15 @@ class AccountHeaderCredential(BaseModel):
     query: CredentialQuery | None = None
     sigv4: CredentialSigV4 | None = None
     oauth: CredentialOAuth | None = None
+    mtls: CredentialTLS | None = None
     allowed_query_parameters: tuple[Annotated[str, Field(min_length=1, max_length=128)], ...] = ()
     application_grants: Annotated[tuple[AccountApplicationGrant, ...], Field(max_length=256)] = ()
     resource_types: Annotated[tuple[AccountResourceType, ...], Field(max_length=16)] = ()
 
     @model_validator(mode="after")
     def validate_policy(self) -> Self:
-        if not self.headers and self.query is None and self.sigv4 is None and self.oauth is None:
-            raise ValueError("Account credentials need a header, query parameter, SigV4 or OAuth destination")
+        if not self.headers and self.query is None and self.sigv4 is None and self.oauth is None and self.mtls is None:
+            raise ValueError("Account credentials need a header, query parameter, SigV4, OAuth or mTLS destination")
         if self.sigv4 is not None and (self.headers or self.query is not None or self.oauth is not None):
             raise ValueError("SigV4 account credentials cannot be combined with other credential destinations")
         if self.oauth is not None and (self.headers or self.query is not None):
@@ -213,8 +224,8 @@ def credential_origin(value: str, origin_only: bool = False) -> str:
 class ResolvedAccountCredential:
     binding: AccountRouteBinding
     headers: Mapping[str, str] = field(repr=False)
-    outbound: QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | None = field(
-        default=None, repr=False
+    outbound: QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | MTLSCredentialAuth | None = (
+        field(default=None, repr=False)
     )
 
 
@@ -260,6 +271,8 @@ def validate_account_route(
         raise ValueError("Inline headers cannot shadow a named account credential")
     if policy.sigv4 is not None and any(name == "authorization" or name.startswith("x-amz-") for name in configured):
         raise ValueError("Inline headers cannot shadow a SigV4 signature")
+    if policy.mtls is not None and urlsplit(target).scheme != "https":
+        raise ValueError("Client certificate account routes need an HTTPS target")
     if policy.oauth is not None and "authorization" in configured:
         raise ValueError("Inline headers cannot shadow an OAuth access token")
     if not methods or any(re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Z-]{1,32}", method) is None for method in methods):
@@ -326,14 +339,18 @@ def resolve_account_credential(
             provider=info.cube_provider_id,
         ),
         headers=MappingProxyType({header.name: header.prefix + bare_secret(header.field) for header in policy.headers}),
-        outbound=(
-            _query_auth(policy.query, bare_secret(policy.query.field))
-            if policy.query is not None
-            else _sigv4_auth(policy.sigv4, bare_secret)
-            if policy.sigv4 is not None
-            else _oauth_auth(policy.oauth, bare_secret)
-            if policy.oauth is not None
-            else None
+        outbound=_with_tls(
+            policy.mtls,
+            values,
+            (
+                _query_auth(policy.query, bare_secret(policy.query.field))
+                if policy.query is not None
+                else _sigv4_auth(policy.sigv4, bare_secret)
+                if policy.sigv4 is not None
+                else _oauth_auth(policy.oauth, bare_secret)
+                if policy.oauth is not None
+                else None
+            ),
         ),
     )
 
@@ -360,3 +377,34 @@ def _oauth_auth(destination: CredentialOAuth, secret: Callable[[str], str]) -> O
         destination.scope,
         destination.client_authentication,
     )
+
+
+def _pem(values: Mapping[str, object], name: str) -> str:
+    raw: Final = values.get(name)
+    text: Final = raw.get_secret_value() if isinstance(raw, SecretStr) else raw
+    from litellm.secret_managers.main import get_secret_str
+
+    value: Final = get_secret_str(text) if isinstance(text, str) and text.startswith("os.environ/") else text
+    if (
+        not isinstance(value, str)
+        or not 0 < len(value) <= 64 * 1024
+        or any(not (32 <= ord(character) <= 126 or character in "\r\n") for character in value)
+    ):
+        raise ValueError("Named account credential field is unavailable or invalid")
+    return value
+
+
+def _with_tls(
+    destination: CredentialTLS | None,
+    values: Mapping[str, object],
+    outbound: QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | None,
+) -> QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | MTLSCredentialAuth | None:
+    if destination is None:
+        return outbound
+    private_key: Final = _pem(values, destination.private_key_field)
+    key: Final = validate_tls_material(
+        _pem(values, destination.certificate_field),
+        private_key,
+        _pem(values, destination.ca_certificate_field) if destination.ca_certificate_field is not None else None,
+    )
+    return MTLSCredentialAuth(key, outbound, private_key)

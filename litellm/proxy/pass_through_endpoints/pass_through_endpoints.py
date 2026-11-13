@@ -147,6 +147,7 @@ from .credential_transport import CredentialTransport
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
+from .mtls_credentials import MTLSCredentialAuth
 from .oauth_credentials import OAuthClientCredentialsAuth
 from .query_credentials import QueryCredentialAuth
 from .sigv4_credentials import SigV4CredentialAuth
@@ -1106,7 +1107,11 @@ async def pass_through_request(
     guardrails_config: dict | None = None,
     timeout: float | None = None,
     account_binding: AccountRouteBinding | None = None,
-    account_outbound: QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | None = None,
+    account_outbound: QueryCredentialAuth
+    | SigV4CredentialAuth
+    | OAuthClientCredentialsAuth
+    | MTLSCredentialAuth
+    | None = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -2026,7 +2031,9 @@ class _AccountRouteParams(BaseModel):
 
 class _RelayOptions(TypedDict, total=False):
     account_binding: ReadOnly[AccountRouteBinding]
-    account_outbound: ReadOnly[QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth]
+    account_outbound: ReadOnly[
+        QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | MTLSCredentialAuth
+    ]
 
 
 @dataclass(frozen=True, slots=True)

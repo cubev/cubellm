@@ -80,6 +80,13 @@ class OutboundCredential(Protocol):
     async def prepare(self, request: httpx.Request) -> httpx.Request: ...
 
 
+@runtime_checkable
+class TransportCredential(OutboundCredential, Protocol):
+    """A credential that needs its own connection, for example one presenting a TLS client certificate."""
+
+    def transport(self) -> httpx.AsyncBaseTransport: ...
+
+
 def marked(request: httpx.Request, credential: OutboundCredential) -> httpx.Request:
     # The client-level request keeps clean metadata, so httpx logs, response.url and exceptions never carry a
     # credential; CredentialTransport applies it only to the physical request on the way to the network.
@@ -182,8 +189,10 @@ class CredentialTransport(httpx.AsyncBaseTransport):
         credential: Final = request.extensions.get(CREDENTIAL_EXTENSION)
         if not isinstance(credential, OutboundCredential):
             return await self._inner.handle_async_request(request)
+        # A credential with its own TLS identity (mTLS) supplies the connection; every other one uses the pool.
+        target: Final = credential.transport() if isinstance(credential, TransportCredential) else self._inner
         try:
-            upstream: Final = await self._inner.handle_async_request(await credential.prepare(_unmarked(request)))
+            upstream: Final = await target.handle_async_request(await credential.prepare(_unmarked(request)))
         except httpx.RequestError as error:
             # Read after prepare(): a credential may only learn some secrets (an issued token) while preparing.
             failure: Final = _sanitized(error, credential.redaction, request)

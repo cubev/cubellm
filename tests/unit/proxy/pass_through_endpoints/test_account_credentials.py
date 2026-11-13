@@ -350,7 +350,7 @@ QUERY_POLICY: Final = AccountHeaderCredential(
 
 
 def test_query_credentials_need_a_destination_that_clients_cannot_name() -> None:
-    with pytest.raises(ValidationError, match="header, query parameter, SigV4 or OAuth destination"):
+    with pytest.raises(ValidationError, match="header, query parameter, SigV4, OAuth or mTLS destination"):
         AccountHeaderCredential(account_id="fixture-account", credential_name="fixture credential")
     with pytest.raises(ValidationError, match="also be a client query parameter"):
         AccountHeaderCredential.model_validate(QUERY_POLICY.model_dump() | {"allowed_query_parameters": ["TICKET.V2~"]})

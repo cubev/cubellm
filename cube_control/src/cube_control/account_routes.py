@@ -73,6 +73,12 @@ class AccountRouteOAuth(FrozenModel):
         return self
 
 
+class AccountRouteTLS(FrozenModel):
+    certificate_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    private_key_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    ca_certificate_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")] | None = None
+
+
 class AccountRouteQuery(FrozenModel):
     name: Annotated[str, Field(pattern=r"^[A-Za-z0-9._~-]{1,128}$")]
     field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
@@ -123,6 +129,7 @@ class AccountRouteSpec(FrozenModel):
     query: AccountRouteQuery | None = None
     sigv4: AccountRouteSigV4 | None = None
     oauth: AccountRouteOAuth | None = None
+    mtls: AccountRouteTLS | None = None
     allowed_query_parameters: Annotated[tuple[str, ...], Field(max_length=32)] = ()
     target: Annotated[str, Field(min_length=1, max_length=2048)]
     path: AccountPath
@@ -134,8 +141,12 @@ class AccountRouteSpec(FrozenModel):
     def validate_route(self) -> Self:
         require_admin_origin(self.gateway_origin)
         require_managed_path(self.path)
-        if not self.headers and self.query is None and self.sigv4 is None and self.oauth is None:
-            raise ValueError("Account routes need a credential header, query parameter, SigV4 signature or OAuth grant")
+        if not self.headers and self.query is None and self.sigv4 is None and self.oauth is None and self.mtls is None:
+            raise ValueError(
+                "Account routes need a credential header, query parameter, SigV4 signature, OAuth grant or client certificate"
+            )
+        if self.mtls is not None and not self.target.startswith("https://"):
+            raise ValueError("Client certificate account routes need an HTTPS target")
         if self.sigv4 is not None and (self.headers or self.query is not None or self.oauth is not None):
             raise ValueError("SigV4 account routes cannot add other credential destinations")
         if self.oauth is not None and (self.headers or self.query is not None):
@@ -177,6 +188,7 @@ class AccountRouteSpec(FrozenModel):
                     **({"query": self.query.model_dump(mode="json")} if self.query is not None else {}),
                     **({"sigv4": self.sigv4.model_dump(mode="json")} if self.sigv4 is not None else {}),
                     **({"oauth": self.oauth.model_dump(mode="json")} if self.oauth is not None else {}),
+                    **({"mtls": self.mtls.model_dump(mode="json")} if self.mtls is not None else {}),
                     "allowed_query_parameters": list(self.allowed_query_parameters),
                     **(
                         {
@@ -216,6 +228,10 @@ class _OAuthCredentialCapabilities(_RouteCapabilities):
     passthrough_account_oauth_credential: Literal["oauth_client_credentials_v1"]
 
 
+class _TLSCredentialCapabilities(_RouteCapabilities):
+    passthrough_account_mtls_credential: Literal["client_certificate_v1"]
+
+
 class _RouteReceipt(BaseModel):
     stored: Literal[True]
     created: bool
@@ -253,6 +269,11 @@ def _ensure(client: httpx.Client, spec: AccountRouteSpec) -> AccountRouteResult:
             _ = _OAuthCredentialCapabilities.model_validate_json(caps_raw)
         except ValidationError:
             return result("error", "Gateway does not support OAuth client credentials; nothing stored")
+    if spec.mtls is not None:
+        try:
+            _ = _TLSCredentialCapabilities.model_validate_json(caps_raw)
+        except ValidationError:
+            return result("error", "Gateway does not support client certificates; nothing stored")
     if spec.resource_types:
         AccountResourceCapabilities.model_validate_json(caps_raw)
     code, raw = request_gateway(client, "POST", "/cube_control/account_routes", spec.command())

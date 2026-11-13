@@ -985,6 +985,41 @@ mTLS client authentication, refresh tokens, audience or resource parameters and 
 revocation are not supported. Several gateway workers each fetch their own token.
 Gateway-reported costs stay `unverified`
 
+## Client certificate (mTLS) account routes
+
+An account route can present a TLS client certificate from its named credential on the
+provider connection. It can stand alone or be combined with a header, query, SigV4 or
+OAuth destination of the same route:
+
+```json
+{
+  "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+  "mtls": {
+    "certificate_field": "client_certificate",
+    "private_key_field": "client_key",
+    "ca_certificate_field": "provider_ca"
+  },
+  "allowed_query_parameters": []
+}
+```
+
+The fields name PEM values of the named credential (certificate chain, unencrypted
+private key and an optional provider CA). The field names are part of the stored route
+and its fingerprint, the target must use HTTPS, and the gateway announces the feature
+with `passthrough_account_mtls_credential: client_certificate_v1`; the controller only
+sends such a route to a gateway that does. When a provider CA is given it replaces the
+system trust store for that connection instead of widening it. The gateway builds one
+TLS context per certificate, key and CA, writes the material only to a private
+temporary file while loading it, and keeps one connection pool per client certificate
+(at most 64), without environment proxies. Invalid or mismatching material fails the
+request with a fixed message and no chained exception. Responses and errors are cleaned
+of the combined destination's secrets as before; the private key itself never leaves the
+gateway
+
+Limits: encrypted private keys, PKCS#12 bundles, certificate revocation checks and
+proxies for mTLS connections are not supported. A rotated certificate is used from the
+next request; pools of replaced certificates are dropped only by the size limit
+
 ## Account resource ownership
 
 Some provider APIs create resources such as media jobs or files and then address

@@ -23,6 +23,7 @@ from cube_control.account_routes import (
     AccountRouteResult,
     AccountRouteSigV4,
     AccountRouteSpec,
+    AccountRouteTLS,
     adopt_account_resource,
     ensure_account_route,
 )
@@ -229,6 +230,35 @@ class AccountRouteTests(unittest.TestCase):
         ):
             with self.subTest(changes=changes), self.assertRaises(ValidationError):
                 AccountRouteSpec.model_validate(spec.model_dump() | changes)
+
+    def test_client_certificate_routes_need_https_and_a_gateway_that_announces_them(self) -> None:
+        tls: Final = AccountRouteTLS(
+            certificate_field="client_certificate", private_key_field="client_key", ca_certificate_field="provider_ca"
+        )
+        spec: Final = SPEC.model_copy(update={"mtls": tls})
+        unsupported: Final = RouteGateway()
+        self.assertEqual((ensure(unsupported, spec).status, unsupported.bodies), ("error", []))
+        gateway: Final = RouteGateway()
+        gateway.capabilities["passthrough_account_mtls_credential"] = "client_certificate_v1"
+        self.assertEqual(ensure(gateway, spec).status, "created")
+        route: Final = gateway.bodies[0]["route"]
+        credential: Final = route["account_credential"] if isinstance(route, dict) else None
+        self.assertEqual(
+            credential["mtls"] if isinstance(credential, dict) else None,
+            {
+                "certificate_field": "client_certificate",
+                "private_key_field": "client_key",
+                "ca_certificate_field": "provider_ca",
+            },
+        )
+        for changes in (
+            {"target": "http://127.0.0.1:9/v1"},
+            {"mtls": tls.model_dump() | {"private_key_field": "bad\nname"}},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                AccountRouteSpec.model_validate(spec.model_dump() | changes)
+        alone: Final = AccountRouteSpec.model_validate(spec.model_dump() | {"headers": ()})
+        self.assertEqual(alone.headers, ())
 
     def test_existing_identical_route_is_reported_as_existing(self) -> None:
         gateway: Final = RouteGateway()
