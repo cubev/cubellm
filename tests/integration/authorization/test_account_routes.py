@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import socket
@@ -405,6 +406,147 @@ def test_sigv4_route_signs_only_for_the_granted_application_and_keeps_every_cred
         assert [
             form for secret in secrets for form in _encoded(secret) if form in stored
         ] == []  # comprehension-ok: every encoding of each credential part
+
+
+def test_oauth_route_fetches_one_token_for_the_granted_application_and_keeps_secret_and_token_private(
+    gateway: Gateway,
+) -> None:
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-account-{marker}"
+    client_id: Final = f"integration client {marker[:8]}"
+    client_secret: Final = f"synthetic/{marker}+secret="
+    token: Final = f"issued-{marker}.token~"
+    path: Final = f"/cube_api/integration-{marker}/quota"
+    route_id: Final = f"integration-oauth-route-{marker}"
+    application: Final = f"integration-app-{marker}"
+    handle: Final = register_scenario(
+        marker,
+        RoutedResponse(
+            content_type="application/x-routed",
+            routes={
+                "POST /oauth/token": JsonResponse(
+                    content_type="application/json",
+                    body={"access_token": token, "token_type": "Bearer", "expires_in": 3600},
+                ),
+                "POST /v1/quota": JsonResponse(
+                    content_type="application/json",
+                    body={"quota": 42, "echo": f"token {token} and secret {client_secret} rejected"},
+                ),
+            },
+        ),
+    )
+    with gateway.scenario() as scenario:
+        scenario.cleanups.callback(delete_scenario, handle)
+        credential: Final = f"integration-oauth-{marker}"
+        gateway.post(
+            "/credentials",
+            {
+                "credential_name": credential,
+                "credential_values": {"client_id": client_id, "client_secret": client_secret},
+                "credential_info": {"cube_account_id": account, "cube_allowed_origins": [gateway.upstream_url]},
+            },
+        )
+        scenario.cleanups.callback(_delete_credential, gateway, credential)
+        oauth: Final[dict[str, JsonValue]] = {
+            "token_url": f"{handle.api_base()}/oauth/token",
+            "client_id_field": "client_id",
+            "client_secret_field": "client_secret",
+            "scope": "quota.read",
+        }
+        definition: Final[dict[str, JsonValue]] = {
+            "id": route_id,
+            "path": path,
+            "target": f"{handle.api_base()}/v1/quota",
+            "methods": ["POST"],
+            "account_credential": {
+                "account_id": account,
+                "credential_name": credential,
+                "oauth": oauth,
+                "allowed_query_parameters": ["page"],
+            },
+        }
+        capabilities: Final = gateway.get("/cube_control/capabilities")
+        assert capabilities["passthrough_account_oauth_credential"] == "oauth_client_credentials_v1"
+        created: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+        scenario.cleanups.callback(_delete_route, gateway, route_id)
+        route: Final = object_value(created["route"])
+        repeated: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+        assert (created["created"], repeated["created"]) == (True, False)
+        assert object_value(repeated["route"])["fingerprint"] == route["fingerprint"]
+        rescoped: Final = {
+            **definition,
+            "account_credential": {
+                **object_value(definition["account_credential"]),
+                "oauth": {**oauth, "scope": "quota.write"},
+            },
+        }
+        assert gateway.request("POST", "/cube_control/account_routes", {"route": rescoped}).status_code == 409
+
+        key, key_hash = _application_key(scenario, application, [path])
+        other_key, _ = _application_key(scenario, f"integration-other-{marker}", [path])
+        _grant(
+            gateway,
+            route_id,
+            string_value(route["fingerprint"]),
+            {
+                "application_id": application,
+                "key_hash": key_hash,
+                "account_id": account,
+                "path": path,
+                "methods": ["POST"],
+            },
+        )
+        _observed(gateway)
+        served: Final = eventually(
+            lambda: gateway.request(
+                "POST", path, {"marker": marker}, key=key, params={"page": "7"}, headers={"Authorization-Hint": "x"}
+            ),
+            lambda response: response.status_code != 404,
+            seconds=60,
+        )
+        assert (served.status_code, served.json()) == (
+            200,
+            {"quota": 42, "echo": "token [redacted] and secret [redacted] rejected"},
+        ), served.text
+        again: Final = gateway.request("POST", path, {"marker": marker}, key=key, params={"page": "8"})
+        assert again.status_code == 200, again.text
+        observed: Final = [object_value(value) for value in _observed(gateway)]
+        token_requests: Final = [value for value in observed if string_value(value["path"]).endswith("/oauth/token")]
+        provider_requests: Final = [value for value in observed if string_value(value["path"]).endswith("/v1/quota")]
+        assert len(token_requests) == 1, observed
+        assert object_value(token_requests[0]["body"]) == {"grant_type": "client_credentials", "scope": "quota.read"}
+        basic: Final = string_value(token_requests[0]["authorization"]).removeprefix("Basic ")
+        assert base64.b64decode(basic).decode() == f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}"
+        assert [string_value(value["authorization"]) for value in provider_requests] == [f"Bearer {token}"] * 2
+        assert [(value["query"], value["body"]) for value in provider_requests] == [
+            ("page=7", {"marker": marker}),
+            ("page=8", {"marker": marker}),
+        ]
+
+        assert gateway.request("POST", path, {"marker": marker}, key=other_key, params={"page": "7"}).status_code == 403
+        assert gateway.request("POST", path, {"marker": marker}, key=key, params={"other": "x"}).status_code == 400
+        assert _observed(gateway) == []
+
+        rows: Final = eventually(
+            lambda: read_rows(
+                'SELECT call_type, api_base, metadata, response FROM "LiteLLM_SpendLogs" WHERE api_key = %s',
+                (key_hash,),
+            ),
+            lambda values: len(values) == 2,
+            seconds=70,
+        )
+        metadata: Final = object_value(rows[0]["metadata"])
+        assert (
+            rows[0]["call_type"],
+            metadata["provider_account_id"],
+            metadata["user_api_key_application_id"],
+            metadata["provider_account_source"],
+            metadata["provider_cost_status"],
+        ) == ("pass_through_endpoint", account, application, "configured_credential", "unverified")
+        stored: Final = json.dumps(rows, default=str)
+        assert [
+            form for secret in (client_secret, token) for form in _encoded(secret) if form in stored
+        ] == []  # comprehension-ok: every encoding of the client secret and the issued token
 
 
 def _delete_ownership(account: str) -> None:

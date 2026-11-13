@@ -17,6 +17,7 @@ from typing_extensions import Self
 from .account_credentials import (
     AccountHeaderCredential,
     CredentialHeader,
+    CredentialOAuth,
     CredentialQuery,
     CredentialSigV4,
     Identifier,
@@ -100,7 +101,9 @@ class AccountRouteDefinition(BaseModel):
         )
         credential: Final = self.account_credential
         absent: Final = frozenset(
-            name for name, value in (("query", credential.query), ("sigv4", credential.sigv4)) if value is None
+            name
+            for name, value in (("query", credential.query), ("sigv4", credential.sigv4), ("oauth", credential.oauth))
+            if value is None
         )
         return _OBJECT.validate_json(
             route.model_dump_json(
@@ -118,6 +121,7 @@ class _StoredCredential(BaseModel):
     headers: tuple[CredentialHeader, ...]
     query: CredentialQuery | None = None
     sigv4: CredentialSigV4 | None = None
+    oauth: CredentialOAuth | None = None
     allowed_query_parameters: tuple[str, ...]
 
 
@@ -128,6 +132,7 @@ class _StoredResourceCredential(BaseModel):
     headers: tuple[CredentialHeader, ...]
     query: CredentialQuery | None = None
     sigv4: CredentialSigV4 | None = None
+    oauth: CredentialOAuth | None = None
     allowed_query_parameters: tuple[str, ...]
     resource_types: Annotated[tuple[AccountResourceType, ...], Field(min_length=1)]
 

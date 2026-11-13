@@ -10,6 +10,7 @@ from litellm.proxy.pass_through_endpoints.account_credentials import (
     AccountApplicationGrant,
     AccountHeaderCredential,
     CredentialHeader,
+    CredentialOAuth,
     CredentialQuery,
     CredentialSigV4,
     account_application_allowed,
@@ -18,6 +19,7 @@ from litellm.proxy.pass_through_endpoints.account_credentials import (
     validate_account_request,
     validate_account_route,
 )
+from litellm.proxy.pass_through_endpoints.oauth_credentials import OAuthClientCredentialsAuth
 from litellm.proxy.pass_through_endpoints.query_credentials import QueryCredentialAuth
 from litellm.proxy.pass_through_endpoints.sigv4_credentials import SigV4CredentialAuth
 from litellm.proxy.spend_tracking.spend_tracking_utils import (
@@ -348,7 +350,7 @@ QUERY_POLICY: Final = AccountHeaderCredential(
 
 
 def test_query_credentials_need_a_destination_that_clients_cannot_name() -> None:
-    with pytest.raises(ValidationError, match="header, query parameter or SigV4 destination"):
+    with pytest.raises(ValidationError, match="header, query parameter, SigV4 or OAuth destination"):
         AccountHeaderCredential(account_id="fixture-account", credential_name="fixture credential")
     with pytest.raises(ValidationError, match="also be a client query parameter"):
         AccountHeaderCredential.model_validate(QUERY_POLICY.model_dump() | {"allowed_query_parameters": ["TICKET.V2~"]})
@@ -429,4 +431,82 @@ def test_sigv4_credentials_resolve_from_the_named_vault_entry_without_exposing_t
     with pytest.raises(ValueError, match="unavailable or invalid"):
         resolve_account_credential(
             SIGV4_POLICY, sigv4_credential(**{"access key": "AKIDFIXTURE"}), "https://vendor.example/v1"
+        )
+
+
+OAUTH: Final = CredentialOAuth(
+    token_url="https://login.vendor.example/oauth/token",
+    client_id_field="client id",
+    client_secret_field="client secret",
+    scope="items.read items.write",
+)
+OAUTH_POLICY: Final = AccountHeaderCredential(
+    account_id="fixture-account", credential_name="fixture credential", oauth=OAUTH, allowed_query_parameters=("page",)
+)
+
+
+def oauth_credential(
+    origins: tuple[str, ...] = ("https://vendor.example", "https://login.vendor.example"), **values: str
+) -> CredentialItem:
+    return CredentialItem(
+        credential_name=POLICY.credential_name,
+        credential_values=values or {"client id": "fixture-client", "client secret": "fixture/secret+"},
+        credential_info={"cube_account_id": "fixture-account", "cube_allowed_origins": list(origins)},
+    )
+
+
+def test_oauth_is_the_only_credential_destination_of_its_route() -> None:
+    for changes in (
+        {"headers": [{"name": "X-Api-Key", "field": "client id"}]},
+        {"query": {"name": "key", "field": "client id"}},
+        {"sigv4": SIGV4.model_dump()},
+    ):
+        with pytest.raises(ValidationError, match="cannot be combined"):
+            AccountHeaderCredential.model_validate(OAUTH_POLICY.model_dump() | changes)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"token_url": "http://login.vendor.example/token"},
+        {"token_url": "https://user:pass@login.vendor.example/token"},
+        {"token_url": "https://login.vendor.example/token?client_secret=x"},
+        {"token_url": "https://login.vendor.example/token#x"},
+        {"token_url": "ftp://login.vendor.example/token"},
+        {"scope": "items read"[:0]},
+        {"scope": 'bad"scope'},
+        {"scope": "double  space"},
+        {"client_authentication": "private_key_jwt"},
+        {"unknown": "field"},
+    ),
+)
+def test_oauth_endpoint_and_scope_are_validated_before_storage(changes: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        CredentialOAuth.model_validate(OAUTH.model_dump() | changes)
+
+
+def test_loopback_http_token_endpoints_stay_possible_for_local_acceptance() -> None:
+    assert CredentialOAuth.model_validate(OAUTH.model_dump() | {"token_url": "http://127.0.0.1:9/token"})
+
+
+def test_inline_headers_cannot_shadow_the_access_token() -> None:
+    with pytest.raises(ValueError, match="OAuth access token"):
+        validate_account_route(
+            "https://vendor.example/v1", True, False, {"Authorization": "forged"}, None, OAUTH_POLICY, ("GET",)
+        )
+    validate_account_route("https://vendor.example/v1", True, False, {"X-Trace": "1"}, None, OAUTH_POLICY, ("GET",))
+
+
+def test_oauth_credentials_resolve_privately_and_only_for_an_allowed_token_origin() -> None:
+    resolved: Final = resolve_account_credential(OAUTH_POLICY, oauth_credential(), "https://vendor.example/v1")
+    assert resolved.headers == {} and isinstance(resolved.outbound, OAuthClientCredentialsAuth)
+    assert repr(resolved.outbound) == "OAuthClientCredentialsAuth(<redacted>)"
+    assert resolved.outbound.redact("fixture%2Fsecret%2B and fixture/secret+") == "[redacted] and [redacted]"
+    with pytest.raises(ValueError, match="token endpoint is not an allowed origin"):
+        resolve_account_credential(
+            OAUTH_POLICY, oauth_credential(("https://vendor.example",)), "https://vendor.example/v1"
+        )
+    with pytest.raises(ValueError, match="unavailable or invalid"):
+        resolve_account_credential(
+            OAUTH_POLICY, oauth_credential(**{"client id": "fixture-client"}), "https://vendor.example/v1"
         )

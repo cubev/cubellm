@@ -18,6 +18,7 @@ from cube_control.account_routes import (
     AccountResourceCreation,
     AccountResourceType,
     AccountRouteHeader,
+    AccountRouteOAuth,
     AccountRouteQuery,
     AccountRouteResult,
     AccountRouteSigV4,
@@ -182,6 +183,49 @@ class AccountRouteTests(unittest.TestCase):
             {"headers": [{"name": "X-Api-Key", "field": "api_key"}]},
             {"query": {"name": "key", "field": "api_key"}},
             {"sigv4": sigv4.model_dump() | {"region": "Frankfurt"}},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                AccountRouteSpec.model_validate(spec.model_dump() | changes)
+
+    def test_oauth_routes_are_sent_only_to_gateways_that_announce_client_credentials(self) -> None:
+        oauth: Final = AccountRouteOAuth(
+            token_url="https://login.vendor.example/oauth/token",
+            client_id_field="client_id",
+            client_secret_field="client_secret",
+            scope="items.read items.write",
+        )
+        spec: Final = SPEC.model_copy(update={"headers": (), "oauth": oauth})
+        unsupported: Final = RouteGateway()
+        unsupported.capabilities["passthrough_account_sigv4_credential"] = "aws_sigv4_v1"
+        self.assertEqual((ensure(unsupported, spec).status, unsupported.bodies), ("error", []))
+        gateway: Final = RouteGateway()
+        gateway.capabilities["passthrough_account_oauth_credential"] = "oauth_client_credentials_v1"
+        self.assertEqual(ensure(gateway, spec).status, "created")
+        route: Final = gateway.bodies[0]["route"]
+        self.assertEqual(
+            route["account_credential"] if isinstance(route, dict) else None,
+            {
+                "account_id": "fixture-account",
+                "credential_name": "fixture-credential",
+                "headers": [],
+                "oauth": {
+                    "token_url": "https://login.vendor.example/oauth/token",
+                    "client_id_field": "client_id",
+                    "client_secret_field": "client_secret",
+                    "scope": "items.read items.write",
+                    "client_authentication": "client_secret_basic",
+                },
+                "allowed_query_parameters": [],
+            },
+        )
+        for changes in (
+            {"headers": [{"name": "X-Api-Key", "field": "api_key"}]},
+            {"query": {"name": "key", "field": "api_key"}},
+            {"sigv4": {"region": "eu-central-1", "service": "s3", "access_key_field": "a", "secret_key_field": "b"}},
+            {"oauth": oauth.model_dump() | {"token_url": "https://login.vendor.example/token?secret=1"}},
+            {"oauth": oauth.model_dump() | {"token_url": "https://user:pw@login.vendor.example/token"}},
+            {"oauth": oauth.model_dump() | {"scope": "two  spaces"}},
+            {"oauth": oauth.model_dump() | {"client_authentication": "private_key_jwt"}},
         ):
             with self.subTest(changes=changes), self.assertRaises(ValidationError):
                 AccountRouteSpec.model_validate(spec.model_dump() | changes)

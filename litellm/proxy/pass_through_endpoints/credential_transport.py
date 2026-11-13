@@ -74,7 +74,8 @@ class Redaction:
 
 @runtime_checkable
 class OutboundCredential(Protocol):
-    redaction: Redaction
+    @property
+    def redaction(self) -> Redaction: ...
 
     async def prepare(self, request: httpx.Request) -> httpx.Request: ...
 
@@ -181,13 +182,16 @@ class CredentialTransport(httpx.AsyncBaseTransport):
         credential: Final = request.extensions.get(CREDENTIAL_EXTENSION)
         if not isinstance(credential, OutboundCredential):
             return await self._inner.handle_async_request(request)
-        redaction: Final = credential.redaction
         try:
             upstream: Final = await self._inner.handle_async_request(await credential.prepare(_unmarked(request)))
         except httpx.RequestError as error:
-            failure: Final = _sanitized(error, redaction, request)
+            # Read after prepare(): a credential may only learn some secrets (an issued token) while preparing.
+            failure: Final = _sanitized(error, credential.redaction, request)
         else:
-            return await self._redacted(upstream, redaction, request)
+            rejected: Final = getattr(credential, "rejected", None)
+            if upstream.status_code == 401 and callable(rejected):
+                _ = rejected()
+            return await self._redacted(upstream, credential.redaction, request)
         # Raised outside the handler so no chained exception or frame keeps the outbound request.
         raise failure
 

@@ -936,6 +936,55 @@ that echoes a credential in a form not listed above is not covered. Gateway-repo
 costs stay `unverified`
 
 
+## OAuth client credential account routes
+
+An account route can authenticate with an OAuth 2.0 access token that the gateway
+obtains itself with the client credentials grant (RFC 6749 section 4.4). The token is
+the route's only credential destination:
+
+```json
+{
+  "headers": [],
+  "oauth": {
+    "token_url": "https://login.vendor.example/oauth/token",
+    "client_id_field": "client_id",
+    "client_secret_field": "client_secret",
+    "scope": "items.read items.write",
+    "client_authentication": "client_secret_basic"
+  },
+  "allowed_query_parameters": ["page"]
+}
+```
+
+The two fields name values of the route's named credential. `client_authentication` is
+`client_secret_basic` (default, HTTP Basic with form-encoded parts) or
+`client_secret_post` (client ID and secret in the form body). Token endpoint, scope,
+field names and client authentication are part of the stored route and its
+fingerprint. The token endpoint must use HTTPS (plain HTTP only on literal loopback),
+cannot carry user information, a query or a fragment, and its origin must be one of the
+named credential's allowed origins, so a route can never send the client secret to a
+host the credential is not approved for. The gateway announces this with
+`passthrough_account_oauth_credential: oauth_client_credentials_v1`, and the controller
+only sends an OAuth route to a gateway that does. Inline route headers may not set
+`Authorization`, and the transport replaces any `Authorization` header with
+`Bearer <token>`
+
+Tokens are fetched without redirects, proxies from the environment or retries, with a
+10 second timeout and at most 64 KiB of response. Only HTTP 200 JSON with a printable
+`access_token`, `token_type` `bearer` and a positive integer `expires_in` (default 300
+seconds when absent, capped at one day) is accepted; anything else fails the request
+without echoing the endpoint's answer. Tokens are cached per process, keyed by endpoint,
+client ID, client secret, scope and client authentication, refreshed 60 seconds before
+they expire (or at half their lifetime when shorter), fetched once for concurrent
+requests, and dropped when the provider answers 401. Responses, streams, errors and logs
+are cleaned of the client secret and the current access token in the same encodings as
+query credentials
+
+Limits: only the client credentials grant with a client secret. Private key JWT and
+mTLS client authentication, refresh tokens, audience or resource parameters and token
+revocation are not supported. Several gateway workers each fetch their own token.
+Gateway-reported costs stay `unverified`
+
 ## Account resource ownership
 
 Some provider APIs create resources such as media jobs or files and then address

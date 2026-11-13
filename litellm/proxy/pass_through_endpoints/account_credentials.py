@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from ipaddress import ip_address
 from itertools import chain
 from types import MappingProxyType
-from typing import Annotated, Final
+from typing import Annotated, Final, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -14,6 +14,7 @@ from typing_extensions import Self
 from litellm.models.credentials import CredentialItem
 
 from .account_resources import AccountResourceType, is_resource_template, template_segment, validate_resource_types
+from .oauth_credentials import OAuthClientCredentialsAuth
 from .query_credentials import QueryCredentialAuth
 from .sigv4_credentials import SigV4CredentialAuth
 
@@ -53,6 +54,25 @@ class CredentialSigV4(BaseModel):
     session_token_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")] | None = None
 
 
+class CredentialOAuth(BaseModel):
+    """OAuth 2.0 client credentials grant; the token endpoint must be an allowed origin of the credential."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    token_url: Annotated[str, Field(min_length=1, max_length=2048)]
+    client_id_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    client_secret_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    scope: (
+        Annotated[str, Field(pattern=r"^[\x21\x23-\x5b\x5d-\x7e]+( [\x21\x23-\x5b\x5d-\x7e]+)*$", max_length=1024)]
+        | None
+    ) = None
+    client_authentication: Literal["client_secret_basic", "client_secret_post"] = "client_secret_basic"
+
+    @model_validator(mode="after")
+    def validate_endpoint(self) -> Self:
+        _validate_account_target(self.token_url)
+        return self
+
+
 class CredentialQuery(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     name: Annotated[str, Field(pattern=r"^[A-Za-z0-9._~-]{1,128}$")]
@@ -90,16 +110,19 @@ class AccountHeaderCredential(BaseModel):
     headers: Annotated[tuple[CredentialHeader, ...], Field(max_length=8)] = ()
     query: CredentialQuery | None = None
     sigv4: CredentialSigV4 | None = None
+    oauth: CredentialOAuth | None = None
     allowed_query_parameters: tuple[Annotated[str, Field(min_length=1, max_length=128)], ...] = ()
     application_grants: Annotated[tuple[AccountApplicationGrant, ...], Field(max_length=256)] = ()
     resource_types: Annotated[tuple[AccountResourceType, ...], Field(max_length=16)] = ()
 
     @model_validator(mode="after")
     def validate_policy(self) -> Self:
-        if not self.headers and self.query is None and self.sigv4 is None:
-            raise ValueError("Account credentials need a header, query parameter or SigV4 destination")
-        if self.sigv4 is not None and (self.headers or self.query is not None):
+        if not self.headers and self.query is None and self.sigv4 is None and self.oauth is None:
+            raise ValueError("Account credentials need a header, query parameter, SigV4 or OAuth destination")
+        if self.sigv4 is not None and (self.headers or self.query is not None or self.oauth is not None):
             raise ValueError("SigV4 account credentials cannot be combined with other credential destinations")
+        if self.oauth is not None and (self.headers or self.query is not None):
+            raise ValueError("OAuth account credentials cannot be combined with other credential destinations")
         if self.query is not None and any(
             name.casefold() == self.query.name.casefold() for name in self.allowed_query_parameters
         ):
@@ -190,7 +213,9 @@ def credential_origin(value: str, origin_only: bool = False) -> str:
 class ResolvedAccountCredential:
     binding: AccountRouteBinding
     headers: Mapping[str, str] = field(repr=False)
-    outbound: QueryCredentialAuth | SigV4CredentialAuth | None = field(default=None, repr=False)
+    outbound: QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | None = field(
+        default=None, repr=False
+    )
 
 
 def _validate_account_target(target: str) -> None:
@@ -235,6 +260,8 @@ def validate_account_route(
         raise ValueError("Inline headers cannot shadow a named account credential")
     if policy.sigv4 is not None and any(name == "authorization" or name.startswith("x-amz-") for name in configured):
         raise ValueError("Inline headers cannot shadow a SigV4 signature")
+    if policy.oauth is not None and "authorization" in configured:
+        raise ValueError("Inline headers cannot shadow an OAuth access token")
     if not methods or any(re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Z-]{1,32}", method) is None for method in methods):
         raise ValueError("Account credential routes require explicit HTTP methods")
 
@@ -272,6 +299,9 @@ def resolve_account_credential(
     origin: Final = credential_origin(target)
     if origin not in tuple(credential_origin(value, origin_only=True) for value in info.cube_allowed_origins):
         raise ValueError("Named account credential is not allowed for this origin")
+    allowed_origins: Final = tuple(credential_origin(value, origin_only=True) for value in info.cube_allowed_origins)
+    if policy.oauth is not None and credential_origin(policy.oauth.token_url) not in allowed_origins:
+        raise ValueError("OAuth token endpoint is not an allowed origin of the named credential")
     values: Final = MappingProxyType(payload.credential_values)
 
     def bare_secret(name: str) -> str:
@@ -301,6 +331,8 @@ def resolve_account_credential(
             if policy.query is not None
             else _sigv4_auth(policy.sigv4, bare_secret)
             if policy.sigv4 is not None
+            else _oauth_auth(policy.oauth, bare_secret)
+            if policy.oauth is not None
             else None
         ),
     )
@@ -317,4 +349,14 @@ def _sigv4_auth(destination: CredentialSigV4, secret: Callable[[str], str]) -> S
         secret(destination.access_key_field),
         secret(destination.secret_key_field),
         secret(destination.session_token_field) if destination.session_token_field is not None else None,
+    )
+
+
+def _oauth_auth(destination: CredentialOAuth, secret: Callable[[str], str]) -> OAuthClientCredentialsAuth:
+    return OAuthClientCredentialsAuth(
+        destination.token_url,
+        secret(destination.client_id_field),
+        secret(destination.client_secret_field),
+        destination.scope,
+        destination.client_authentication,
     )

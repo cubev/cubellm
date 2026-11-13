@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from queue import SimpleQueue
 from typing import Final, cast
+from urllib.parse import parse_qsl
 
 import httpx
 import uvicorn
@@ -262,6 +263,12 @@ class Provider:
         response: Final = self.scenario_store.get(scenario_id)
         if response is None:
             return JSONResponse({"error": "Unknown scenario"}, status_code=404)
+        if request.method == "POST" and request.headers.get("content-type", "") == "application/x-www-form-urlencoded":
+            # Token requests (OAuth client credentials) are recorded with their form fields and Basic authorization.
+            form: Final = dict(parse_qsl((await request.body()).decode(), keep_blank_values=True))
+            self.observations.put(
+                Observation(request.url.path, request.headers.get("authorization", ""), dict(form), request.url.query)
+            )
         if request.method == "POST" and "json" in request.headers.get("content-type", ""):
             raw_body: Final = await request.body()
             if raw_body:
