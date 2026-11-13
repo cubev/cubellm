@@ -549,6 +549,173 @@ def test_oauth_route_fetches_one_token_for_the_granted_application_and_keeps_sec
         ] == []  # comprehension-ok: every encoding of the client secret and the issued token
 
 
+def _tls_material(gateway: Gateway) -> dict[str, JsonValue]:
+    with httpx.Client(base_url=gateway.upstream_url, timeout=15, trust_env=False) as upstream:
+        response: Final = upstream.get("/__tls")
+        response.raise_for_status()
+        return JSON_OBJECT.validate_json(response.content)
+
+
+def test_client_certificate_route_presents_the_account_certificate_only_for_the_granted_application(
+    gateway: Gateway,
+) -> None:
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-account-{marker}"
+    material: Final = _tls_material(gateway)
+    origin: Final = f"https://127.0.0.1:{material['port']}"
+    query_key: Final = f"synthetic-query-{marker}"
+    path: Final = f"/cube_api/integration-{marker}/status"
+    route_id: Final = f"integration-mtls-route-{marker}"
+    application: Final = f"integration-app-{marker}"
+    with gateway.scenario() as scenario:
+
+        def stored_credential(name: str, certificate: str, key: str) -> None:
+            gateway.post(
+                "/credentials",
+                {
+                    "credential_name": name,
+                    "credential_values": {
+                        "client_certificate": certificate,
+                        "client_key": key,
+                        "provider_ca": string_value(material["provider_ca"]),
+                        "api_key": query_key,
+                    },
+                    "credential_info": {"cube_account_id": account, "cube_allowed_origins": [origin]},
+                },
+            )
+            scenario.cleanups.callback(_delete_credential, gateway, name)
+
+        credential: Final = f"integration-mtls-{marker}"
+        stored_credential(
+            credential, string_value(material["client_certificate"]), string_value(material["client_key"])
+        )
+        mtls: Final[dict[str, JsonValue]] = {
+            "certificate_field": "client_certificate",
+            "private_key_field": "client_key",
+            "ca_certificate_field": "provider_ca",
+        }
+        definition: Final[dict[str, JsonValue]] = {
+            "id": route_id,
+            "path": path,
+            "target": f"{origin}/v1/status",
+            "methods": ["POST"],
+            "account_credential": {
+                "account_id": account,
+                "credential_name": credential,
+                "query": {"name": "key", "field": "api_key"},
+                "mtls": mtls,
+                "allowed_query_parameters": ["page"],
+            },
+        }
+        capabilities: Final = gateway.get("/cube_control/capabilities")
+        assert capabilities["passthrough_account_mtls_credential"] == "client_certificate_v1"
+        insecure: Final = {**definition, "target": f"http://127.0.0.1:{material['port']}/v1/status"}
+        # The credential only allows the HTTPS origin, so a plain HTTP target is refused before anything is stored
+        # (the HTTPS rule for client certificate routes itself is covered by the unit tests).
+        assert gateway.request("POST", "/cube_control/account_routes", {"route": insecure}).status_code == 422
+        assert gateway.request("GET", f"/cube_control/account_routes/{route_id}").status_code == 404
+        created: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+        scenario.cleanups.callback(_delete_route, gateway, route_id)
+        route: Final = object_value(created["route"])
+        repeated: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+        assert (created["created"], repeated["created"]) == (True, False)
+        assert object_value(repeated["route"])["fingerprint"] == route["fingerprint"]
+        without_ca: Final = {
+            **definition,
+            "account_credential": {
+                **object_value(definition["account_credential"]),
+                "mtls": {key: value for key, value in mtls.items() if key != "ca_certificate_field"},
+            },
+        }
+        assert gateway.request("POST", "/cube_control/account_routes", {"route": without_ca}).status_code == 409
+
+        key, key_hash = _application_key(scenario, application, [path])
+        other_key, _ = _application_key(scenario, f"integration-other-{marker}", [path])
+        _grant(
+            gateway,
+            route_id,
+            string_value(route["fingerprint"]),
+            {
+                "application_id": application,
+                "key_hash": key_hash,
+                "account_id": account,
+                "path": path,
+                "methods": ["POST"],
+            },
+        )
+        served: Final = eventually(
+            lambda: gateway.request("POST", path, {"marker": marker}, key=key, params={"page": "7"}),
+            lambda response: response.status_code != 404,
+            seconds=60,
+        )
+        assert served.status_code == 200, served.text
+        assert served.json() == {
+            "client": "integration-account-client",
+            "authorization": "",
+            "path": "/v1/status?page=7&key=[redacted]",
+        }, served.text
+        assert gateway.request("POST", path, {"marker": marker}, key=other_key, params={"page": "7"}).status_code == 403
+
+        # Another authority's certificate: the provider refuses the handshake and nothing of the key leaks.
+        stranger_route: Final = f"integration-mtls-stranger-{marker}"
+        stranger_path: Final = f"{path}-stranger"
+        stranger_credential: Final = f"integration-mtls-stranger-{marker}"
+        stored_credential(
+            stranger_credential,
+            string_value(material["stranger_certificate"]),
+            string_value(material["stranger_key"]),
+        )
+        stranger: Final = gateway.post(
+            "/cube_control/account_routes",
+            {
+                "route": {
+                    **definition,
+                    "id": stranger_route,
+                    "path": stranger_path,
+                    "account_credential": {
+                        **object_value(definition["account_credential"]),
+                        "credential_name": stranger_credential,
+                    },
+                }
+            },
+        )
+        scenario.cleanups.callback(_delete_route, gateway, stranger_route)
+        stranger_key, stranger_hash = _application_key(scenario, f"integration-stranger-{marker}", [stranger_path])
+        _grant(
+            gateway,
+            stranger_route,
+            string_value(object_value(stranger["route"])["fingerprint"]),
+            {
+                "application_id": f"integration-stranger-{marker}",
+                "key_hash": stranger_hash,
+                "account_id": account,
+                "path": stranger_path,
+                "methods": ["POST"],
+            },
+        )
+        refused: Final = eventually(
+            lambda: gateway.request("POST", stranger_path, {"marker": marker}, key=stranger_key),
+            lambda response: response.status_code != 404,
+            seconds=60,
+        )
+        assert refused.status_code >= 500, refused.text
+        for secret in (string_value(material["stranger_key"]), string_value(material["client_key"]), query_key):
+            assert secret.splitlines()[1 if "PRIVATE" in secret else 0] not in refused.text
+
+        rows: Final = eventually(
+            lambda: read_rows(
+                'SELECT call_type, metadata, response FROM "LiteLLM_SpendLogs" WHERE api_key = %s', (key_hash,)
+            ),
+            lambda values: len(values) == 1,
+            seconds=70,
+        )
+        metadata: Final = object_value(rows[0]["metadata"])
+        assert (metadata["provider_account_id"], metadata["user_api_key_application_id"]) == (account, application)
+        stored: Final = json.dumps(rows, default=str)
+        assert string_value(material["client_key"]).splitlines()[1] not in stored
+        assert [form for form in _encoded(query_key) if form in stored] == []
+
+
 def _delete_ownership(account: str) -> None:
     write_rows('DELETE FROM "LiteLLM_AccountResourceOwnership" WHERE account_id = %s', (account,))
     remaining: Final = read_rows(

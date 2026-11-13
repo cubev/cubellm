@@ -452,11 +452,27 @@ def delete_scenario(handle: ScenarioHandle) -> None:
     response.raise_for_status()
 
 
+async def _serve(port: int) -> None:
+    # The client certificate provider listens next to the plain port; its material is served by /__tls.
+    from integration._support.tls_upstream import TlsProvider
+
+    tls: Final = TlsProvider(port + 1)
+    provider: Final = Provider()
+    application: Final = provider.app()
+
+    async def material(_request: Request) -> Response:
+        return JSONResponse(tls.material())
+
+    application.router.routes.insert(0, Route("/__tls", material, methods=["GET"]))
+    server: Final = uvicorn.Server(uvicorn.Config(application, host="127.0.0.1", port=port, access_log=False))
+    _ = await asyncio.gather(server.serve(), tls.serve())
+
+
 def main() -> None:
     parser: Final = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8190)
     arguments: Final = parser.parse_args()
-    uvicorn.run(Provider().app(), host="127.0.0.1", port=cast(int, arguments.port), access_log=False)
+    asyncio.run(_serve(cast(int, arguments.port)))
 
 
 if __name__ == "__main__":
