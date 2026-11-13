@@ -1360,7 +1360,7 @@ def _redact_prompt_leaks_in_error_string(
             out.append(redaction)
             pos = v_end
         elif redact_scalars:
-            scalar_end: Final = re.search(r"[,}\]\r\n]", text[v_start:])
+            scalar_end = re.search(r"[,}\]\r\n]", text[v_start:])
             out.append(redaction)
             pos = v_start + scalar_end.start() if scalar_end else n
         else:
