@@ -28,6 +28,7 @@ from tests.integration._support.client import (
 
 CONSECUTIVE: Final = 30
 BOUND_SECONDS: Final = 90.0
+HOLD_SECONDS: Final = 8.0
 
 
 def _observed(gateway: Gateway) -> list[dict[str, JsonValue]]:
@@ -40,15 +41,23 @@ def _observed(gateway: Gateway) -> list[dict[str, JsonValue]]:
 
 
 def _settled(label: str, probe: Callable[[], bool]) -> float:
-    """Seconds until CONSECUTIVE probes in a row succeed; fails after BOUND_SECONDS."""
+    """Seconds until the new state holds: CONSECUTIVE probes and HOLD_SECONDS in a row without a stale answer.
+
+    A run of probes can land on one worker by chance, so the state must also hold for longer than the reload
+    interval. The reported time is when that final run began, the last moment a stale answer was seen.
+    """
     started: Final = time.monotonic()
-    streak = 0  # rebind-ok: consecutive successes so far
-    while streak < CONSECUTIVE:
+    run_start = started  # rebind-ok: start of the current run without a stale answer
+    streak = 0  # rebind-ok: probes in the current run
+    while streak < CONSECUTIVE or time.monotonic() - run_start < HOLD_SECONDS:
         assert time.monotonic() - started < BOUND_SECONDS, f"{label} not settled within {BOUND_SECONDS}s"
-        streak = streak + 1 if probe() else 0  # rebind-ok: see above
-        if streak == 0:
+        if probe():
+            streak += 1
+        else:
+            streak = 0
+            run_start = time.monotonic()
             time.sleep(0.2)
-    elapsed: Final = time.monotonic() - started
+    elapsed: Final = run_start - started
     report: Final = os.environ.get("INTEGRATION_REVOCATION_REPORT")
     if report:
         with open(report, "a", encoding="utf-8") as output:

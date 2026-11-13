@@ -5527,10 +5527,10 @@ class _CascadingJWTMappingTable:
 
 class _RecordingEvict:
     def __init__(self):
-        self.cache_keys = ()
+        self.calls = []
 
     async def __call__(self, cache_keys, user_api_key_cache):
-        self.cache_keys = tuple(cache_keys)
+        self.calls.append(tuple(cache_keys))
 
 
 @pytest.mark.asyncio
@@ -5603,10 +5603,14 @@ async def test_delete_verification_tokens_evicts_jwt_key_mapping_cache(monkeypat
         ),
     )
 
-    assert recording_evict.cache_keys == (
-        jwt_key_mapping_cache_key("email", "user@example.com", None),
-        jwt_key_mapping_cache_key("email", "user@example.com", "https://issuer.example"),
-    )
+    # The jwt mappings, then the deleted key object itself, are evicted on every worker.
+    assert recording_evict.calls == [
+        (
+            jwt_key_mapping_cache_key("email", "user@example.com", None),
+            jwt_key_mapping_cache_key("email", "user@example.com", "https://issuer.example"),
+        ),
+        ("hashed-token-1",),
+    ]
 
 
 @pytest.mark.asyncio

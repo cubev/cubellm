@@ -5084,6 +5084,12 @@ async def delete_verification_tokens(
         # remove hash token from cache
         hashed_token = hash_token(cast(str, key))
         user_api_key_cache.delete_cache(hashed_token)
+    # Every other worker caches the key object as well; without this broadcast a deleted key keeps
+    # authenticating on those workers until its cache entry expires, even with coordination Redis.
+    await evict_and_broadcast(
+        cache_keys=tuple(_hash_token_if_needed(token=cast(str, key)) for key in tokens),
+        user_api_key_cache=user_api_key_cache,
+    )
 
     # After credential invalidation, so a failure here can never keep a deleted key alive.
     for deleted_key in authorized_keys:
