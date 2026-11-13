@@ -260,6 +260,30 @@ class AccountRouteTests(unittest.TestCase):
         alone: Final = AccountRouteSpec.model_validate(spec.model_dump() | {"headers": ()})
         self.assertEqual(alone.headers, ())
 
+    def test_websocket_routes_need_header_credentials_and_a_gateway_that_announces_them(self) -> None:
+        spec: Final = SPEC.model_copy(update={"target": "wss://vendor.example/v1/realtime", "methods": ("WEBSOCKET",)})
+        self.assertEqual(AccountRouteSpec.model_validate(spec.model_dump()).origin, "https://vendor.example")
+        unsupported: Final = RouteGateway()
+        self.assertEqual((ensure(unsupported, spec).status, unsupported.bodies), ("error", []))
+        gateway: Final = RouteGateway()
+        gateway.capabilities["passthrough_account_websocket_route"] = "websocket_v1"
+        gateway.route_changes = {"methods": ["WEBSOCKET"]}
+        self.assertEqual(ensure(gateway, spec).status, "created")
+        route: Final = gateway.bodies[0]["route"]
+        self.assertEqual(
+            (route["target"], route["methods"]) if isinstance(route, dict) else None,
+            ("wss://vendor.example/v1/realtime", ["WEBSOCKET"]),
+        )
+        for changes in (
+            {"methods": ("WEBSOCKET", "GET")},
+            {"target": "https://vendor.example/v1/realtime"},
+            {"methods": ("GET",)},
+            {"query": {"name": "key", "field": "api_key"}, "headers": ()},
+            {"include_subpath": True},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                AccountRouteSpec.model_validate(spec.model_dump() | changes)
+
     def test_existing_identical_route_is_reported_as_existing(self) -> None:
         gateway: Final = RouteGateway()
         gateway.created = False

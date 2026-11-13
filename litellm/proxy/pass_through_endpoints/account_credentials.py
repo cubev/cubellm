@@ -229,8 +229,23 @@ class ResolvedAccountCredential:
     )
 
 
-def _validate_account_target(target: str) -> None:
+WEBSOCKET_METHOD: Final = "WEBSOCKET"
+_HTTP_FORM: Final = MappingProxyType({"ws": "http", "wss": "https"})
+
+
+def http_form(target: str) -> str:
+    """The HTTP URL a WebSocket target is checked as: same authority, ws -> http and wss -> https."""
     parsed: Final = urlsplit(target)
+    scheme: Final = _HTTP_FORM.get(parsed.scheme)
+    return target if scheme is None else parsed._replace(scheme=scheme).geturl()
+
+
+def is_websocket_route(methods: Sequence[str] | None) -> bool:
+    return methods is not None and WEBSOCKET_METHOD in methods
+
+
+def _validate_account_target(target: str) -> None:
+    parsed: Final = urlsplit(http_form(target))
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.hostname
@@ -260,6 +275,19 @@ def validate_account_route(
     methods: Sequence[str] | None = None,
 ) -> None:
     _validate_account_target(target)
+    websocket: Final = is_websocket_route(methods)
+    if websocket != (urlsplit(target).scheme in _HTTP_FORM):
+        raise ValueError("WebSocket account routes need a ws or wss target, other routes an HTTP target")
+    if websocket and (
+        tuple(methods or ()) != (WEBSOCKET_METHOD,)
+        or policy.query is not None
+        or policy.sigv4 is not None
+        or policy.oauth is not None
+        or policy.mtls is not None
+        or policy.resource_types
+        or not policy.headers
+    ):
+        raise ValueError("WebSocket account routes use only the WEBSOCKET method and header credentials")
     if not auth or forward_headers:
         raise ValueError("Account credential routes require gateway authentication and restricted forwarding")
     if default_query_params and not set(default_query_params).issubset(policy.allowed_query_parameters):
@@ -309,7 +337,7 @@ def resolve_account_credential(
     info: Final = payload.credential_info
     if info.cube_account_id != policy.account_id:
         raise ValueError("Named credential account does not match route account")
-    origin: Final = credential_origin(target)
+    origin: Final = credential_origin(http_form(target))
     if origin not in tuple(credential_origin(value, origin_only=True) for value in info.cube_allowed_origins):
         raise ValueError("Named account credential is not allowed for this origin")
     allowed_origins: Final = tuple(credential_origin(value, origin_only=True) for value in info.cube_allowed_origins)

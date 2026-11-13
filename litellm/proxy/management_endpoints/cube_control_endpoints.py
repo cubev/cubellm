@@ -61,6 +61,7 @@ class CubeControlCapabilities(BaseModel):
     passthrough_account_sigv4_credential: Literal["aws_sigv4_v1"] = "aws_sigv4_v1"
     passthrough_account_oauth_credential: Literal["oauth_client_credentials_v1"] = "oauth_client_credentials_v1"
     passthrough_account_mtls_credential: Literal["client_certificate_v1"] = "client_certificate_v1"
+    passthrough_account_websocket_route: Literal["websocket_v1"] = "websocket_v1"
     account_inventory: Literal["gateway_bindings_v1"] = "gateway_bindings_v1"
     credential_values_full_masking: Literal[True] = True
     virtual_key_log_redaction: Literal[True] = True

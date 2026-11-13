@@ -29,6 +29,7 @@ from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
 )
 from litellm.proxy.pass_through_endpoints.account_credentials import (
     AccountHeaderCredential,
+    is_websocket_route,
     validate_account_resources,
     validate_account_route,
 )
@@ -2462,6 +2463,8 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
                 self.methods,
             )
             validate_account_resources(self.path, self.include_subpath, self.account_credential)
+            if self.include_subpath and is_websocket_route(self.methods):
+                raise ValueError("WebSocket account routes cannot forward subpaths")
         return self
 
     id: str | None = Field(

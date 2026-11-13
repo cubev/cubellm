@@ -5,7 +5,7 @@ import json
 import posixpath
 import traceback
 from base64 import b64encode
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import count, groupby
@@ -28,6 +28,7 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocketState
 from typing_extensions import ReadOnly
 from websockets.asyncio.client import connect
@@ -125,10 +126,12 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, Usage
 
 from .account_credentials import (
+    WEBSOCKET_METHOD,
     AccountHeaderCredential,
     AccountRouteBinding,
     ResolvedAccountCredential,
     account_application_allowed,
+    is_websocket_route,
     resolve_account_credential,
     validate_account_request,
     validate_account_resources,
@@ -2439,6 +2442,79 @@ def create_websocket_passthrough_route(
     return websocket_endpoint_func
 
 
+_WEBSOCKET_POLICY_VIOLATION: Final = 1008
+_NO_PARAMS: Final[Mapping[str, object]] = MappingProxyType({})
+_NO_HEADERS: Final[Mapping[str, str]] = MappingProxyType({})
+_ROUTE_HEADERS: Final = TypeAdapter(dict[str, str])
+
+
+def create_account_websocket_route(path: str) -> Callable[[WebSocket], Awaitable[None]]:
+    """WebSocket account route: same key, grant and credential checks as HTTP account routes, at handshake time.
+
+    The definition is read from the registry for every connection, so a deleted route or a revoked grant applies to
+    the next handshake. The client is never sent upstream headers, the credential only goes into the upstream
+    handshake, and the logged headers are masked.
+    """
+
+    async def account_websocket_endpoint(websocket: WebSocket) -> None:
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_websocket
+
+        registered: Final = InitPassThroughEndpointHelpers.get_registered_pass_through_route(
+            route=path, method=WEBSOCKET_METHOD
+        )
+        params: Final[Mapping[str, object]] = (
+            registered.get("passthrough_params", _NO_PARAMS) if registered is not None else _NO_PARAMS
+        )
+        raw_policy: Final = params.get("account_credential")
+        if raw_policy is None:
+            await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION)
+            return
+        try:
+            key: Final = await user_api_key_auth_websocket(websocket)
+        except HTTPException:
+            return  # user_api_key_auth_websocket already closed the handshake
+        policy: Final = AccountHeaderCredential.model_validate(raw_policy)
+        application_id: Final = application_id_from_key_metadata(
+            _KeyMetadata.model_validate(key, from_attributes=True).metadata
+        )
+        if not account_application_allowed(policy, application_id, key.token, path, WEBSOCKET_METHOD):
+            await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION)
+            return
+        target: Final = params.get("target")
+        configured: Final = params.get("custom_headers")
+        headers: Final[Mapping[str, str]] = MappingProxyType(
+            _ROUTE_HEADERS.validate_python(configured) if configured is not None else _NO_HEADERS
+        )
+        try:
+            validate_account_request(policy, websocket.headers, tuple(websocket.query_params.keys()))
+            if not isinstance(target, str):
+                raise ValueError("WebSocket account route target is missing")
+            validate_account_route(
+                target, True, params.get("forward_headers") is True, headers, None, policy, (WEBSOCKET_METHOD,)
+            )
+            credential: Final = resolve_account_credential(
+                policy, CredentialAccessor.find_credential(policy.credential_name), target
+            )
+        except ValueError:
+            await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION)
+            return
+        query: Final = urlencode(tuple(websocket.query_params.multi_items()))
+        cost: Final = params.get("cost_per_request")
+        await websocket_passthrough_request(
+            websocket=websocket,
+            target=target + ("?" + query if query else ""),
+            custom_headers={**headers, **credential.headers},  # mutable-ok: the relay signature takes a dict
+            user_api_key_dict=key,
+            forward_headers=False,
+            endpoint=path,
+            cost_per_request=float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) else None,
+            accept_websocket=True,
+            account_binding=credential.binding,
+        )
+
+    return account_websocket_endpoint
+
+
 def _rewrite_vertex_live_setup_model(text_data: str, setup_model_rewriter: Callable[[str], str] | None) -> str:
     """
     Rewrite the model of a Vertex AI Live ``setup`` frame, leaving every other frame byte-identical
@@ -2550,6 +2626,7 @@ async def websocket_passthrough_request(
     cost_per_request: float | None = None,
     accept_websocket: bool = True,
     setup_model_rewriter: Callable[[str], str] | None = None,
+    account_binding: AccountRouteBinding | None = None,
 ):
     """
     WebSocket passthrough request handler.
@@ -2644,6 +2721,7 @@ async def websocket_passthrough_request(
         litellm_call_id=litellm_call_id,
         request=dummy_request,
         logging_obj=logging_obj,
+        account_binding=account_binding,
     )
 
     # Update logging environment variables
@@ -2663,7 +2741,10 @@ async def websocket_passthrough_request(
         additional_args={
             "complete_input_dict": {},
             "api_base": target,
-            "headers": upstream_headers,
+            # Account routes carry a named credential in these headers; their values are never logged.
+            "headers": {name: "[redacted]" for name in upstream_headers}  # mutable-ok: logged copy only
+            if account_binding is not None
+            else upstream_headers,
         },
     )
 
@@ -3179,6 +3260,14 @@ class SafeRouteAdder:
         )
         return True
 
+    @staticmethod
+    def add_websocket_route_if_not_exists(app: FastAPI, path: str, endpoint: Callable[..., object]) -> bool:
+        """Account WebSocket routes look up their current definition per connection, so one route per path suffices."""
+        if any(isinstance(route, WebSocketRoute) and route.path == path for route in app.routes):
+            return False
+        app.add_api_websocket_route(path=path, endpoint=endpoint)
+        return True
+
 
 class InitPassThroughEndpointHelpers:
     @staticmethod
@@ -3229,25 +3318,28 @@ class InitPassThroughEndpointHelpers:
         )
 
         # Use SafeRouteAdder to only add route if it doesn't exist on the app
-        SafeRouteAdder.add_api_route_if_not_exists(
-            app=app,
-            path=path,
-            endpoint=create_pass_through_route(
-                path,
-                target,
-                custom_headers,
-                forward_headers,
-                merge_query_params,
-                dependencies,
-                cost_per_request=cost_per_request,
-                default_query_params=default_query_params,
-                guardrails=guardrails,
-                config_file_path=config_file_path,
-                timeout=timeout,
-            ),
-            methods=methods,
-            dependencies=dependencies,
-        )
+        if account_credential is not None and is_websocket_route(methods):
+            _ = SafeRouteAdder.add_websocket_route_if_not_exists(app, path, create_account_websocket_route(path))
+        else:
+            SafeRouteAdder.add_api_route_if_not_exists(
+                app=app,
+                path=path,
+                endpoint=create_pass_through_route(
+                    path,
+                    target,
+                    custom_headers,
+                    forward_headers,
+                    merge_query_params,
+                    dependencies,
+                    cost_per_request=cost_per_request,
+                    default_query_params=default_query_params,
+                    guardrails=guardrails,
+                    config_file_path=config_file_path,
+                    timeout=timeout,
+                ),
+                methods=methods,
+                dependencies=dependencies,
+            )
 
         # Always register/update the route metadata (headers, target) even if FastAPI route exists
         _registered_pass_through_routes[route_key] = {

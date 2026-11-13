@@ -12,6 +12,7 @@ from .account_credentials import (
     AccountApplicationGrant,
     AccountHeaderCredential,
     credential_origin,
+    http_form,
     validate_account_resources,
     validate_account_route,
 )
@@ -128,7 +129,7 @@ def describe_account_route(settings: Mapping[str, JsonValue], route_id: str) -> 
             path=route.path,
             methods=route.methods,
             include_subpath=route.include_subpath,
-            origin=credential_origin(route.target),
+            origin=credential_origin(http_form(route.target)),
             fingerprint=sha256(json.dumps(stable, sort_keys=True, allow_nan=False).encode()).hexdigest(),
             grants=route.account_credential.application_grants,
         )

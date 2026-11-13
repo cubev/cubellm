@@ -182,6 +182,7 @@ async def test_capabilities_reports_running_policy_without_configuration_secrets
         "passthrough_account_sigv4_credential": "aws_sigv4_v1",
         "passthrough_account_oauth_credential": "oauth_client_credentials_v1",
         "passthrough_account_mtls_credential": "client_certificate_v1",
+        "passthrough_account_websocket_route": "websocket_v1",
         "account_inventory": "gateway_bindings_v1",
         "virtual_key_log_redaction": True,
         "custom_keys_allowed": disable_custom_keys not in (True, "true"),

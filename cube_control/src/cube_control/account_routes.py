@@ -30,7 +30,7 @@ def _target_url(target: str) -> httpx.URL:
     except httpx.InvalidURL:
         raise ValueError("Account route target is not a valid URL") from None
     if (
-        url.scheme not in ("http", "https")
+        url.scheme not in ("http", "https", "ws", "wss")
         or not url.host
         or _has_blank_or_control(target)
         or _has_blank_or_control(unquote(url.host))
@@ -161,7 +161,20 @@ class AccountRouteSpec(FrozenModel):
             raise ValueError("Account route base paths must be concrete")
         if len(set(self.methods)) != len(self.methods):
             raise ValueError("Account route methods must be unique")
-        _ = _target_url(self.target)
+        target: Final = _target_url(self.target)
+        if ("WEBSOCKET" in self.methods) != (target.scheme in ("ws", "wss")):
+            raise ValueError("WebSocket account routes need a ws or wss target, other routes an HTTP target")
+        if "WEBSOCKET" in self.methods and (
+            self.methods != ("WEBSOCKET",)
+            or not self.headers
+            or self.query is not None
+            or self.sigv4 is not None
+            or self.oauth is not None
+            or self.mtls is not None
+            or self.resource_types
+            or self.include_subpath
+        ):
+            raise ValueError("WebSocket account routes use only the WEBSOCKET method and header credentials")
         if self.resource_types and not self.include_subpath:
             raise ValueError("Account resources require a route that forwards subpaths")
         if len({resource.name for resource in self.resource_types}) != len(self.resource_types):
@@ -171,7 +184,8 @@ class AccountRouteSpec(FrozenModel):
     @property
     def origin(self) -> str:
         target: Final = _target_url(self.target)
-        return target.scheme + "://" + target.netloc.decode("ascii")
+        scheme: Final = {"ws": "http", "wss": "https"}.get(target.scheme, target.scheme)
+        return scheme + "://" + target.netloc.decode("ascii")
 
     def command(self) -> dict[str, JsonValue]:
         return {
@@ -232,6 +246,10 @@ class _TLSCredentialCapabilities(_RouteCapabilities):
     passthrough_account_mtls_credential: Literal["client_certificate_v1"]
 
 
+class _WebSocketRouteCapabilities(_RouteCapabilities):
+    passthrough_account_websocket_route: Literal["websocket_v1"]
+
+
 class _RouteReceipt(BaseModel):
     stored: Literal[True]
     created: bool
@@ -269,6 +287,11 @@ def _ensure(client: httpx.Client, spec: AccountRouteSpec) -> AccountRouteResult:
             _ = _OAuthCredentialCapabilities.model_validate_json(caps_raw)
         except ValidationError:
             return result("error", "Gateway does not support OAuth client credentials; nothing stored")
+    if "WEBSOCKET" in spec.methods:
+        try:
+            _ = _WebSocketRouteCapabilities.model_validate_json(caps_raw)
+        except ValidationError:
+            return result("error", "Gateway does not support WebSocket account routes; nothing stored")
     if spec.mtls is not None:
         try:
             _ = _TLSCredentialCapabilities.model_validate_json(caps_raw)
