@@ -925,3 +925,18 @@ Account routes with the single method `WEBSOCKET` and a ws or wss target are reg
 Evidence: offline, `tests/unit/proxy/pass_through_endpoints/test_account_websocket_routes.py` passes with 15 tests (policy restrictions, HTTPS-form origin binding, refused subpaths, granted relay with only the account header, four denied handshakes without provider contact, deletion and revocation applying to the next handshake, masked logged headers), and all 10 targeted mutations are detected. Against `cubellm-native-dev:b1510df`, built from an exact `git archive` with a matching revision label, the whole account route integration file passes with 11 tests in 60.59 s in the isolated runner. The new test checks the capability, idempotent creation, 422 for mixed methods, a WebSocket handshake through the gateway in which the scripted provider receives `Bearer <account value>` and the allowed query but not a client-only header and echoes a frame, refusal of another application's key and of an unknown query parameter, and a spend row with the account and application and without the provider value. Isolation before and after showed only loopback, and no relay, container or test schema remained. The pass-through unit directory passes with 396 tests, `test_pass_through_endpoints.py` with 542, the controller suite with 290, and the type check, type discipline, ruff strict and test quality gates pass. The spend log payload expectation that still listed the upstream key set was corrected in 837cd38
 
 Limits: frames are not redacted, open connections survive a revocation until they close, and usage is not derived from frames
+
+## Revocation and rotation across gateway workers
+
+`tests/integration/authorization/test_account_route_revocation.py` measures how long a key deletion, a credential rotation and a route deletion take until 30 consecutive requests, each on a fresh connection so the shared listening socket spreads them over the workers, all show the new state. A kept-alive client would pin every probe to one worker and hide the gap. `INTEGRATION_REVOCATION_REPORT` names a file for the measured durations
+
+Evidence against `cubellm-native-dev:b1510df` with `--num_workers 2`, no Redis and a 5 second config reload interval, isolated runner, both runs passing:
+
+| Setting | Route and grants loaded | Deleted key refused | Rotated credential used | Deleted route refused |
+| --- | --- | --- | --- | --- |
+| default key cache (60 s) | 5.97 s | 58.27 s | 1.75 s | 4.60 s |
+| `user_api_key_cache_ttl: 5` | 4.39 s | 2.93 s | 2.88 s | 1.68 s |
+
+Without Redis a deleted key stays usable on the other workers for up to the key cache lifetime, because each worker caches the key on its own. Route and grant changes follow the config reload interval, and a rotated credential is used once the worker reloads the credential list. Several workers without Redis therefore need a short `general_settings.user_api_key_cache_ttl` (for example 5 seconds) if a key deletion must take effect quickly; with Redis the shared cache applies instead. The single-worker production gateway is not affected
+
+Limits: Redis itself, an actual several-host deployment and LAN or Tailscale reachability were not tested here. Open WebSocket connections are not cut by a revocation
