@@ -22,6 +22,7 @@ const goodStatuses = new Set(["known", "manual", "estimated"]);
 function unresolvedError(view, readings, now = Date.now()) {
  const error = view.reading;
  if (!["error", "not_configured"].includes(error.status)) return false;
+ if (/^\d{4}-(0[1-9]|1[0-2])$/.test(error.period) && error.period < new Date(now).toISOString().slice(0, 7)) return false;
  if (error.window !== "all") return true;
  const since = Date.parse(error.observed_at);
  return !readings.some(other => {

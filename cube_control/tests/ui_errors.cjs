@@ -24,6 +24,16 @@ for (const override of [
 assert.equal(context.unresolvedError({reading: {...error.reading, window: 'Other'}}, [good], now), true);
 assert.equal(context.unresolvedError({reading: {...error.reading, status: 'not_configured'}}, [good], now), false);
 assert.equal(context.unresolvedError(good, [good], now), false);
+for (const metric of ['spend', 'budget', 'usage']) {
+ const current = new Date(now).toISOString().slice(0, 7);
+ const previous = new Date(now - 32 * 86400000).toISOString().slice(0, 7);
+ const monthlyError = {reading: {...error.reading, metric, window: 'Monat', period: current}};
+ assert.equal(context.unresolvedError(monthlyError, [monthlyError], now), true);
+ assert.equal(context.unresolvedError({reading: {...monthlyError.reading, period: previous}}, [], now), false);
+ assert.equal(context.unresolvedError({reading: {...monthlyError.reading, window: 'all', period: previous}}, [], now), false);
+ assert.equal(context.unresolvedError({reading: {...monthlyError.reading, period: 'invalid'}}, [], now), true);
+ assert.equal(context.unresolvedError({reading: {...monthlyError.reading, period: '9999-12'}}, [], now), true);
+}
 assert.equal(context.unresolvedError({reading:{...error.reading,snapshot_scope:'quotas'}},
  [{reading:{...good.reading,snapshot_scope:'billing'}}],now),true);
 assert.equal(context.unresolvedError({reading:{...error.reading,snapshot_scope:'quotas'}},
