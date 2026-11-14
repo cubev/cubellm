@@ -39,6 +39,7 @@ from cube_control.gateway_inventory import collect_and_record_gateway_inventory
 from cube_control.gateway_store import GatewayRepository
 from cube_control.github import collect_github
 from cube_control.heygen import collect_heygen
+from cube_control.heygen_jobs import check_heygen_jobs
 from cube_control.media import JobCommand, PostgresJobManager
 from cube_control.models import GatewayBatch, Identifier, ImportBatch, ManualCommand
 from cube_control.native_gateway import PROJECTION_COLUMNS, prepare_native_gateway
@@ -141,6 +142,9 @@ def main() -> int:
     heygen_parser.add_argument("--config", required=True, type=Path)
     heygen_parser.add_argument("--account-id", default="heygen-api")
     heygen_parser.add_argument("--account-name", default="HeyGen API")
+    heygen_jobs_parser: Final = sub.add_parser("check-heygen-jobs")
+    heygen_jobs_parser.add_argument("--config", required=True, type=Path)
+    heygen_jobs_parser.add_argument("--account-id", default="heygen-api")
     github_parser: Final = sub.add_parser("collect-github")
     github_parser.add_argument("--config", required=True, type=Path)
     github_parser.add_argument("--account-id", default="github-api")
@@ -326,6 +330,19 @@ def main() -> int:
         job_result: Final = PostgresJobManager(dsn).manage(job_command, args.actor, datetime.now(UTC))
         print(json.dumps({"status": job_result.status, "version": job_result.version, "message": job_result.message}))
         return 0 if job_result.status in ("applied", "duplicate") else 1
+    if args.command == "check-heygen-jobs":
+        try:
+            heygen_report: Final = check_heygen_jobs(
+                args.config, args.account_id, PostgresJobManager(dsn), datetime.now(UTC)
+            )
+        except psycopg.Error:
+            print("Job database unavailable", file=sys.stderr)
+            return 1
+        except ValidationError:
+            print("Job or provider data rejected; input values are not logged", file=sys.stderr)
+            return 2
+        print(heygen_report.model_dump_json())
+        return 0
     if args.command == "job-history":
         try:
             history: Final = PostgresJobManager(dsn).history(args.account_id, args.job_id, args.after, args.limit)

@@ -318,6 +318,20 @@ reservation that ran out without a submission. `truncated` marks a longer list. 
 same list under "Medienaufträge überwachen" and loads nothing else when the job database is unavailable. Nothing
 is inferred about the provider side; checking and finalizing a job remains an explicit command
 
+## HeyGen media job status check
+
+`check-heygen-jobs --config /private/heygen.env --account-id heygen-api` compares the submitted media jobs of the
+account (the job ID is the HeyGen video ID) with `GET https://api.heygen.com/v3/videos/{video_id}`, which needs the
+`videos:read` scope. It prints a report and changes nothing. Each check carries the reported status
+(`pending`, `processing`, `completed` or `failed`), completion time, duration and failure code, and a suggestion:
+`wait`, `finalize_after_confirming_usage`, `review_failure` or `provider_status_unavailable`. HeyGen reports no cost
+for a video, so a completed job is only finalized by an explicit job command with the confirmed usage. A response
+for another video ID, an unknown status, a redirect or an oversized body is not trusted. At most 100 submitted jobs
+among the 200 most recently updated are checked per run (`truncated` marks more). Download URLs are never copied
+into the report. Contract checked on 2026-11-14 against
+[Get Video](https://developers.heygen.com/reference/get-video) and the
+[permission scopes](https://developers.heygen.com/docs/api-key-permissions); local tests use synthetic responses
+
 ## HeyGen account reader
 
 `collect-heygen --config /private/heygen.env` reads `HEYGEN_API_KEY` from a private
