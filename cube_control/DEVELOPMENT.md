@@ -937,6 +937,13 @@ Evidence against `cubellm-native-dev:b1510df` with `--num_workers 2`, no Redis a
 | default key cache (60 s) | 5.97 s | 58.27 s | 1.75 s | 4.60 s |
 | `user_api_key_cache_ttl: 5` | 4.39 s | 2.93 s | 2.88 s | 1.68 s |
 
-Without Redis a deleted key stays usable on the other workers for up to the key cache lifetime, because each worker caches the key on its own. Route and grant changes follow the config reload interval, and a rotated credential is used once the worker reloads the credential list. Several workers without Redis therefore need a short `general_settings.user_api_key_cache_ttl` (for example 5 seconds) if a key deletion must take effect quickly; with Redis the shared cache applies instead. The worker count and cache settings of the production gateway were not checked here
+With coordination Redis (`general_settings.coordination_redis`, `redis:7.4-alpine` in the gateway's isolated network namespace) the first measurement on b1510df still showed 59.45 s for a deleted key: `delete_verification_tokens` evicted the key only on the handling worker and broadcast just its jwt key mappings. 728484e broadcasts the key eviction as well. Against `cubellm-native-dev:728484e`, with the stricter criterion that the new state must also hold for 8 seconds (the reported time is when that final run began):
 
-Limits: Redis itself, an actual several-host deployment and LAN or Tailscale reachability were not tested here. Open WebSocket connections are not cut by a revocation
+| Setting | Route and grants loaded | Deleted key refused | Rotated credential used | Deleted route refused |
+| --- | --- | --- | --- | --- |
+| no Redis, default key cache | 5.33 s | 52.02 s | 3.85 s | 0.01 s |
+| coordination Redis | 5.03 s | 0.00 s | 2.16 s | 2.16 s |
+
+Without Redis a deleted key stays usable on the other workers for up to the key cache lifetime, because each worker caches the key on its own and nothing tells it about the deletion. Route and grant changes follow the config reload interval, and a rotated credential is used once the worker reloads the credential list. Several workers without Redis therefore need a short `general_settings.user_api_key_cache_ttl` (for example 5 seconds) if a key deletion must take effect quickly; with Redis the shared cache applies instead. The worker count and cache settings of the production gateway were not checked here
+
+Limits: a single Redis without authentication or TLS on loopback; several hosts, Redis Sentinel or Cluster and LAN or Tailscale reachability were not tested. Open WebSocket connections are not cut by a revocation
