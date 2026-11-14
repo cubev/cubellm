@@ -953,3 +953,13 @@ Limits: a single Redis without authentication or TLS on loopback; several hosts,
 The job list endpoint and the browser section close the "job monitoring" gap of the browser overview row. Evidence: `tests/test_media.py` passes against a dedicated `cubecontrol_test` PostgreSQL with 9 tests, the new one covering ordering, versions, both attention values at the deadline, paging with `truncated`, the account filter, 422 for invalid parameters, 405 for writes and 503 without a job database. `tests/ui_jobs.cjs` checks the rendered rows, the attention marking, text-only output of a markup job ID and the summary line. A headless Chromium run against `python -m cube_control serve` on the test database showed 20 rows and no horizontal overflow at 390 px. The full controller suite passes with 291 tests and no skips on that database
 
 Limits: provider status polling and billing reconciliation for media jobs remain open; the list never claims a provider outcome
+
+## Gateway authorization suite in CI parity
+
+Run on 2026-11-14 against `cubellm-native-dev:ad1a1ac` with the isolated runner in CI parity mode, which matches the CI `management` group: the repository's `tests/integration/proxy_config.yaml`, Redis, production mode, `num_retries: 0`, a second gateway on port 4001 sharing the database and Redis, and the default 30-second config reload. Result: 39 of 42 `tests/integration/authorization` tests passed. None of the three failures comes from the fork:
+
+- The Bedrock pass-through test starts its fake provider inside the test client. The isolated gateway cannot reach it. Run on a shared loopback, the test passes.
+- The worker-kill chaos test starts its own two-worker proxy with the host interpreter. On Python 3.14 the generated Prisma types take 17.8 seconds to import (2.2 seconds on the image's Python 3.13), so the proxy misses the test's 70-second readiness deadline. With a longer deadline it passes.
+- The SCIM deactivation test needs an enterprise `LITELLM_LICENSE`. The fork changes no SCIM or license code.
+
+Eleven upstream migrations, for example `20250603210143_cascade_budget_changes`, look up constraints in `pg_constraint` by name without a schema filter. A second LiteLLM schema in the same PostgreSQL database therefore makes `prisma migrate deploy` fail with P3018. Give each gateway its own database rather than its own schema in a shared one. The migrations are left unchanged because they are already applied to existing databases.
