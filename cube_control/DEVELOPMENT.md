@@ -954,12 +954,12 @@ The job list endpoint and the browser section close the "job monitoring" gap of 
 
 Limits: provider status polling and billing reconciliation for media jobs remain open; the list never claims a provider outcome
 
-## Gateway authorization suite in CI parity
+## Gateway management group in CI parity
 
-Run on 2026-11-14 against `cubellm-native-dev:ad1a1ac` with the isolated runner in CI parity mode, which matches the CI `management` group: the repository's `tests/integration/proxy_config.yaml`, Redis, production mode, `num_retries: 0`, a second gateway on port 4001 sharing the database and Redis, and the default 30-second config reload. Result: 39 of 42 `tests/integration/authorization` tests passed. None of the three failures comes from the fork:
+Run on 2026-11-14 against `cubellm-native-dev:ad1a1ac` with the isolated runner in CI parity mode, which matches the CI `management` group (`tests/integration/management`, `authorization`, `configuration`). Both gateways start through `tests/integration/_support/proxy.py` with the test entitlement, as in CI, using the image's own litellm. The run uses the repository's `tests/integration/proxy_config.yaml`, Redis, production mode and `num_retries: 0`, plus a second gateway on port 4001 that shares the database and Redis. Config reload stays at the default 30 seconds, and the test role may create scratch databases. Result: 90 passed, 7 skipped, 4 failed in 37 minutes. None of the four failures comes from the fork:
 
+- Two Redis-outage tests (`test_user_updates_wedged_coordination_redis`, `test_vector_store_config_ownership::test_redis_outage…`) pause CI's Docker container named `redis-cache`, which the isolated runner does not have.
 - The Bedrock pass-through test starts its fake provider inside the test client. The isolated gateway cannot reach it. Run on a shared loopback, the test passes.
 - The worker-kill chaos test starts its own two-worker proxy with the host interpreter. On Python 3.14 the generated Prisma types take 17.8 seconds to import (2.2 seconds on the image's Python 3.13), so the proxy misses the test's 70-second readiness deadline. With a longer deadline it passes.
-- The SCIM deactivation test needs an enterprise `LITELLM_LICENSE`. The fork changes no SCIM or license code.
 
 Eleven upstream migrations, for example `20250603210143_cascade_budget_changes`, look up constraints in `pg_constraint` by name without a schema filter. A second LiteLLM schema in the same PostgreSQL database therefore makes `prisma migrate deploy` fail with P3018. Give each gateway its own database rather than its own schema in a shared one. The migrations are left unchanged because they are already applied to existing databases.
