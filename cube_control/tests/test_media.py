@@ -145,6 +145,41 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(unavailable.get(path).status_code, 503)
         self.assertEqual(unavailable.get(path + "/history").status_code, 503)
 
+    def test_job_list_flags_overdue_submissions_and_expired_reservations(self) -> None:
+        second: Final = self.job.model_copy(
+            update={"job_id": "second-job", "updated_at": self.now + timedelta(seconds=1)}
+        )
+        self.assertEqual(self.manager.manage(self.command(self.job), "owner", self.now).status, "applied")
+        self.assertEqual(self.manager.manage(self.command(second), "owner", self.now).status, "applied")
+        submitted: Final = self.job.model_copy(
+            update={"state": "submitted", "updated_at": self.now + timedelta(seconds=2)}
+        )
+        self.assertEqual(self.manager.manage(self.command(submitted, 1), "owner", self.now).status, "applied")
+        current: Final = self.manager.recent(self.now, account_id=self.account.id)
+        self.assertEqual([view.job.job_id for view in current.jobs], [self.job.job_id, "second-job"])
+        self.assertEqual([view.version for view in current.jobs], [2, 1])
+        self.assertEqual([view.attention for view in current.jobs], [None, None])
+        self.assertFalse(current.truncated)
+        overdue: Final = self.manager.recent(self.job.expires_at, account_id=self.account.id)
+        self.assertEqual(
+            [view.attention for view in overdue.jobs], ["provider_status_unverified", "reservation_expired"]
+        )
+        page: Final = self.manager.recent(self.now, account_id=self.account.id, limit=1)
+        self.assertEqual((len(page.jobs), page.truncated), (1, True))
+        self.assertEqual(self.manager.recent(self.now, account_id="missing").jobs, ())
+        client: Final = TestClient(
+            create_app(self.repository, job_reader=self.manager, clock=lambda: self.job.expires_at)
+        )
+        listed: Final = client.get(f"/api/v1/jobs?account_id={self.account.id}&limit=5")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["jobs"][0]["attention"], "provider_status_unverified")
+        self.assertEqual(listed.json()["jobs"][0]["job"]["reserved_amount"], str(self.job.reserved_amount))
+        self.assertEqual(client.get("/api/v1/jobs?limit=201").status_code, 422)
+        self.assertEqual(client.get("/api/v1/jobs?account_id=bad%20id").status_code, 422)
+        self.assertEqual(client.post("/api/v1/jobs", json={}).status_code, 405)
+        self.assertEqual(TestClient(create_app(self.repository)).get("/api/v1/jobs").status_code, 503)
+        self.assertEqual(client.get("/jobs.js").status_code, 200)
+
     def test_cli_retry_and_history_use_same_persisted_command(self) -> None:
         command: Final = self.command(self.job)
         environment: Final = dict(os.environ) | {"CUBE_CONTROL_DATABASE_URL": DSN}

@@ -947,3 +947,9 @@ With coordination Redis (`general_settings.coordination_redis`, `redis:7.4-alpin
 Without Redis a deleted key stays usable on the other workers for up to the key cache lifetime, because each worker caches the key on its own and nothing tells it about the deletion. Route and grant changes follow the config reload interval, and a rotated credential is used once the worker reloads the credential list. Several workers without Redis therefore need a short `general_settings.user_api_key_cache_ttl` (for example 5 seconds) if a key deletion must take effect quickly; with Redis the shared cache applies instead. The worker count and cache settings of the production gateway were not checked here
 
 Limits: a single Redis without authentication or TLS on loopback; several hosts, Redis Sentinel or Cluster and LAN or Tailscale reachability were not tested. Open WebSocket connections are not cut by a revocation
+
+## Media job monitoring acceptance
+
+The job list endpoint and the browser section close the "job monitoring" gap of the browser overview row. Evidence: `tests/test_media.py` passes against a dedicated `cubecontrol_test` PostgreSQL with 9 tests, the new one covering ordering, versions, both attention values at the deadline, paging with `truncated`, the account filter, 422 for invalid parameters, 405 for writes and 503 without a job database. `tests/ui_jobs.cjs` checks the rendered rows, the attention marking, text-only output of a markup job ID and the summary line. A headless Chromium run against `python -m cube_control serve` on the test database showed 20 rows and no horizontal overflow at 390 px. The full controller suite passes with 291 tests and no skips on that database
+
+Limits: provider status polling and billing reconciliation for media jobs remain open; the list never claims a provider outcome

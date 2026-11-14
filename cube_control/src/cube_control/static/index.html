@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="de">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CubeLLM · Übersicht</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/usage.js" defer></script><script src="/reconciliation.js" defer></script><script src="/manage.js" defer></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CubeLLM · Übersicht</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/usage.js" defer></script><script src="/jobs.js" defer></script><script src="/reconciliation.js" defer></script><script src="/manage.js" defer></script></head>
 <body>
 <header><a class="brand" href="/" aria-label="CubeLLM Übersicht"><span class="mark">C</span><span>CubeLLM<small>Deine AI-Dienste im Blick</small></span></a><div class="live"><i></i><span id="connection">Verbinde …</span><button id="refresh" type="button">Aktualisieren</button></div></header>
 <main>
@@ -45,5 +45,14 @@
 </section>
 <section class="fleet-section"><div class="section-heading"><div><p class="eyebrow">ENTWICKLUNG & BETRIEB</p><h2>Deine Systeme</h2></div><span id="fleet-age"></span></div><div id="fleet" class="fleet-grid"><div class="empty">Noch kein zentraler Systembericht</div></div></section>
 <footer>Provider-Kosten und beobachteter Proxy-Verbrauch werden getrennt geführt. Credits sind kein Geldbetrag. Nicht angebundene Konten bleiben sichtbar.</footer>
+<section class="usage-section" aria-labelledby="jobs-heading">
+<h2 id="jobs-heading">Medienaufträge überwachen</h2>
+<p class="explanation">Lokal geführte Aufträge mit Reservierung und tatsächlichem Verbrauch, zuletzt geänderte zuerst. Ein eingereichter Auftrag nach Ablauf seiner Frist hat keinen bestätigten Anbieterstatus; er bleibt reserviert, bis er beim Anbieter geprüft und abgeschlossen ist.</p>
+<form id="jobs-filters" class="usage-filters"><label>Konto-ID<input id="jobs-account" type="text" maxlength="128" pattern="[a-zA-Z0-9][a-zA-Z0-9_.:\-]{0,127}" placeholder="Alle Konten"></label><button id="jobs-load" type="submit">Aufträge laden</button></form>
+<p id="jobs-status" role="status">Aufträge laden, um den aktuellen Stand zu sehen.</p>
+<div class="usage-table-scroll" tabindex="0" role="region" aria-label="Medienaufträge, horizontal scrollbar">
+<table class="usage-table"><thead><tr><th scope="col">Konto / Auftrag</th><th scope="col">Status</th><th scope="col">Reserviert</th><th scope="col">Tatsächlich</th><th scope="col">Frist (UTC)</th><th scope="col">Geändert (UTC)</th><th scope="col">Hinweis</th></tr></thead><tbody id="jobs-rows"></tbody></table>
+</div>
+</section>
 </main>
 </body></html>

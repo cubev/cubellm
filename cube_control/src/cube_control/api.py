@@ -15,7 +15,7 @@ from cube_control.browser_session import SessionAuthority
 from cube_control.gateway import gateway_metrics
 from cube_control.gateway_store import GatewayPeriodReader
 from cube_control.inventory import AccountInventoryReport, account_inventory
-from cube_control.media import JobHistory, JobReader, JobSnapshot
+from cube_control.media import JobHistory, JobList, JobReader, JobSnapshot
 from cube_control.models import (
     AccountView,
     FleetSnapshot,
@@ -203,6 +203,20 @@ def create_app(
         except psycopg.Error:
             raise HTTPException(503, detail="Auftragsdatenbank ist nicht erreichbar") from None
 
+    def jobs(
+        account_id: Annotated[str | None, Query(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> JobList:
+        if job_reader is None:
+            raise HTTPException(503, detail="Auftragsübersicht nicht eingerichtet")
+        try:
+            return job_reader.recent(clock(), account_id, limit)
+        except psycopg.Error:
+            raise HTTPException(503, detail="Auftragsdatenbank ist nicht erreichbar") from None
+
+    def jobs_script() -> FileResponse:
+        return FileResponse(static / "jobs.js", media_type="application/javascript")
+
     def index() -> FileResponse:
         return FileResponse(static / "index.html", media_type="text/html")
 
@@ -229,6 +243,8 @@ def create_app(
     app.add_api_route("/api/v1/reconciliation", reconciliation, methods=["GET"], response_model=ReconciliationReport)
     app.add_api_route("/api/v1/fleet", fleet, methods=["GET"], response_model=FleetSnapshot | None)
     app.add_api_route("/api/v1/usage", usage, methods=["GET"], response_model=UsagePage)
+    app.add_api_route("/api/v1/jobs", jobs, methods=["GET"], response_model=JobList)
+    app.add_api_route("/jobs.js", jobs_script, methods=["GET"])
     app.add_api_route(
         "/api/v1/accounts/{account_id}/jobs/{job_id}", job_detail, methods=["GET"], response_model=JobSnapshot
     )

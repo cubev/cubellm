@@ -44,9 +44,35 @@ class JobHistory(FrozenModel):
     next_after: int | None = None
 
 
+JobAttention = Literal["provider_status_unverified", "reservation_expired"]
+
+
+class JobView(FrozenModel):
+    job: MediaJob
+    version: int
+    attention: JobAttention | None = None
+
+
+class JobList(FrozenModel):
+    checked_at: AwareDatetime
+    jobs: tuple[JobView, ...]
+    truncated: bool
+
+
+def job_attention(job: MediaJob, now: datetime) -> JobAttention | None:
+    """What an operator must look at: a submission whose outcome is still unknown after its deadline, or a
+    reservation that ran out without being submitted. Nothing is inferred about the provider side."""
+    if job.expires_at > now:
+        return None
+    if job.state == "submitted":
+        return "provider_status_unverified"
+    return "reservation_expired" if job.state == "reserved" else None
+
+
 class JobReader(Protocol):
     def get(self, account_id: str, job_id: str) -> JobSnapshot | None: ...
     def history(self, account_id: str, job_id: str, after: int = 0, limit: int = 50) -> JobHistory: ...
+    def recent(self, now: datetime, account_id: str | None = None, limit: int = 50) -> JobList: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,3 +167,25 @@ class PostgresJobManager:
                 entries=entries[:limit],
                 next_after=entries[limit - 1].revision if len(entries) > limit else None,
             )
+
+    def recent(self, now: datetime, account_id: str | None = None, limit: int = 50) -> JobList:
+        """Most recently updated jobs first, optionally for one account."""
+        if not 1 <= limit <= 200:
+            raise ValueError("Invalid job list page")
+        with self.connect() as connection:
+            rows: Final = connection.execute(
+                "SELECT jobs.payload::text, COALESCE((SELECT max(revision) FROM cube_control.job_commands "
+                "WHERE job_id=jobs.id),0)::text FROM cube_control.jobs AS jobs "
+                "WHERE %s::text IS NULL OR jobs.account_id=%s "
+                "ORDER BY (jobs.payload->>'updated_at')::timestamptz DESC, jobs.id LIMIT %s",
+                (account_id, account_id, limit + 1),
+            ).fetchall()
+        jobs: Final = tuple(MediaJob.model_validate_json(row[0]) for row in rows)
+        return JobList(
+            checked_at=now,
+            jobs=tuple(
+                JobView(job=job, version=int(row[1]), attention=job_attention(job, now))
+                for job, row in zip(jobs[:limit], rows[:limit], strict=True)
+            ),
+            truncated=len(rows) > limit,
+        )

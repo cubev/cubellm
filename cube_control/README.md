@@ -309,6 +309,15 @@ account metadata. Register custom accounts before importing failure-only reports
 python -m cube_control collect-openrouter --config /private/account-one.env --account-id account-one --account-name 'Account one'
 ```
 
+## Media job monitoring
+
+`GET /api/v1/jobs?account_id=<id>&limit=<1-200>` lists the managed media jobs, most recently updated first, with
+their version and an `attention` value: `provider_status_unverified` for a submitted job past its deadline, whose
+outcome at the provider is still unknown and whose reservation stays held, and `reservation_expired` for a
+reservation that ran out without a submission. `truncated` marks a longer list. The browser overview shows the
+same list under "Medienaufträge überwachen" and loads nothing else when the job database is unavailable. Nothing
+is inferred about the provider side; checking and finalizing a job remains an explicit command
+
 ## HeyGen account reader
 
 `collect-heygen --config /private/heygen.env` reads `HEYGEN_API_KEY` from a private
