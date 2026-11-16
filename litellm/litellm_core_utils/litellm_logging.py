@@ -4348,7 +4348,7 @@ def _get_masked_values(
     def _mask_value(v: Any) -> Any:
         if isinstance(v, dict):
             if _depth >= _max_depth:
-                return v
+                return "*****"
             return _get_masked_values(
                 v,
                 ignore_sensitive_values=ignore_sensitive_values,
@@ -4359,8 +4359,8 @@ def _get_masked_values(
                 _max_depth=_max_depth,
             )
         if not isinstance(v, str):
-            return v
-        if len(v) <= unmasked_length:
+            return "*****" if mask_all_values else v
+        if unmasked_length <= 0 or len(v) <= unmasked_length:
             return "*****"
         if number_of_asterisks is not None:
             return v[: unmasked_length // 2] + "*" * number_of_asterisks + v[-unmasked_length // 2 :]
@@ -4370,7 +4370,10 @@ def _get_masked_values(
         k: (
             v
             if ignore_sensitive_values
-            or not any(sensitive_keyword in k.lower() for sensitive_keyword in sensitive_keywords)
+            or (
+                not mask_all_values
+                and not any(sensitive_keyword in k.lower() for sensitive_keyword in sensitive_keywords)
+            )
             else _mask_value(v)
         )
         for k, v in sensitive_object.items()

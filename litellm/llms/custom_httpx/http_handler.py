@@ -616,8 +616,10 @@ class AsyncHTTPHandler:
         shared_session: Optional["ClientSession"] = None,
         transport: httpx.AsyncBaseTransport | None = None,
         follow_redirects: bool = True,
+        transport_wrapper: Callable[[httpx.AsyncBaseTransport], httpx.AsyncBaseTransport] | None = None,
     ):
         self.timeout = timeout
+        self.transport_wrapper = transport_wrapper
         self.event_hooks = event_hooks
         self.ssl_verify = ssl_verify
         self.shared_session = shared_session
@@ -648,6 +650,9 @@ class AsyncHTTPHandler:
         self._client = client
         self._owns_client = False
 
+    def _wrapped(self, transport: httpx.AsyncBaseTransport) -> httpx.AsyncBaseTransport:
+        return transport if self.transport_wrapper is None else self.transport_wrapper(transport)
+
     def create_client(
         self,
         timeout: float | httpx.Timeout | None,
@@ -657,7 +662,7 @@ class AsyncHTTPHandler:
     ) -> httpx.AsyncClient:
         if self.transport is not None:
             return httpx.AsyncClient(
-                transport=self.transport,
+                transport=self._wrapped(self.transport),
                 event_hooks=event_hooks,
                 timeout=timeout if timeout is not None else _DEFAULT_TIMEOUT,
                 headers=get_default_headers(),
@@ -676,18 +681,34 @@ class AsyncHTTPHandler:
             timeout = _DEFAULT_TIMEOUT
         # Create a client with a connection pool
 
-        transport: Final = AsyncHTTPHandler._create_async_transport(
+        created: Final = AsyncHTTPHandler._create_async_transport(
             ssl_context=ssl_config if isinstance(ssl_config, ssl.SSLContext) else None,
             ssl_verify=ssl_config if isinstance(ssl_config, bool) else None,
             shared_session=shared_session,
         )
+        # A wrapper needs a concrete transport; this is the one httpx would otherwise build itself.
+        transport: Final = (
+            AsyncHTTPTransport(verify=ssl_config, cert=cert, http2=http2_enabled())
+            if created is None and self.transport_wrapper is not None
+            else created
+        )
+        mounts: Final = AsyncHTTPHandler._create_httpx_proxy_mounts(transport, verify=ssl_config, cert=cert)
 
         # Get default headers (User-Agent, overridable via LITELLM_USER_AGENT)
         default_headers: Final = get_default_headers()
 
         return httpx.AsyncClient(
-            transport=transport,
-            mounts=AsyncHTTPHandler._create_httpx_proxy_mounts(transport, verify=ssl_config, cert=cert),
+            transport=self._wrapped(transport) if transport is not None else None,
+            mounts=(
+                MappingProxyType(
+                    {
+                        pattern: self._wrapped(mounted) if mounted is not None else None
+                        for pattern, mounted in mounts.items()
+                    }
+                )
+                if mounts is not None
+                else None
+            ),
             event_hooks=event_hooks,
             timeout=timeout,
             verify=ssl_config,

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from itertools import product
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType, ModuleType
@@ -15,6 +16,35 @@ from typing import Final, Protocol
 EXPECTED_PYTHON_TAG: Final = "cp310"
 EXPECTED_ABI_TAG: Final = "abi3"
 EXPECTED_PLATFORM_TAG: Final = "linux_x86_64"
+
+
+@dataclass(frozen=True, slots=True)
+class LinuxPlatform:
+    glibc: tuple[int, int, int] | None
+
+
+def _linux_platform(tag: str) -> LinuxPlatform | None:
+    """Platform definitions: https://peps.python.org/pep-0600/ (checked 2026-10-31)."""
+    if tag == EXPECTED_PLATFORM_TAG:
+        return LinuxPlatform(glibc=None)
+    legacy: Final = MappingProxyType(
+        {
+            "manylinux1_x86_64": (2, 5, 0),
+            "manylinux2010_x86_64": (2, 12, 0),
+            "manylinux2014_x86_64": (2, 17, 0),
+        }
+    )
+    if tag in legacy:
+        return LinuxPlatform(glibc=legacy[tag])
+    match: Final = re.fullmatch(r"manylinux_([0-9]+)_([0-9]+)_x86_64", tag)
+    if match is None:
+        return None
+    return LinuxPlatform(glibc=(int(match[1]), int(match[2]), 0))
+
+
+def _glibc_version(value: str) -> tuple[int, int, int]:
+    parts: Final = tuple(int(part) for part in value.split("."))
+    return parts[0], parts[1], parts[2] if len(parts) == 3 else 0
 
 
 class CommandRunner(Protocol):
@@ -149,6 +179,23 @@ def main(
         len(wheel_metadata_tags) == len(expanded_filename_tags)
         and frozenset(wheel_metadata_tags) == expanded_filename_tags
     )
+    platforms: Final = tuple(_linux_platform(tag) for tag in platform_tag.split("."))
+    platforms_supported: Final = all(platform is not None for platform in platforms)
+    version_info: Final = run_command(
+        ("readelf", "--version-info", "--wide", str(native_path)),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    glibc_requirements: Final = tuple(
+        _glibc_version(match[1]) for match in re.finditer(r"\bGLIBC_([0-9]+\.[0-9]+(?:\.[0-9]+)?)\b", version_info)
+    )
+    required_glibc: Final = max(glibc_requirements, default=None)
+    glibc_compatible: Final = all(
+        platform is None or platform.glibc is None or (required_glibc is not None and required_glibc <= platform.glibc)
+        for platform in platforms
+    )
+    glibc_description: Final = ".".join(str(part) for part in required_glibc) if required_glibc else "unavailable"
     commit_sha: Final = resolved_environment.get(
         "RELEASE_WHEEL_COMMIT_SHA", resolved_environment.get("GITHUB_SHA", "unknown")
     )
@@ -177,6 +224,7 @@ def main(
             f"| Python ABI | `{python_tag}-{abi_tag}` |",
             f"| Rust compiler | `{rustc_version}` |",
             f"| Maturin | `{maturin_version}` |",
+            f"| ELF glibc requirement | `{glibc_description}` |",
             "| Cargo profile | `release` |",
             "",
             "| Artifact | Size |",
@@ -219,7 +267,8 @@ def main(
     validations: Final = (
         (f"Python tag is {EXPECTED_PYTHON_TAG}", python_tag == EXPECTED_PYTHON_TAG),
         (f"ABI tag is {EXPECTED_ABI_TAG}", abi_tag == EXPECTED_ABI_TAG),
-        (f"Platform tag is {EXPECTED_PLATFORM_TAG}", platform_tag == EXPECTED_PLATFORM_TAG),
+        ("Platform tags describe Linux x86_64", platforms_supported),
+        ("Manylinux tags cover the measured glibc requirement", glibc_compatible),
         ("Wheel dist-info directory matches the filename", dist_info_directories == expected_dist_info_directories),
         (
             "Required dist-info files are present exactly once",
@@ -257,8 +306,12 @@ def main(
             ),
             (abi_tag != EXPECTED_ABI_TAG, f"unexpected ABI tag: expected {EXPECTED_ABI_TAG}, found {abi_tag}"),
             (
-                platform_tag != EXPECTED_PLATFORM_TAG,
-                f"unexpected platform tag: expected {EXPECTED_PLATFORM_TAG}, found {platform_tag}",
+                not platforms_supported,
+                f"unexpected platform tag: expected Linux x86_64, found {platform_tag}",
+            ),
+            (
+                not glibc_compatible,
+                f"manylinux tag does not cover the measured glibc requirement: {glibc_description}",
             ),
             (
                 dist_info_directories != expected_dist_info_directories,

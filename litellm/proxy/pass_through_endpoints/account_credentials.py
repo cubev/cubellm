@@ -1,0 +1,443 @@
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from ipaddress import ip_address
+from itertools import chain
+from types import MappingProxyType
+from typing import Annotated, Final, Literal
+from urllib.parse import urlsplit
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from typing_extensions import Self
+
+from litellm.models.credentials import CredentialItem
+
+from .account_resources import AccountResourceType, is_resource_template, template_segment, validate_resource_types
+from .mtls_credentials import MTLSCredentialAuth, validate_tls_material
+from .oauth_credentials import OAuthClientCredentialsAuth
+from .query_credentials import QueryCredentialAuth
+from .sigv4_credentials import SigV4CredentialAuth
+
+Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
+
+
+class CredentialHeader(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    name: Annotated[str, Field(pattern=r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$")]
+    field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    prefix: Annotated[str, Field(pattern=r"^[ -~]{0,32}$")] = ""
+
+    @model_validator(mode="after")
+    def validate_header(self) -> Self:
+        if self.name.lower() in {
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "proxy-authorization",
+            "content-type",
+            "traceparent",
+            "tracestate",
+            "baggage",
+            "accept-encoding",
+        }:
+            raise ValueError("Credential header cannot control HTTP routing or framing")
+        return self
+
+
+class CredentialSigV4(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    region: Annotated[str, Field(pattern=r"^[a-z]{2}(-[a-z0-9]+)+-[0-9]{1,2}$")]
+    service: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+    access_key_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    secret_key_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    session_token_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")] | None = None
+
+
+class CredentialOAuth(BaseModel):
+    """OAuth 2.0 client credentials grant; the token endpoint must be an allowed origin of the credential."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    token_url: Annotated[str, Field(min_length=1, max_length=2048)]
+    client_id_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    client_secret_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    scope: (
+        Annotated[str, Field(pattern=r"^[\x21\x23-\x5b\x5d-\x7e]+( [\x21\x23-\x5b\x5d-\x7e]+)*$", max_length=1024)]
+        | None
+    ) = None
+    client_authentication: Literal["client_secret_basic", "client_secret_post"] = "client_secret_basic"
+
+    @model_validator(mode="after")
+    def validate_endpoint(self) -> Self:
+        _validate_account_target(self.token_url)
+        return self
+
+
+class CredentialTLS(BaseModel):
+    """Client certificate (mTLS) presented on the provider connection; the PEM values come from the credential."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    certificate_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    private_key_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    ca_certificate_field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")] | None = None
+
+
+class CredentialQuery(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    name: Annotated[str, Field(pattern=r"^[A-Za-z0-9._~-]{1,128}$")]
+    field: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    prefix: Annotated[str, Field(pattern=r"^[ -~]{0,32}$")] = ""
+
+
+class AccountApplicationGrant(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    application_id: Identifier
+    key_hash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    account_id: Identifier
+    path: Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^/[A-Za-z0-9._~!$&'()+,;=:@/{}-]*$")]
+    methods: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[!#$%&'+.^_`|~0-9A-Z-]{1,32}$")], ...],
+        Field(min_length=1, max_length=16),
+    ]
+
+    @model_validator(mode="after")
+    def validate_grant(self) -> Self:
+        templated: Final = "{" in self.path or "}" in self.path
+        if templated and not is_resource_template(self.path):
+            raise ValueError("Application resource grants require one whole {resource_id} segment")
+        if "//" in self.path or any(segment in {".", ".."} for segment in self.path.split("/")):
+            raise ValueError("Application grants require exact canonical paths")
+        if len(set(self.methods)) != len(self.methods):
+            raise ValueError("Application grant methods must be unique")
+        return self
+
+
+class AccountHeaderCredential(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    account_id: Identifier
+    credential_name: Annotated[str, Field(min_length=1, max_length=256, pattern=r"^[^\r\n\x00]+$")]
+    headers: Annotated[tuple[CredentialHeader, ...], Field(max_length=8)] = ()
+    query: CredentialQuery | None = None
+    sigv4: CredentialSigV4 | None = None
+    oauth: CredentialOAuth | None = None
+    mtls: CredentialTLS | None = None
+    allowed_query_parameters: tuple[Annotated[str, Field(min_length=1, max_length=128)], ...] = ()
+    application_grants: Annotated[tuple[AccountApplicationGrant, ...], Field(max_length=256)] = ()
+    resource_types: Annotated[tuple[AccountResourceType, ...], Field(max_length=16)] = ()
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> Self:
+        if not self.headers and self.query is None and self.sigv4 is None and self.oauth is None and self.mtls is None:
+            raise ValueError("Account credentials need a header, query parameter, SigV4, OAuth or mTLS destination")
+        if self.sigv4 is not None and (self.headers or self.query is not None or self.oauth is not None):
+            raise ValueError("SigV4 account credentials cannot be combined with other credential destinations")
+        if self.oauth is not None and (self.headers or self.query is not None):
+            raise ValueError("OAuth account credentials cannot be combined with other credential destinations")
+        if self.query is not None and any(
+            name.casefold() == self.query.name.casefold() for name in self.allowed_query_parameters
+        ):
+            raise ValueError("The credential query parameter cannot also be a client query parameter")
+        if any(grant.account_id != self.account_id for grant in self.application_grants):
+            raise ValueError("Application grant account must match its credential policy")
+        templates: Final = frozenset(chain.from_iterable(resource.item_paths for resource in self.resource_types))
+        if any(
+            grant.path not in templates if is_resource_template(grant.path) else _covered(templates, grant.path)
+            for grant in self.application_grants
+        ):
+            raise ValueError("Resource grants must name a declared item path; concrete grants cannot cover one")
+        if len({header.name.lower() for header in self.headers}) != len(self.headers):
+            raise ValueError("Credential headers must be unique")
+        if len(set(self.allowed_query_parameters)) != len(self.allowed_query_parameters):
+            raise ValueError("Allowed query parameters must be unique")
+        if any(
+            name.casefold() in {"key", "api_key", "api-key", "token", "access_token", "authorization"}
+            for name in self.allowed_query_parameters
+        ):
+            raise ValueError("Header credential routes cannot accept query credentials")
+        return self
+
+
+def _covered(templates: frozenset[str], path: str) -> bool:
+    return any(template_segment(template, path) is not None for template in templates)
+
+
+def validate_account_resources(path: str, include_subpath: bool, policy: AccountHeaderCredential) -> None:
+    validate_resource_types(path, include_subpath, policy.resource_types)
+
+
+def account_application_allowed(
+    policy: AccountHeaderCredential,
+    application_id: str | None,
+    key_hash: str | None,
+    path: str,
+    method: str,
+) -> bool:
+    return (
+        application_id is not None
+        and key_hash is not None
+        and any(
+            grant.application_id == application_id
+            and grant.key_hash == key_hash
+            and grant.account_id == policy.account_id
+            and grant.path == path
+            and not is_resource_template(grant.path)
+            and method in grant.methods
+            for grant in policy.application_grants
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AccountRouteBinding:
+    account_id: str
+    credential_name: str
+    origin: str | None = None
+    provider: str | None = None
+
+
+class CredentialAccountInfo(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    cube_account_id: Identifier
+    cube_provider_id: Annotated[str, Field(pattern=r"^[a-z](?:[a-z0-9_-]{0,62}[a-z0-9])?$")] | None = None
+    cube_allowed_origins: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+def credential_origin(value: str, origin_only: bool = False) -> str:
+    try:
+        parsed: Final = httpx.URL(value)
+    except httpx.InvalidURL:
+        raise ValueError("Credential origin is invalid") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.host
+        or parsed.userinfo
+        or parsed.query
+        or parsed.fragment
+        or (origin_only and parsed.path not in {"", "/"})
+    ):
+        raise ValueError("Credential origins must be explicit HTTP origins")
+    return parsed.scheme + "://" + parsed.netloc.decode("ascii")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedAccountCredential:
+    binding: AccountRouteBinding
+    headers: Mapping[str, str] = field(repr=False)
+    outbound: QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | MTLSCredentialAuth | None = (
+        field(default=None, repr=False)
+    )
+    header_secrets: tuple[str, ...] = field(default=(), repr=False)
+
+
+WEBSOCKET_METHOD: Final = "WEBSOCKET"
+_HTTP_FORM: Final = MappingProxyType({"ws": "http", "wss": "https"})
+
+
+def http_form(target: str) -> str:
+    """The HTTP URL a WebSocket target is checked as: same authority, ws -> http and wss -> https."""
+    parsed: Final = urlsplit(target)
+    scheme: Final = _HTTP_FORM.get(parsed.scheme)
+    return target if scheme is None else parsed._replace(scheme=scheme).geturl()
+
+
+def is_websocket_route(methods: Sequence[str] | None) -> bool:
+    return methods is not None and WEBSOCKET_METHOD in methods
+
+
+def _validate_account_target(target: str) -> None:
+    parsed: Final = urlsplit(http_form(target))
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or (parsed.port is not None and not 1 <= parsed.port <= 65535)
+    ):
+        raise ValueError("Account credential routes require an HTTP origin without user information")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Account credential route targets cannot contain query parameters or fragments")
+    if parsed.scheme == "http":
+        try:
+            loopback: Final = ip_address(parsed.hostname).is_loopback
+        except ValueError:
+            raise ValueError("Account credential routes require HTTPS outside literal loopback") from None
+        if not loopback:
+            raise ValueError("Account credential routes require HTTPS outside literal loopback")
+
+
+def validate_account_route(
+    target: str,
+    auth: bool,
+    forward_headers: bool | None,
+    configured_headers: Mapping[str, object],
+    default_query_params: Mapping[str, object] | None,
+    policy: AccountHeaderCredential,
+    methods: Sequence[str] | None = None,
+) -> None:
+    _validate_account_target(target)
+    websocket: Final = is_websocket_route(methods)
+    if websocket != (urlsplit(target).scheme in _HTTP_FORM):
+        raise ValueError("WebSocket account routes need a ws or wss target, other routes an HTTP target")
+    if websocket and (
+        tuple(methods or ()) != (WEBSOCKET_METHOD,)
+        or policy.query is not None
+        or policy.sigv4 is not None
+        or policy.oauth is not None
+        or policy.mtls is not None
+        or policy.resource_types
+        or not policy.headers
+    ):
+        raise ValueError("WebSocket account routes use only the WEBSOCKET method and header credentials")
+    if not auth or forward_headers:
+        raise ValueError("Account credential routes require gateway authentication and restricted forwarding")
+    if default_query_params and not set(default_query_params).issubset(policy.allowed_query_parameters):
+        raise ValueError("Default query parameters must be explicitly allowed")
+    configured: Final = frozenset(name.lower() for name in configured_headers)
+    if configured.intersection({"host", "content-length", "transfer-encoding", "connection", "proxy-authorization"}):
+        raise ValueError("Account route headers cannot control HTTP routing or framing")
+    if any(header.name.lower() in configured for header in policy.headers):
+        raise ValueError("Inline headers cannot shadow a named account credential")
+    if policy.sigv4 is not None and any(name == "authorization" or name.startswith("x-amz-") for name in configured):
+        raise ValueError("Inline headers cannot shadow a SigV4 signature")
+    if policy.mtls is not None and urlsplit(target).scheme != "https":
+        raise ValueError("Client certificate account routes need an HTTPS target")
+    if policy.oauth is not None and "authorization" in configured:
+        raise ValueError("Inline headers cannot shadow an OAuth access token")
+    if not methods or any(re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Z-]{1,32}", method) is None for method in methods):
+        raise ValueError("Account credential routes require explicit HTTP methods")
+
+
+def validate_account_request(
+    policy: AccountHeaderCredential,
+    headers: Mapping[str, str],
+    query_names: tuple[str, ...],
+) -> None:
+    if any(name.lower().startswith("x-pass-") for name in headers):
+        raise ValueError("Account credential routes do not accept client header overrides")
+    if policy.query is not None and any(name.casefold() == policy.query.name.casefold() for name in query_names):
+        raise ValueError("Clients cannot supply the account credential query parameter")
+    if not set(query_names).issubset(policy.allowed_query_parameters):
+        raise ValueError("Account credential route query parameter is not allowed")
+
+
+class _CredentialPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+    credential_info: CredentialAccountInfo
+    credential_values: Mapping[str, object]
+
+
+def resolve_account_credential(
+    policy: AccountHeaderCredential,
+    credential: CredentialItem | None,
+    target: str,
+) -> ResolvedAccountCredential:
+    if credential is None or credential.credential_name != policy.credential_name:
+        raise ValueError("Named account credential is unavailable")
+    payload: Final = _CredentialPayload.model_validate(credential, from_attributes=True)
+    info: Final = payload.credential_info
+    if info.cube_account_id != policy.account_id:
+        raise ValueError("Named credential account does not match route account")
+    origin: Final = credential_origin(http_form(target))
+    if origin not in tuple(credential_origin(value, origin_only=True) for value in info.cube_allowed_origins):
+        raise ValueError("Named account credential is not allowed for this origin")
+    allowed_origins: Final = tuple(credential_origin(value, origin_only=True) for value in info.cube_allowed_origins)
+    if policy.oauth is not None and credential_origin(policy.oauth.token_url) not in allowed_origins:
+        raise ValueError("OAuth token endpoint is not an allowed origin of the named credential")
+    values: Final = MappingProxyType(payload.credential_values)
+
+    def bare_secret(name: str) -> str:
+        raw: Final = values.get(name)
+        text: Final = raw.get_secret_value() if isinstance(raw, SecretStr) else raw
+        from litellm.secret_managers.main import get_secret_str
+
+        value: Final = get_secret_str(text) if isinstance(text, str) and text.startswith("os.environ/") else text
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(ord(character) < 32 or ord(character) > 126 for character in value)
+        ):
+            raise ValueError("Named account credential field is unavailable or invalid")
+        return value
+
+    header_secrets: Final = tuple(bare_secret(header.field) for header in policy.headers)
+    return ResolvedAccountCredential(
+        binding=AccountRouteBinding(
+            account_id=policy.account_id,
+            credential_name=credential.credential_name,
+            origin=origin,
+            provider=info.cube_provider_id,
+        ),
+        headers=MappingProxyType(
+            {header.name: header.prefix + secret for header, secret in zip(policy.headers, header_secrets, strict=True)}
+        ),
+        header_secrets=header_secrets,
+        outbound=_with_tls(
+            policy.mtls,
+            values,
+            (
+                _query_auth(policy.query, bare_secret(policy.query.field))
+                if policy.query is not None
+                else _sigv4_auth(policy.sigv4, bare_secret)
+                if policy.sigv4 is not None
+                else _oauth_auth(policy.oauth, bare_secret)
+                if policy.oauth is not None
+                else None
+            ),
+        ),
+    )
+
+
+def _query_auth(destination: CredentialQuery, secret: str) -> QueryCredentialAuth:
+    return QueryCredentialAuth(destination.name, destination.prefix + secret, secret)
+
+
+def _sigv4_auth(destination: CredentialSigV4, secret: Callable[[str], str]) -> SigV4CredentialAuth:
+    return SigV4CredentialAuth(
+        destination.region,
+        destination.service,
+        secret(destination.access_key_field),
+        secret(destination.secret_key_field),
+        secret(destination.session_token_field) if destination.session_token_field is not None else None,
+    )
+
+
+def _oauth_auth(destination: CredentialOAuth, secret: Callable[[str], str]) -> OAuthClientCredentialsAuth:
+    return OAuthClientCredentialsAuth(
+        destination.token_url,
+        secret(destination.client_id_field),
+        secret(destination.client_secret_field),
+        destination.scope,
+        destination.client_authentication,
+    )
+
+
+def _pem(values: Mapping[str, object], name: str) -> str:
+    raw: Final = values.get(name)
+    text: Final = raw.get_secret_value() if isinstance(raw, SecretStr) else raw
+    from litellm.secret_managers.main import get_secret_str
+
+    value: Final = get_secret_str(text) if isinstance(text, str) and text.startswith("os.environ/") else text
+    if (
+        not isinstance(value, str)
+        or not 0 < len(value) <= 64 * 1024
+        or any(not (32 <= ord(character) <= 126 or character in "\r\n") for character in value)
+    ):
+        raise ValueError("Named account credential field is unavailable or invalid")
+    return value
+
+
+def _with_tls(
+    destination: CredentialTLS | None,
+    values: Mapping[str, object],
+    outbound: QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | None,
+) -> QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | MTLSCredentialAuth | None:
+    if destination is None:
+        return outbound
+    private_key: Final = _pem(values, destination.private_key_field)
+    key: Final = validate_tls_material(
+        _pem(values, destination.certificate_field),
+        private_key,
+        _pem(values, destination.ca_certificate_field) if destination.ca_certificate_field is not None else None,
+    )
+    return MTLSCredentialAuth(key, outbound, private_key)

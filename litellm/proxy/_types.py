@@ -27,6 +27,12 @@ from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
     validate_langfuse_span_scope_value,
     validate_no_callback_env_reference,
 )
+from litellm.proxy.pass_through_endpoints.account_credentials import (
+    AccountHeaderCredential,
+    is_websocket_route,
+    validate_account_resources,
+    validate_account_route,
+)
 from litellm.types.agents import AgentCaller
 from litellm.types.integrations.compression_interception import (
     CompressionSavingsMetadata,
@@ -695,6 +701,13 @@ class LiteLLMRoutes(enum.Enum):
 
     management_routes = (
         [
+            "/cube_control/capabilities",
+            "/cube_control/account_inventory",
+            "/cube_control/account_routes",
+            "/cube_control/account_routes/{route_id}",
+            "/cube_control/account_routes/{route_id}/grants",
+            "/cube_control/account_routes/{route_id}/resources",
+            "/cube_control/account_routes/{route_id}/resources/{resource_type}/{resource_id}",
             # user
             "/user/new",
             "/management/v1/users/bulk",
@@ -2435,6 +2448,25 @@ PassThroughGuardrailsConfig = dict[str, PassThroughGuardrailSettings | None]
 
 
 class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
+    account_credential: AccountHeaderCredential | None = None
+
+    @model_validator(mode="after")
+    def require_authenticated_account_route(self) -> "PassThroughGenericEndpoint":
+        if self.account_credential is not None:
+            validate_account_route(
+                self.target,
+                self.auth,
+                False,
+                self.headers,
+                self.default_query_params,
+                self.account_credential,
+                self.methods,
+            )
+            validate_account_resources(self.path, self.include_subpath, self.account_credential)
+            if self.include_subpath and is_websocket_route(self.methods):
+                raise ValueError("WebSocket account routes cannot forward subpaths")
+        return self
+
     id: str | None = Field(
         default=None,
         description="Optional unique identifier for the pass-through endpoint. If not provided, endpoints will be identified by path for backwards compatibility.",
@@ -4052,6 +4084,12 @@ class SpendLogsRouterMetadata(TypedDict):
 
 
 class SpendLogsMetadata(TypedDict):
+    provider_account_provider: NotRequired[ReadOnly[str | None]]
+    provider_origin: NotRequired[ReadOnly[str | None]]
+    provider_account_id: NotRequired[ReadOnly[str | None]]
+    provider_account_source: NotRequired[ReadOnly[Literal["configured_credential"] | None]]
+    provider_cost_status: NotRequired[ReadOnly[Literal["unverified"] | None]]
+    user_api_key_application_id: NotRequired[ReadOnly[str | None]]
     autorouter_baseline_observation: ReadOnly[str | None]
     """
     Specific metadata k,v pairs logged to spendlogs for easier cost tracking

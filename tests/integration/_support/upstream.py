@@ -11,9 +11,11 @@ import zlib
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from queue import SimpleQueue
 from typing import Final, cast
+from urllib.parse import parse_qsl
 
 import httpx
 import uvicorn
@@ -34,7 +36,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
 CASES_FILE: Final = Path(__file__).resolve().parents[1] / "cost_calculation" / "cost_tracking_cases.json"
@@ -64,6 +66,17 @@ class Observation:
     path: str
     authorization: str
     body: dict[str, JsonValue]
+    query: str = ""
+    signed: tuple[tuple[str, str], ...] = ()
+    raw: str = ""
+
+
+def signed_parts(request: Request, raw_body: bytes) -> tuple[tuple[tuple[str, str], ...], str]:
+    authorization: Final = request.headers.get("authorization", "")
+    if not authorization.startswith("AWS4-HMAC-SHA256 "):
+        return (), ""
+    names: Final = authorization.split("SignedHeaders=", 1)[1].split(",", 1)[0].split(";")
+    return tuple((name, request.headers.get(name, "")) for name in names), raw_body.decode()
 
 
 class _ScenarioRegistration(BaseModel):
@@ -89,9 +102,12 @@ def _aws_event_frame(
     scenario_id: str,
     unique_id: str,
 ) -> bytes:
-    payload_bytes: Final = json.dumps(payload, separators=(",", ":")).replace(
-        "$REQUEST_ID", scenario_id
-    ).replace("$UNIQUE_ID", unique_id).encode()
+    payload_bytes: Final = (
+        json.dumps(payload, separators=(",", ":"))
+        .replace("$REQUEST_ID", scenario_id)
+        .replace("$UNIQUE_ID", unique_id)
+        .encode()
+    )
     headers_bytes: Final = (
         _aws_str_header(":event-type", event_type)
         + _aws_str_header(":content-type", "application/json")
@@ -147,7 +163,13 @@ class Provider:
             status: Final = script.popleft()
             if status != 200:
                 return JSONResponse(
-                    {"error": {"message": "Controlled provider failure", "type": error_type(status), "code": str(status)}},
+                    {
+                        "error": {
+                            "message": "Controlled provider failure",
+                            "type": error_type(status),
+                            "code": str(status),
+                        }
+                    },
                     status_code=status,
                 )
         return await chat_completions(request)
@@ -198,7 +220,10 @@ class Provider:
         return JSONResponse(
             {
                 "requests": [
-                    {"path": value.path, "authorization": value.authorization, "body": value.body} for value in values
+                    {"path": value.path, "authorization": value.authorization, "body": value.body}
+                    | ({"query": value.query} if value.query else {})
+                    | ({"signed": [list(pair) for pair in value.signed], "raw": value.raw} if value.signed else {})
+                    for value in values
                 ]
             }
         )
@@ -239,13 +264,25 @@ class Provider:
         response: Final = self.scenario_store.get(scenario_id)
         if response is None:
             return JSONResponse({"error": "Unknown scenario"}, status_code=404)
+        if request.method == "POST" and request.headers.get("content-type", "") == "application/x-www-form-urlencoded":
+            # Token requests (OAuth client credentials) are recorded with their form fields and Basic authorization.
+            form: Final = dict(parse_qsl((await request.body()).decode(), keep_blank_values=True))
+            self.observations.put(
+                Observation(request.url.path, request.headers.get("authorization", ""), dict(form), request.url.query)
+            )
         if request.method == "POST" and "json" in request.headers.get("content-type", ""):
             raw_body: Final = await request.body()
             if raw_body:
                 body: Final = JSON_OBJECT.validate_json(raw_body)
                 if isinstance(body, dict):
                     self.observations.put(
-                        Observation(request.url.path, request.headers.get("authorization", ""), body)
+                        Observation(
+                            request.url.path,
+                            request.headers.get("authorization", ""),
+                            body,
+                            request.url.query,
+                            *signed_parts(request, raw_body),
+                        )
                     )
         if isinstance(response, RoutedResponse):
             route_key: Final = f"{request.method} /{'/'.join(segments[1:])}"
@@ -261,6 +298,27 @@ class Provider:
                 return JSONResponse({"error": "Unknown scripted route"}, status_code=404)
             return self._response(route, scenario_id)
         return self._response(response, scenario_id)
+
+    async def websocket_echo(self, websocket: WebSocket) -> None:
+        """Reports the handshake it received (authorization, query, a client-only header), then echoes text frames.
+
+        The digest lets a test prove which credential arrived even when the gateway redacts the echoed value.
+        """
+        authorization: Final = websocket.headers.get("authorization", "")
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "authorization": authorization,
+                "authorization_sha256": sha256(authorization.encode()).hexdigest(),
+                "query": websocket.url.query,
+                "client_header": websocket.headers.get("x-integration-client", ""),
+            }
+        )
+        try:
+            while True:
+                await websocket.send_text(await websocket.receive_text())
+        except WebSocketDisconnect:
+            return
 
     async def realtime(self, websocket: WebSocket) -> None:
         scenario_id: Final = websocket.headers.get("authorization", "").removeprefix("Bearer ")
@@ -300,11 +358,10 @@ class Provider:
         match response:
             case JsonResponse():
                 return Response(
-                    content=json.dumps(response.body, separators=(",", ":")).replace(
-                        "$REQUEST_ID", scenario_id
-                    ).replace(
-                        "$UNIQUE_ID", unique_id
-                    ).encode(),
+                    content=json.dumps(response.body, separators=(",", ":"))
+                    .replace("$REQUEST_ID", scenario_id)
+                    .replace("$UNIQUE_ID", unique_id)
+                    .encode(),
                     media_type=response.content_type,
                     status_code=response.status,
                 )
@@ -321,6 +378,7 @@ class Provider:
                 )
             case SseResponse():
                 if response.frame_delay_ms > 0:
+
                     async def stream() -> AsyncIterator[bytes]:
                         for frame in response.frames:
                             yield (
@@ -329,9 +387,11 @@ class Provider:
                             await asyncio.sleep(response.frame_delay_ms / 1000)
 
                     return StreamingResponse(stream(), media_type=response.content_type)
-                stream_body: Final = ("\n\n".join(response.frames) + "\n\n").replace(
-                    "$REQUEST_ID", scenario_id
-                ).replace("$UNIQUE_ID", unique_id)
+                stream_body: Final = (
+                    ("\n\n".join(response.frames) + "\n\n")
+                    .replace("$REQUEST_ID", scenario_id)
+                    .replace("$UNIQUE_ID", unique_id)
+                )
                 return Response(content=stream_body.encode(), media_type=response.content_type)
             case EventStreamResponse():
                 events: Final = (
@@ -375,6 +435,7 @@ class Provider:
                 Route("/{path:path}", self.scripted, methods=["POST"]),
                 Route("/{path:path}", self.scripted, methods=["GET"]),
                 WebSocketRoute("/v1/realtime", self.realtime),
+                WebSocketRoute("/__ws_echo/{path:path}", self.websocket_echo),
             ]
         )
 
@@ -414,11 +475,29 @@ def delete_scenario(handle: ScenarioHandle) -> None:
     response.raise_for_status()
 
 
+async def _serve(port: int) -> None:
+    # The client certificate provider listens next to the plain port; its material is served by /__tls.
+    from integration._support.tls_upstream import TlsProvider
+
+    tls: Final = TlsProvider(port + 1)
+    provider: Final = Provider()
+    application: Final = provider.app()
+
+    async def material(_request: Request) -> Response:
+        return JSONResponse(tls.material())
+
+    application.router.routes.insert(0, Route("/__tls", material, methods=["GET"]))
+    server: Final = uvicorn.Server(
+        uvicorn.Config(application, host="127.0.0.1", port=port, access_log=False, timeout_keep_alive=120)
+    )
+    _ = await asyncio.gather(server.serve(), tls.serve())
+
+
 def main() -> None:
     parser: Final = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8190)
     arguments: Final = parser.parse_args()
-    uvicorn.run(Provider().app(), host="127.0.0.1", port=cast(int, arguments.port), access_log=False)
+    asyncio.run(_serve(cast(int, arguments.port)))
 
 
 if __name__ == "__main__":

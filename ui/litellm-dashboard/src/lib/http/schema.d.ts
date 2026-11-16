@@ -3705,6 +3705,125 @@ export interface paths {
         patch: operations["update_credential_credentials__credential_name__patch"];
         trace?: never;
     };
+    "/cube_control/account_inventory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cube Control Account Inventory */
+        get: operations["cube_control_account_inventory_cube_control_account_inventory_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cube_control/account_routes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cube Control Create Account Route */
+        post: operations["cube_control_create_account_route_cube_control_account_routes_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cube_control/account_routes/{route_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cube Control Account Route */
+        get: operations["cube_control_account_route_cube_control_account_routes__route_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cube_control/account_routes/{route_id}/grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cube Control Append Account Grant */
+        post: operations["cube_control_append_account_grant_cube_control_account_routes__route_id__grants_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cube_control/account_routes/{route_id}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cube Control Adopt Account Resource */
+        post: operations["cube_control_adopt_account_resource_cube_control_account_routes__route_id__resources_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cube_control/account_routes/{route_id}/resources/{resource_type}/{resource_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cube Control Account Resource */
+        get: operations["cube_control_account_resource_cube_control_account_routes__route_id__resources__resource_type___resource_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cube_control/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cube Control Capabilities */
+        get: operations["cube_control_capabilities_cube_control_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cursor/chat/completions": {
         parameters: {
             query?: never;
@@ -23829,6 +23948,159 @@ export interface components {
             /** Description */
             description?: string | null;
         };
+        /** AccountApplicationGrant */
+        AccountApplicationGrant: {
+            /** Account Id */
+            account_id: string;
+            /** Application Id */
+            application_id: string;
+            /** Key Hash */
+            key_hash: string;
+            /** Methods */
+            methods: string[];
+            /** Path */
+            path: string;
+        };
+        /** AccountGrantCommand */
+        AccountGrantCommand: {
+            /** Expected Fingerprint */
+            expected_fingerprint: string;
+            grant: components["schemas"]["AccountApplicationGrant"];
+        };
+        /** AccountGrantReceipt */
+        AccountGrantReceipt: {
+            /**
+             * Enforcement
+             * @default not_verified
+             * @constant
+             */
+            enforcement: "not_verified";
+            route: components["schemas"]["AccountRouteDescriptor"];
+            /**
+             * Stored
+             * @default true
+             * @constant
+             */
+            stored: true;
+        };
+        /** AccountHeaderCredential */
+        AccountHeaderCredential: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Allowed Query Parameters
+             * @default []
+             */
+            allowed_query_parameters: string[];
+            /**
+             * Application Grants
+             * @default []
+             */
+            application_grants: components["schemas"]["AccountApplicationGrant"][];
+            /** Credential Name */
+            credential_name: string;
+            /**
+             * Headers
+             * @default []
+             */
+            headers: components["schemas"]["CredentialHeader"][];
+            mtls?: components["schemas"]["CredentialTLS"] | null;
+            oauth?: components["schemas"]["CredentialOAuth"] | null;
+            query?: components["schemas"]["CredentialQuery"] | null;
+            /**
+             * Resource Types
+             * @default []
+             */
+            resource_types: components["schemas"]["AccountResourceType"][];
+            sigv4?: components["schemas"]["CredentialSigV4"] | null;
+        };
+        /** AccountResourceReceipt */
+        AccountResourceReceipt: {
+            /**
+             * Enforcement
+             * @default not_verified
+             * @constant
+             */
+            enforcement: "not_verified";
+            /** Inserted */
+            inserted: boolean;
+            ownership: components["schemas"]["ResourceOwnership"];
+            /**
+             * Stored
+             * @default true
+             * @constant
+             */
+            stored: true;
+        };
+        /** AccountResourceType */
+        AccountResourceType: {
+            creation?: components["schemas"]["ResourceCreation"] | null;
+            /** Item Paths */
+            item_paths: string[];
+            /** Name */
+            name: string;
+        };
+        /** AccountRouteCreateCommand */
+        AccountRouteCreateCommand: {
+            route: components["schemas"]["AccountRouteDefinition"];
+        };
+        /** AccountRouteDefinition */
+        AccountRouteDefinition: {
+            account_credential: components["schemas"]["AccountHeaderCredential"];
+            /** Id */
+            id: string;
+            /**
+             * Include Subpath
+             * @default false
+             */
+            include_subpath: boolean;
+            /** Methods */
+            methods: string[];
+            /** Path */
+            path: string;
+            /** Target */
+            target: string;
+        };
+        /** AccountRouteDescriptor */
+        AccountRouteDescriptor: {
+            /** Account Id */
+            account_id: string;
+            /** Fingerprint */
+            fingerprint: string;
+            /** Grants */
+            grants: components["schemas"]["AccountApplicationGrant"][];
+            /**
+             * Include Subpath
+             * @default false
+             */
+            include_subpath: boolean;
+            /** Methods */
+            methods: string[];
+            /** Origin */
+            origin: string;
+            /** Path */
+            path: string;
+            /** Route Id */
+            route_id: string;
+        };
+        /** AccountRouteReceipt */
+        AccountRouteReceipt: {
+            /** Created */
+            created: boolean;
+            /**
+             * Enforcement
+             * @default not_verified
+             * @constant
+             */
+            enforcement: "not_verified";
+            route: components["schemas"]["AccountRouteDescriptor"];
+            /**
+             * Stored
+             * @default true
+             * @constant
+             */
+            stored: true;
+        };
         /**
          * AcknowledgedSafetyCheck
          * @description A pending safety check for the computer call.
@@ -29301,6 +29573,18 @@ export interface components {
         CreateSearchToolRequest: {
             search_tool: components["schemas"]["SearchTool"];
         };
+        /** CredentialHeader */
+        CredentialHeader: {
+            /** Field */
+            field: string;
+            /** Name */
+            name: string;
+            /**
+             * Prefix
+             * @default
+             */
+            prefix: string;
+        };
         /** CredentialItem */
         CredentialItem: {
             /** Credential Info */
@@ -29313,6 +29597,184 @@ export interface components {
             credential_values: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * CredentialOAuth
+         * @description OAuth 2.0 client credentials grant; the token endpoint must be an allowed origin of the credential.
+         */
+        CredentialOAuth: {
+            /**
+             * Client Authentication
+             * @default client_secret_basic
+             * @enum {string}
+             */
+            client_authentication: "client_secret_basic" | "client_secret_post";
+            /** Client Id Field */
+            client_id_field: string;
+            /** Client Secret Field */
+            client_secret_field: string;
+            /** Scope */
+            scope?: string | null;
+            /** Token Url */
+            token_url: string;
+        };
+        /** CredentialQuery */
+        CredentialQuery: {
+            /** Field */
+            field: string;
+            /** Name */
+            name: string;
+            /**
+             * Prefix
+             * @default
+             */
+            prefix: string;
+        };
+        /** CredentialSigV4 */
+        CredentialSigV4: {
+            /** Access Key Field */
+            access_key_field: string;
+            /** Region */
+            region: string;
+            /** Secret Key Field */
+            secret_key_field: string;
+            /** Service */
+            service: string;
+            /** Session Token Field */
+            session_token_field?: string | null;
+        };
+        /**
+         * CredentialTLS
+         * @description Client certificate (mTLS) presented on the provider connection; the PEM values come from the credential.
+         */
+        CredentialTLS: {
+            /** Ca Certificate Field */
+            ca_certificate_field?: string | null;
+            /** Certificate Field */
+            certificate_field: string;
+            /** Private Key Field */
+            private_key_field: string;
+        };
+        /** CubeControlCapabilities */
+        CubeControlCapabilities: {
+            /**
+             * Account Inventory
+             * @default gateway_bindings_v1
+             * @constant
+             */
+            account_inventory: "gateway_bindings_v1";
+            /**
+             * Application Exact Routes
+             * @default exact_path_v1
+             * @constant
+             */
+            application_exact_routes: "exact_path_v1";
+            /**
+             * Application Identity
+             * @default authenticated_object_v1
+             * @constant
+             */
+            application_identity: "authenticated_object_v1";
+            /** Client Side Credentials Allowed */
+            client_side_credentials_allowed: boolean;
+            /**
+             * Credential Values Full Masking
+             * @default true
+             * @constant
+             */
+            credential_values_full_masking: true;
+            /** Custom Keys Allowed */
+            custom_keys_allowed: boolean;
+            /**
+             * Passthrough Account Binding
+             * @default configured_credential_v1
+             * @constant
+             */
+            passthrough_account_binding: "configured_credential_v1";
+            /**
+             * Passthrough Account Grant Management
+             * @default atomic_append_v1
+             * @constant
+             */
+            passthrough_account_grant_management: "atomic_append_v1";
+            /**
+             * Passthrough Account Grants
+             * @default application_account_path_method_v1
+             * @constant
+             */
+            passthrough_account_grants: "application_account_path_method_v1";
+            /**
+             * Passthrough Account Mtls Credential
+             * @default client_certificate_v1
+             * @constant
+             */
+            passthrough_account_mtls_credential: "client_certificate_v1";
+            /**
+             * Passthrough Account Oauth Credential
+             * @default oauth_client_credentials_v1
+             * @constant
+             */
+            passthrough_account_oauth_credential: "oauth_client_credentials_v1";
+            /**
+             * Passthrough Account Provider
+             * @default credential_metadata_v1
+             * @constant
+             */
+            passthrough_account_provider: "credential_metadata_v1";
+            /**
+             * Passthrough Account Query Credential
+             * @default query_parameter_v1
+             * @constant
+             */
+            passthrough_account_query_credential: "query_parameter_v1";
+            /**
+             * Passthrough Account Resources
+             * @default application_ownership_v1
+             * @constant
+             */
+            passthrough_account_resources: "application_ownership_v1";
+            /**
+             * Passthrough Account Route Management
+             * @default atomic_create_v1
+             * @constant
+             */
+            passthrough_account_route_management: "atomic_create_v1";
+            /**
+             * Passthrough Account Sigv4 Credential
+             * @default aws_sigv4_v1
+             * @constant
+             */
+            passthrough_account_sigv4_credential: "aws_sigv4_v1";
+            /**
+             * Passthrough Account Websocket Route
+             * @default websocket_v1
+             * @constant
+             */
+            passthrough_account_websocket_route: "websocket_v1";
+            /**
+             * Passthrough Application Identity
+             * @default authenticated_object_v1
+             * @constant
+             */
+            passthrough_application_identity: "authenticated_object_v1";
+            /**
+             * Passthrough Header Isolation
+             * @default true
+             * @constant
+             */
+            passthrough_header_isolation: true;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Virtual Key Log Redaction
+             * @default true
+             * @constant
+             */
+            virtual_key_log_redaction: true;
         };
         /** CustomDimension */
         CustomDimension: {
@@ -30517,6 +30979,30 @@ export interface components {
          * @enum {string}
          */
         GUARDRAIL_DEFINITION_LOCATION: "db" | "config";
+        /** GatewayAccountInventory */
+        GatewayAccountInventory: {
+            /** Credentials */
+            credentials: components["schemas"]["InventoryCredential"][];
+            /** Deployments */
+            deployments: components["schemas"]["InventoryDeployment"][];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Rejected */
+            rejected: components["schemas"]["InventoryRejection"][];
+            /** Routes */
+            routes: components["schemas"]["InventoryRoute"][];
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Sources */
+            sources: components["schemas"]["InventorySource"][];
+        };
         /**
          * GatewayRequestActivityResponse
          * @description Response for GET /gateway/daily/activity.
@@ -31452,6 +31938,157 @@ export interface components {
             values: {
                 [key: string]: unknown;
             };
+        };
+        /** InventoryCredential */
+        InventoryCredential: {
+            /** Account Id */
+            account_id?: string | null;
+            /**
+             * Allowed Origins
+             * @default []
+             */
+            allowed_origins: string[];
+            /**
+             * Binding
+             * @enum {string}
+             */
+            binding: "bound" | "unbound" | "invalid";
+            /** Credential Name */
+            credential_name: string;
+            /** Llm Provider */
+            llm_provider?: string | null;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /** Provider Id */
+            provider_id?: string | null;
+        };
+        /** InventoryDeployment */
+        InventoryDeployment: {
+            /**
+             * Auth
+             * @enum {string}
+             */
+            auth: "credential_reference" | "environment_reference" | "inline_api_key" | "stored_api_key" | "cloud_identity" | "unknown";
+            /** Credential Name */
+            credential_name?: string | null;
+            /** Model Id */
+            model_id?: string | null;
+            /** Model Name */
+            model_name: string;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /** Provider */
+            provider?: string | null;
+            /** Provider Hint */
+            provider_hint?: string | null;
+        };
+        /** InventoryRejection */
+        InventoryRejection: {
+            /** Index */
+            index: number;
+            /** Name */
+            name?: string | null;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "not_an_object" | "unreadable_fields";
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "credentials" | "routes" | "deployments";
+        };
+        /** InventoryRoute */
+        InventoryRoute: {
+            /** Account Id */
+            account_id?: string | null;
+            /**
+             * Applications
+             * @default []
+             */
+            applications: string[];
+            /**
+             * Binding
+             * @enum {string}
+             */
+            binding: "account" | "unbound" | "invalid";
+            /** Credential Name */
+            credential_name?: string | null;
+            /**
+             * Grant Count
+             * @default 0
+             */
+            grant_count: number;
+            /**
+             * Inline Header Names
+             * @default []
+             */
+            inline_header_names: string[];
+            /**
+             * Methods
+             * @default []
+             */
+            methods: string[];
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /** Path */
+            path?: string | null;
+            /**
+             * Resource Types
+             * @default []
+             */
+            resource_types: string[];
+            /** Route Id */
+            route_id?: string | null;
+        };
+        /** InventorySource */
+        InventorySource: {
+            /**
+             * Detail
+             * @default
+             * @enum {string}
+             */
+            detail: "" | "unreadable" | "database_unavailable" | "database_read_failed";
+            /**
+             * Name
+             * @enum {string}
+             */
+            name: "credentials" | "routes" | "deployments";
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "runtime" | "database";
+            /**
+             * Records
+             * @default 0
+             */
+            records: number;
+            /**
+             * Rejected
+             * @default 0
+             */
+            rejected: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "partial" | "unavailable";
         };
         /** InvitationClaim */
         InvitationClaim: {
@@ -37504,6 +38141,7 @@ export interface components {
         };
         /** PassThroughGenericEndpoint */
         PassThroughGenericEndpoint: {
+            account_credential?: components["schemas"]["AccountHeaderCredential"] | null;
             /**
              * Auth
              * @description Whether authentication is required for the pass-through endpoint. Defaults to True so a pass-through silently created without an explicit value still requires a valid LiteLLM API key — set to False only if the endpoint is meant to be a public forwarder (e.g. an unauthenticated webhook target).
@@ -39810,6 +40448,40 @@ export interface components {
         ResetSpendRequest: {
             /** Reset To */
             reset_to: number;
+        };
+        /** ResourceAdoptionCommand */
+        ResourceAdoptionCommand: {
+            /** Application Id */
+            application_id: string;
+            /** Expected Fingerprint */
+            expected_fingerprint: string;
+            /** Resource Id */
+            resource_id: string;
+            /** Resource Type */
+            resource_type: string;
+        };
+        /** ResourceCreation */
+        ResourceCreation: {
+            /** Id Selector */
+            id_selector: (string | number)[];
+            /** Methods */
+            methods: string[];
+            /** Path */
+            path: string;
+        };
+        /** ResourceOwnership */
+        ResourceOwnership: {
+            /** Creator Key Hash */
+            creator_key_hash?: string | null;
+            /** Owner Application Id */
+            owner_application_id: string;
+            /**
+             * Provenance
+             * @enum {string}
+             */
+            provenance: "created" | "adopted";
+            /** Route Id */
+            route_id: string;
         };
         /** ResponseAPIUsage */
         ResponseAPIUsage: {
@@ -52742,6 +53414,213 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_account_inventory_cube_control_account_inventory_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayAccountInventory"];
+                };
+            };
+        };
+    };
+    cube_control_create_account_route_cube_control_account_routes_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountRouteCreateCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountRouteReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_account_route_cube_control_account_routes__route_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                route_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountRouteDescriptor"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_append_account_grant_cube_control_account_routes__route_id__grants_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                route_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountGrantCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountGrantReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_adopt_account_resource_cube_control_account_routes__route_id__resources_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                route_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResourceAdoptionCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountResourceReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_account_resource_cube_control_account_routes__route_id__resources__resource_type___resource_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                route_id: string;
+                resource_type: string;
+                resource_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceOwnership"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cube_control_capabilities_cube_control_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CubeControlCapabilities"];
                 };
             };
         };

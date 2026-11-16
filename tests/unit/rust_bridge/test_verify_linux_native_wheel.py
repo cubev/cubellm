@@ -106,6 +106,7 @@ def _run_verifier(
     wheel: Path,
     *,
     exposes_panic: bool = False,
+    glibc_versions: str = "GLIBC_2.17",
 ) -> int:
     native_module: Final = (
         _NativeModuleWithPanicHook("litellm.rust_bridge._native")
@@ -116,12 +117,23 @@ def _run_verifier(
     def _fake_load_native_module(_: Path) -> ModuleType:
         return native_module
 
+    def run_command(
+        command: tuple[str, ...],
+        *,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        if "--version-info" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=glibc_versions, stderr="")
+        return _fake_subprocess_run(command, check=check, capture_output=capture_output, text=text)
+
     environment: Final = MappingProxyType({"GITHUB_STEP_SUMMARY": str(wheel.parent / "summary.md")})
     return verifier.main(
         (str(_MODULE_PATH), str(wheel)),
         environment,
         _fake_load_native_module,
-        _fake_subprocess_run,
+        run_command,
     )
 
 
@@ -210,3 +222,52 @@ def test_vocabulary_is_packaged_once(tmp_path: Path, embedded: bool) -> None:
         archive.writestr("litellm/litellm_core_utils/tokenizers/" + "a" * 40, ranks)
 
     assert _run_verifier(wheel) == (1 if embedded else 0)
+
+
+@pytest.mark.parametrize(
+    ("platform", "glibc_versions"),
+    (
+        ("manylinux_2_39_x86_64", "GLIBC_2.39"),
+        ("manylinux_2_39_x86_64", "GLIBC_2.9"),
+        ("manylinux_2_17_x86_64", "GLIBC_2.2.5 GLIBC_2.17"),
+        ("manylinux2014_x86_64", "GLIBC_2.17"),
+        ("manylinux2010_x86_64", "GLIBC_2.12"),
+        ("manylinux1_x86_64", "GLIBC_2.2.5"),
+        ("manylinux_2_17_x86_64.manylinux2014_x86_64", "GLIBC_2.17"),
+        ("linux_x86_64.manylinux_2_39_x86_64", "GLIBC_2.39"),
+    ),
+)
+def test_accepts_linux_tags_that_cover_the_extensions_glibc_requirement(
+    tmp_path: Path,
+    platform: str,
+    glibc_versions: str,
+) -> None:
+    tag: Final = "cp310-abi3-" + platform
+    metadata: Final = tuple("cp310-abi3-" + item for item in platform.split("."))
+    wheel: Final = _write_wheel(tmp_path, filename_tag=tag, metadata_tags=metadata)
+    assert _run_verifier(wheel, glibc_versions=glibc_versions) == 0
+
+
+@pytest.mark.parametrize(
+    ("platform", "glibc_versions"),
+    (
+        ("manylinux_2_17_x86_64", "GLIBC_2.39"),
+        ("manylinux2014_x86_64", "GLIBC_2.39"),
+        ("manylinux_2_9_x86_64", "GLIBC_2.10"),
+        ("manylinux_2_39_x86_64.manylinux2014_x86_64", "GLIBC_2.39"),
+        ("manylinux_2_39_x86_64", ""),
+        ("manylinux_2_39_aarch64", "GLIBC_2.39"),
+        ("linux_x86_64.win_amd64", "GLIBC_2.39"),
+        ("musllinux_1_2_x86_64", "GLIBC_2.39"),
+        ("manylinux_2_unknown_x86_64", "GLIBC_2.39"),
+    ),
+)
+def test_rejects_inaccurate_or_unverified_linux_compatibility_claims(
+    tmp_path: Path,
+    platform: str,
+    glibc_versions: str,
+) -> None:
+    tag: Final = "cp310-abi3-" + platform
+    metadata: Final = tuple("cp310-abi3-" + item for item in platform.split("."))
+    wheel: Final = _write_wheel(tmp_path, filename_tag=tag, metadata_tags=metadata)
+    assert _run_verifier(wheel, glibc_versions=glibc_versions) == 1

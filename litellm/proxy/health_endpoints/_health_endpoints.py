@@ -146,7 +146,10 @@ def _request_inherits_config_credentials(
         return False
     if allow_client_side_credentials:
         return True
-    return not any(param in request_params for param in _BANNED_REQUEST_BODY_PARAMS)
+    # The credential name is decided above; the generic list bans it for request bodies, not for this choice.
+    return not any(
+        param in request_params for param in _BANNED_REQUEST_BODY_PARAMS if param != "litellm_credential_name"
+    )
 
 
 def _config_base_for_health_check(

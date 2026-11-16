@@ -8,9 +8,8 @@ ARG LITELLM_RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:1d95114038f76513a
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a
 # Pinned by digest like the other base images; bump explicitly on Node upgrades.
 ARG UI_BUILD_IMAGE=node:24.19-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
-# Checksum from https://www.pgbouncer.org/downloads/ (the Wolfi repo only carries 1.24.x)
-ARG PGBOUNCER_VERSION=1.25.2
-ARG PGBOUNCER_SHA256=924ad35113fd0a71c8e2dbe85b5d03445532e2b7b37a9f8a48983beea238b332
+ARG PGBOUNCER_VERSION=1.26.1
+ARG PGBOUNCER_SHA256=00886a2994b4844cd37110970df777772cfc42a74c400522c82fba509a3f42d9
 
 FROM $UV_IMAGE AS uvbin
 
@@ -58,12 +57,32 @@ RUN apk add --no-cache \
     gcc \
     python-3.13 \
     python-3.13-dev \
-    rust \
+    curl \
+    xz \
     openssl \
     openssl-dev \
     nodejs \
     npm \
     libsndfile
+
+COPY rust-toolchain.toml ./
+RUN set -eu; \
+    rust_version="$(sed -n 's/^channel = "\([0-9][0-9.]*\)"$/\1/p' rust-toolchain.toml)"; \
+    test -n "$rust_version"; \
+    case "$(uname -m)" in x86_64|aarch64) rust_target="$(uname -m)-unknown-linux-gnu" ;; *) exit 1 ;; esac; \
+    rust_archive="rust-${rust_version}-${rust_target}"; \
+    mkdir /tmp/rust-install; \
+    cd /tmp/rust-install; \
+    curl -fsSLO "https://static.rust-lang.org/dist/${rust_archive}.tar.xz"; \
+    curl -fsSLO "https://static.rust-lang.org/dist/${rust_archive}.tar.xz.sha256"; \
+    sha256sum -c "${rust_archive}.tar.xz.sha256"; \
+    xz --decompress "${rust_archive}.tar.xz"; \
+    tar -xf "${rust_archive}.tar"; \
+    "./${rust_archive}/install.sh" --prefix=/usr/local --disable-ldconfig \
+        --components="rustc,cargo,rust-std-${rust_target}"; \
+    rustc --version; \
+    cargo --version; \
+    rm -rf /tmp/rust-install
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \

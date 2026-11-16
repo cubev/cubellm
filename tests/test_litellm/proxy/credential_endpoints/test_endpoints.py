@@ -1,11 +1,12 @@
 """Tests for the credential management endpoints."""
 
 import json
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
-
 
 import litellm
 from litellm.proxy._types import UserAPIKeyAuth
@@ -15,6 +16,37 @@ from litellm.proxy.proxy_server import app
 from litellm.types.utils import CredentialItem
 
 client = TestClient(app)
+
+
+async def test_credential_read_routes_mask_arbitrary_vendor_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    item: Final = CredentialItem(
+        credential_name="opaque-fixture",
+        credential_info={"cube_account_id": "fixture-account"},
+        credential_values={"opaque_vendor_field": "inert-opaque-canary", "nested": ["inert-nested-canary"]},
+    )
+    monkeypatch.setattr(litellm, "credential_list", [item])
+
+    async def admin() -> UserAPIKeyAuth:
+        return UserAPIKeyAuth(user_role="proxy_admin")
+
+    previous: Final = app.dependency_overrides.get(user_api_key_auth)
+    app.dependency_overrides[user_api_key_auth] = admin
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as async_client:
+            listed: Final = await async_client.get("/credentials")
+            single: Final = await async_client.get("/credentials/by_name/opaque-fixture")
+        assert listed.status_code == single.status_code == 200
+        assert listed.json()["credentials"][0]["credential_values"]["opaque_vendor_field"] == "*****"
+        assert single.json()["credential_values"]["opaque_vendor_field"] == "*****"
+        assert "inert-opaque-canary" not in listed.text + single.text
+        assert "inert-nested-canary" not in listed.text + single.text
+        assert "fixture-account" in listed.text + single.text
+        assert item.credential_values["opaque_vendor_field"] == "inert-opaque-canary"
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(user_api_key_auth, None)
+        else:
+            app.dependency_overrides[user_api_key_auth] = previous
 
 
 def _as_admin():

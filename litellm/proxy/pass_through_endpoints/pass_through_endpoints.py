@@ -5,12 +5,12 @@ import json
 import posixpath
 import traceback
 from base64 import b64encode
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import count, groupby
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Any, Final, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlencode, urlparse
 
 import httpx
@@ -26,8 +26,12 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.exceptions import WebSocketException
+from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocketState
+from typing_extensions import ReadOnly
 from websockets.asyncio.client import connect
 from websockets.exceptions import (
     ConnectionClosedError,
@@ -53,6 +57,7 @@ from litellm.litellm_core_utils.core_helpers import (
     get_metadata_variable_name_from_kwargs,
     get_or_create_metadata_bucket,
 )
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import validate_no_callback_env_reference
 from litellm.litellm_core_utils.internal_call_metadata import MODEL_ACCESS_GROUP_METADATA_KEY
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -66,9 +71,11 @@ from litellm.llms.base_llm.managed_resources.utils import (
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 from litellm.passthrough import BasePassthroughUtils
 from litellm.proxy._types import (
+    CommonProxyErrors,
     ConfigFieldInfo,
     ConfigFieldUpdate,
     LiteLLMRoutes,
+    LitellmUserRoles,
     PassThroughEndpointResponse,
     PassThroughGenericEndpoint,
     ProxyException,
@@ -82,6 +89,7 @@ from litellm.proxy.common_request_processing import (
     open_sse_before_first_byte,
     resolve_litellm_call_id,
 )
+from litellm.proxy.common_utils.application_identity import application_id_from_key_metadata
 from litellm.proxy.common_utils.error_body_call_id import JSON_OBJECT, error_body_call_id, with_call_id
 from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
@@ -102,7 +110,7 @@ from litellm.proxy.litellm_pre_call_utils import (
     _get_dynamic_logging_metadata,  # pyright: ignore[reportPrivateUsage]  # shared proxy helper, same import style as _read_request_body above
 )
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
-from litellm.proxy.utils import normalize_route_for_root_path
+from litellm.proxy.utils import invalidate_config_param, normalize_route_for_root_path
 from litellm.repositories.team_repository import TeamRepository
 from litellm.secret_managers.main import get_secret_str
 from litellm.types import utils as types_utils
@@ -118,9 +126,35 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 )
 from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, Usage
 
+from .account_credentials import (
+    WEBSOCKET_METHOD,
+    AccountHeaderCredential,
+    AccountRouteBinding,
+    ResolvedAccountCredential,
+    account_application_allowed,
+    is_websocket_route,
+    resolve_account_credential,
+    validate_account_request,
+    validate_account_resources,
+    validate_account_route,
+)
+from .account_grants import GrantDatabase, GrantFailure
+from .account_ownership import (
+    capture_created_resources,
+    proxy_ownership_lookup,
+    proxy_ownership_record,
+    resource_access_allowed,
+    resource_path_match,
+)
+from .account_routes import RoutesMutation, RoutesPlan, mutate_settings_routes
+from .credential_transport import CredentialTransport, Redaction
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
+from .mtls_credentials import MTLSCredentialAuth
+from .oauth_credentials import OAuthClientCredentialsAuth
+from .query_credentials import QueryCredentialAuth
+from .sigv4_credentials import SigV4CredentialAuth
 from .streaming_handler import PassThroughStreamingHandler
 from .success_handler import PassThroughEndpointLogging
 from .upstream_usage_headers import (
@@ -438,6 +472,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         requested_query_params: dict | None = None,
         _parsed_body: dict | None = None,
         forward_multipart: bool = False,
+        follow_redirects: bool | None = None,
+        isolate_client: bool = False,
+        upstream_auth: httpx.Auth | None = None,
     ) -> httpx.Response:
         """
         Handle non-SSE HTTP requests
@@ -449,14 +486,20 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         logging/guardrails) or relay it to the client without materializing it in memory
         (LIT-4009: large batch results files must not be buffered in proxy RSS).
         """
+        build_request: Final = httpx.Request if isolate_client else async_client.build_request
         if request.method == "GET":
-            get_request: Final = async_client.build_request(
+            get_request: Final = build_request(
                 request.method,
                 url,
                 headers=headers,
                 params=requested_query_params,
             )
-            return await async_client.send(get_request, stream=True)
+            return await async_client.send(
+                get_request,
+                stream=True,
+                **({"auth": upstream_auth} if isolate_client else {}),
+                **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
+            )
         if HttpPassThroughEndpointHelpers.is_multipart(request) is True and forward_multipart:
             # Forward multipart via make_multipart_http_request even when _parsed_body is
             # non-empty (pass_through_request always injects litellm_logging_obj, etc.).
@@ -468,15 +511,22 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 url=url,
                 headers=headers,
                 requested_query_params=requested_query_params,
+                **({"isolate_client": True, "upstream_auth": upstream_auth} if isolate_client else {}),
+                **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
             )
-        generic_request: Final = async_client.build_request(
+        generic_request: Final = build_request(
             request.method,
             url,
             headers=headers,
             params=requested_query_params,
             json=_parsed_body,
         )
-        return await async_client.send(generic_request, stream=True)
+        return await async_client.send(
+            generic_request,
+            stream=True,
+            **({"auth": upstream_auth} if isolate_client else {}),
+            **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
+        )
 
     @staticmethod
     def is_multipart(request: Request) -> bool:
@@ -499,6 +549,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: dict | None = None,
         stream: bool = False,
+        follow_redirects: bool | None = None,
+        isolate_client: bool = False,
+        upstream_auth: httpx.Auth | None = None,
     ) -> httpx.Response:
         """Process multipart/form-data requests, handling both files and form fields.
 
@@ -551,8 +604,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers_copy.pop("content-type", None)
 
         # httpx.AsyncClient.request() does not accept stream=; use send() for streaming.
-        if stream:
-            req: Final = async_client.build_request(
+        if stream or isolate_client:
+            build_request: Final = httpx.Request if isolate_client else async_client.build_request
+            req: Final = build_request(
                 request.method,
                 url,
                 headers=headers_copy,
@@ -560,7 +614,12 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 files=multipart_files,
                 data=multipart_data,
             )
-            return await async_client.send(req, stream=True)
+            return await async_client.send(
+                req,
+                stream=stream,
+                **({"auth": upstream_auth} if isolate_client else {}),
+                **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
+            )
 
         return await async_client.request(
             method=request.method,
@@ -569,6 +628,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             params=requested_query_params,
             files=multipart_files,
             data=multipart_data,
+            **({"follow_redirects": follow_redirects} if follow_redirects is not None else {}),
         )
 
     @staticmethod
@@ -579,6 +639,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         logging_obj: LiteLLMLoggingObj,
         _parsed_body: dict | None = None,
         litellm_call_id: str | None = None,
+        account_binding: AccountRouteBinding | None = None,
     ) -> dict:
         """
         Filter out litellm params from the request body
@@ -633,8 +694,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             _metadata["user_api_key_team_model_max_budget"] = user_api_key_dict.team_model_max_budget
             _metadata["user_api_key_user_model_max_budget"] = user_api_key_dict.user_model_max_budget
             _metadata["user_api_key_end_user_model_max_budget"] = user_api_key_dict.end_user_model_max_budget
-        _metadata.update(
-            LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(user_api_key_dict=user_api_key_dict)
+        LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+            data={"metadata": _metadata},
+            user_api_key_dict=user_api_key_dict,
+            _metadata_variable_name="metadata",
         )
         _request_state: Final = getattr(request, "state", None)
         deployment_model_info: Final = getattr(
@@ -642,6 +705,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         )
         if isinstance(deployment_model_info, Mapping):
             _metadata["model_info"] = dict(deployment_model_info)
+
+        _metadata["_cube_account_binding"] = account_binding
+        _metadata["provider_account_provider"] = account_binding.provider if account_binding is not None else None
+        _metadata["provider_origin"] = account_binding.origin if account_binding is not None else None
+        _metadata["provider_account_id"] = account_binding.account_id if account_binding is not None else None
+        _metadata["provider_account_source"] = "configured_credential" if account_binding is not None else None
+        _metadata["provider_cost_status"] = "unverified" if account_binding is not None else None
 
         kwargs: Final = {
             "litellm_params": {
@@ -939,6 +1009,7 @@ async def _log_passthrough_upstream_failure(
     user_api_key_dict: UserAPIKeyAuth,
     request_payload: dict,
     logging_obj: LiteLLMLoggingObj,
+    redact: Callable[[str], str] | None = None,
 ) -> httpx.Response:
     if response.status_code < 400:
         return response
@@ -948,7 +1019,9 @@ async def _log_passthrough_upstream_failure(
     upstream_error_body: Final = (
         REDACTED_BY_LITELLM
         if should_redact_message_logging(logging_obj.model_call_details)
-        else _truncate_upstream_error_body(_sanitize_upstream_error_body(preview_text))
+        else _truncate_upstream_error_body(
+            _sanitize_upstream_error_body(redact(preview_text) if redact is not None else preview_text)
+        )
     )
     verbose_proxy_logger.warning(
         "pass_through_endpoint: upstream %s %s returned %s: %s",
@@ -1037,6 +1110,12 @@ async def pass_through_request(
     custom_llm_provider: str | None = None,
     guardrails_config: dict | None = None,
     timeout: float | None = None,
+    account_binding: AccountRouteBinding | None = None,
+    account_outbound: QueryCredentialAuth
+    | SigV4CredentialAuth
+    | OAuthClientCredentialsAuth
+    | MTLSCredentialAuth
+    | None = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -1089,7 +1168,13 @@ async def pass_through_request(
             headers=headers,
             forward_headers=forward_headers,
         )
-        upstream_headers: Final = _with_trace_context(headers, parent_span=user_api_key_dict.parent_otel_span)
+        outbound_headers: Final = httpx.Headers(headers)
+        if account_binding is not None and "user-agent" not in outbound_headers:
+            outbound_headers["User-Agent"] = "CubeLLM-account-gateway"
+        upstream_headers: Final = _with_trace_context(
+            dict(outbound_headers) if account_binding is not None else headers,
+            parent_span=user_api_key_dict.parent_otel_span,
+        )
 
         requested_query_params: dict | None = query_params or dict(request.query_params) or None
 
@@ -1123,7 +1208,9 @@ async def pass_through_request(
         verbose_proxy_logger.debug(
             "Pass through endpoint sending request to \nURL %s\nheaders: %s\nbody: %s\n",
             url,
-            _get_masked_values(upstream_headers),
+            _get_masked_values(upstream_headers, mask_all_values=True, unmasked_length=0)
+            if account_binding is not None
+            else _get_masked_values(upstream_headers),
             _parsed_body,
         )
 
@@ -1184,9 +1271,14 @@ async def pass_through_request(
         resolved_timeout: Final = resolve_pass_through_request_timeout(timeout)
         async_client_obj: Final = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
-            params={"timeout": resolved_timeout},
+            params={
+                "timeout": resolved_timeout,
+                **({"follow_redirects": False} if account_binding else {}),
+                **({"transport_wrapper": CredentialTransport} if account_outbound is not None else {}),
+            },
         )
         async_client: Final = async_client_obj.client
+        build_request: Final = httpx.Request if account_binding is not None else async_client.build_request
         passthrough_logging_payload: Final = PassthroughStandardLoggingPayload(
             url=str(url),
             request_body=_parsed_body,
@@ -1200,6 +1292,7 @@ async def pass_through_request(
             litellm_call_id=litellm_call_id,
             request=request,
             logging_obj=logging_obj,
+            account_binding=account_binding,
         )
 
         # Store custom_llm_provider in kwargs and logging object if provided
@@ -1384,12 +1477,17 @@ async def pass_through_request(
                     headers=upstream_headers,
                     requested_query_params=requested_query_params,
                     stream=True,
+                    **(
+                        {"isolate_client": True, "follow_redirects": False, "upstream_auth": account_outbound}
+                        if account_binding
+                        else {}
+                    ),
                 )
             else:
                 # SigV4-signed callers (Bedrock) supply the exact pre-signed bytes;
                 # otherwise httpx encodes the parsed JSON dict as before.
                 req: Final = (
-                    async_client.build_request(
+                    build_request(
                         request.method,
                         url,
                         params=requested_query_params,
@@ -1397,7 +1495,7 @@ async def pass_through_request(
                         content=state_raw_body,
                     )
                     if state_raw_body is not None
-                    else async_client.build_request(
+                    else build_request(
                         request.method,
                         url,
                         params=requested_query_params,
@@ -1406,7 +1504,11 @@ async def pass_through_request(
                     )
                 )
 
-                response = await async_client.send(req, stream=stream)
+                response = await async_client.send(
+                    req,
+                    stream=stream,
+                    **({"follow_redirects": False, "auth": account_outbound} if account_binding else {}),
+                )
 
             upstream_usage = apply_upstream_reported_usage(
                 logging_obj=logging_obj,
@@ -1424,6 +1526,7 @@ async def pass_through_request(
                     upstream_usage=upstream_usage,
                 ),
                 logging_obj=logging_obj,
+                redact=account_outbound.redact if account_outbound is not None else None,
             )
 
             # Call response headers hook for streaming pass-through
@@ -1476,14 +1579,18 @@ async def pass_through_request(
         if state_raw_body is not None:
             # SigV4-signed callers (Bedrock) require the exact pre-signed bytes
             # to be forwarded so the signature/Content-Length stay valid.
-            raw_body_request: Final = async_client.build_request(
+            raw_body_request: Final = build_request(
                 request.method,
                 url,
                 headers=upstream_headers,
                 params=requested_query_params,
                 content=state_raw_body,
             )
-            response = await async_client.send(raw_body_request, stream=True)
+            response = await async_client.send(
+                raw_body_request,
+                stream=True,
+                **({"follow_redirects": False, "auth": account_outbound} if account_binding else {}),
+            )
         else:
             response = await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
                 request=request,
@@ -1493,6 +1600,11 @@ async def pass_through_request(
                 requested_query_params=requested_query_params,
                 _parsed_body=_parsed_body,
                 forward_multipart=is_multipart,
+                **(
+                    {"follow_redirects": False, "isolate_client": True, "upstream_auth": account_outbound}
+                    if account_binding
+                    else {}
+                ),
             )
         verbose_proxy_logger.debug("response.headers= %s", response.headers)
 
@@ -1516,6 +1628,7 @@ async def pass_through_request(
                     upstream_usage=upstream_usage,
                 ),
                 logging_obj=logging_obj,
+                redact=account_outbound.redact if account_outbound is not None else None,
             )
 
             # Call response headers hook for detected streaming pass-through
@@ -1621,6 +1734,7 @@ async def pass_through_request(
             user_api_key_dict=user_api_key_dict,
             request_payload=failure_request_payload,
             logging_obj=logging_obj,
+            redact=account_outbound.redact if account_outbound is not None else None,
         )
 
         if response.status_code < 400 and response_body is not None and guardrails_to_run:
@@ -1908,6 +2022,127 @@ def _update_metadata_with_tags_in_header(request: Request, metadata: dict) -> di
     return metadata
 
 
+class _KeyMetadata(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+    metadata: Mapping[str, object] | None = None
+
+
+class _AccountRouteParams(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+    forward_headers: bool | None = None
+    default_query_params: Mapping[str, object] | None = None
+
+
+class _RelayOptions(TypedDict, total=False):
+    account_binding: ReadOnly[AccountRouteBinding]
+    account_outbound: ReadOnly[
+        QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | MTLSCredentialAuth
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenRelay:
+    def outbound_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        return headers
+
+    def validate_query(self, names: tuple[str, ...]) -> None:
+        return None
+
+    def relay_options(self) -> _RelayOptions:
+        return _RelayOptions()
+
+    async def capture(self, path: str, method: str, response: Response) -> None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountRelay:
+    policy: AccountHeaderCredential
+    credential: ResolvedAccountCredential
+    route_id: str | None
+    application_id: str | None
+    key_hash: str | None
+
+    def outbound_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        return {**headers, **self.credential.headers}
+
+    def validate_query(self, names: tuple[str, ...]) -> None:
+        try:
+            validate_account_request(self.policy, {}, names)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
+
+    def relay_options(self) -> _RelayOptions:
+        outbound: Final = self.credential.outbound
+        if outbound is None:
+            return _RelayOptions(account_binding=self.credential.binding)
+        return _RelayOptions(account_binding=self.credential.binding, account_outbound=outbound)
+
+    async def capture(self, path: str, method: str, response: Response) -> None:
+        await capture_created_resources(
+            self.policy,
+            self.route_id,
+            self.application_id,
+            self.key_hash,
+            path,
+            method,
+            response.status_code,
+            None if isinstance(response, StreamingResponse) else response.body,
+            proxy_ownership_record,
+        )
+
+
+async def _account_relay(
+    target_params: Mapping[str, object],
+    passthrough_params: Mapping[str, object] | None,
+    user_api_key_dict: object,
+    request: Request,
+    path: str,
+    full_target: str,
+    headers: Mapping[str, object],
+) -> _OpenRelay | _AccountRelay:
+    raw_policy: Final = target_params.get("account_credential")
+    if raw_policy is None:
+        return _OpenRelay()
+    policy: Final = AccountHeaderCredential.model_validate(raw_policy)
+    key: Final = user_api_key_dict if isinstance(user_api_key_dict, UserAPIKeyAuth) else None
+    application_id: Final = (
+        application_id_from_key_metadata(_KeyMetadata.model_validate(key, from_attributes=True).metadata)
+        if key is not None
+        else None
+    )
+    key_hash: Final = key.token if key is not None else None
+    endpoint_id: Final = passthrough_params.get("endpoint_id") if passthrough_params is not None else None
+    route_id: Final = endpoint_id if isinstance(endpoint_id, str) else None
+    resource_match: Final = resource_path_match(policy, path)
+    allowed: Final = (
+        await resource_access_allowed(
+            policy, resource_match, route_id, application_id, key_hash, request.method, proxy_ownership_lookup
+        )
+        if resource_match is not None
+        else account_application_allowed(policy, application_id, key_hash, path, request.method)
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Application is not granted this account route method")
+    try:
+        validate_account_request(policy, request.headers, tuple(request.query_params.keys()))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Account route request policy rejected") from None
+    try:
+        params: Final = _AccountRouteParams.model_validate(target_params)
+        validate_account_route(
+            full_target, True, params.forward_headers, headers, params.default_query_params, policy, (request.method,)
+        )
+        credential: Final = resolve_account_credential(
+            policy, CredentialAccessor.find_credential(policy.credential_name), full_target
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=503, detail="Account route credential or request policy is unavailable"
+        ) from None
+    return _AccountRelay(policy, credential, route_id, application_id, key_hash)
+
+
 class _PassThroughRequestEnvelope(TypedDict, total=False):
     query_params: Mapping[str, object] | None
     custom_body: Mapping[str, object] | None
@@ -2091,11 +2326,16 @@ def create_pass_through_route(
             # Ensure custom_headers is a dict. Botocore returns a HeadersDict
             # for SigV4-prepared requests, which is a Mapping but not a dict.
             headers_dict: Final = dict(param_custom_headers) if isinstance(param_custom_headers, Mapping) else {}
+            account: Final = await _account_relay(
+                target_params, passthrough_params, user_api_key_dict, request, path, full_target, headers_dict
+            )
+            outbound_headers: Final = account.outbound_headers(headers_dict)
 
             # Ensure query_params and custom_body are dicts or None
             final_query_params: Final = query_params_data if isinstance(query_params_data, dict) else {}
             if query_params:
                 final_query_params.update(query_params)
+            account.validate_query(tuple(final_query_params.keys()))
             # Programmatic callers set LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY on
             # request.state (see Bedrock proxy). Parsed JSON envelope otherwise.
             state_custom_body: Final[dict | None] = getattr(
@@ -2113,10 +2353,10 @@ def create_pass_through_route(
 
             async def _relay() -> Response:
                 try:
-                    return await pass_through_request(
+                    relayed: Final = await pass_through_request(
                         request=request,
                         target=full_target,
-                        custom_headers=headers_dict,
+                        custom_headers=outbound_headers,
                         user_api_key_dict=user_api_key_dict,
                         forward_headers=cast(bool | None, param_forward_headers),
                         merge_query_params=cast(bool | None, param_merge_query_params),
@@ -2128,7 +2368,10 @@ def create_pass_through_route(
                         custom_llm_provider=custom_llm_provider,
                         guardrails_config=cast(dict | None, param_guardrails),
                         timeout=cast(float | None, param_timeout),
+                        **account.relay_options(),
                     )
+                    await account.capture(path, request.method, relayed)
+                    return relayed
                 finally:
                     if hasattr(request.state, LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY):
                         delattr(request.state, LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY)
@@ -2198,6 +2441,124 @@ def create_websocket_passthrough_route(
         )
 
     return websocket_endpoint_func
+
+
+_WEBSOCKET_POLICY_VIOLATION: Final = 1008
+_NO_PARAMS: Final[Mapping[str, object]] = MappingProxyType({})
+_NO_HEADERS: Final[Mapping[str, str]] = MappingProxyType({})
+_ROUTE_HEADERS: Final = TypeAdapter(dict[str, str])
+
+
+ACCOUNT_WEBSOCKET_RECHECK_SECONDS: Final = 5.0
+_ACCESS_REVOKED_REASON: Final = "Account route access revoked"
+
+
+@dataclass(frozen=True, slots=True)
+class WebsocketSessionGuard:
+    """Asked again and again while a relay is open; the relay ends once the answer is no longer True."""
+
+    still_authorized: Callable[[], Awaitable[bool]]
+    interval_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountWebsocketSession:
+    target: str
+    headers: Mapping[str, str] = field(repr=False)
+    credential: ResolvedAccountCredential = field(repr=False)
+    cost_per_request: float | None
+
+
+def _account_websocket_session(path: str, websocket: WebSocket, key: UserAPIKeyAuth) -> _AccountWebsocketSession | None:
+    """What the registered route, its grants and its named credential allow this key right now, or None."""
+    registered: Final = InitPassThroughEndpointHelpers.get_registered_pass_through_route(
+        route=path, method=WEBSOCKET_METHOD
+    )
+    params: Final[Mapping[str, object]] = (
+        registered.get("passthrough_params", _NO_PARAMS) if registered is not None else _NO_PARAMS
+    )
+    raw_policy: Final = params.get("account_credential")
+    if raw_policy is None:
+        return None
+    policy: Final = AccountHeaderCredential.model_validate(raw_policy)
+    application_id: Final = application_id_from_key_metadata(
+        _KeyMetadata.model_validate(key, from_attributes=True).metadata
+    )
+    if not account_application_allowed(policy, application_id, key.token, path, WEBSOCKET_METHOD):
+        return None
+    target: Final = params.get("target")
+    configured: Final = params.get("custom_headers")
+    headers: Final[Mapping[str, str]] = MappingProxyType(
+        _ROUTE_HEADERS.validate_python(configured) if configured is not None else _NO_HEADERS
+    )
+    try:
+        validate_account_request(policy, websocket.headers, tuple(websocket.query_params.keys()))
+        if not isinstance(target, str):
+            raise ValueError("WebSocket account route target is missing")
+        validate_account_route(
+            target, True, params.get("forward_headers") is True, headers, None, policy, (WEBSOCKET_METHOD,)
+        )
+        credential: Final = resolve_account_credential(
+            policy, CredentialAccessor.find_credential(policy.credential_name), target
+        )
+    except ValueError:
+        return None
+    cost: Final = params.get("cost_per_request")
+    return _AccountWebsocketSession(
+        target=target,
+        headers=MappingProxyType({**headers, **credential.headers}),
+        credential=credential,
+        cost_per_request=float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) else None,
+    )
+
+
+def create_account_websocket_route(
+    path: str, recheck_seconds: float = ACCOUNT_WEBSOCKET_RECHECK_SECONDS
+) -> Callable[[WebSocket], Awaitable[None]]:
+    """WebSocket account route: same key, grant and credential checks as HTTP account routes.
+
+    The checks run at the handshake and again every ``recheck_seconds`` while the connection is open, each time
+    against the current registry, key and credential. A deleted route or key, a revoked grant or a rotated
+    credential therefore closes an open connection with a policy violation. The client is never sent upstream
+    headers, the credential only goes into the upstream handshake, the logged headers are masked, and the
+    credential is redacted from provider frames.
+    """
+
+    async def account_websocket_endpoint(websocket: WebSocket) -> None:
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_websocket
+
+        try:
+            key: Final = await user_api_key_auth_websocket(websocket)
+        except HTTPException:
+            return  # user_api_key_auth_websocket already closed the handshake
+        session: Final = _account_websocket_session(path, websocket, key)
+        if session is None:
+            await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION)
+            return
+
+        async def still_authorized() -> bool:
+            try:
+                current_key: Final = await user_api_key_auth_websocket(websocket)
+            except (HTTPException, WebSocketException):
+                return False
+            return _account_websocket_session(path, websocket, current_key) == session
+
+        query: Final = urlencode(tuple(websocket.query_params.multi_items()))
+        await websocket_passthrough_request(
+            websocket=websocket,
+            target=session.target + ("?" + query if query else ""),
+            custom_headers=dict(session.headers),  # mutable-ok: the relay signature takes a dict
+            user_api_key_dict=key,
+            forward_headers=False,
+            endpoint=path,
+            cost_per_request=session.cost_per_request,
+            accept_websocket=True,
+            account_binding=session.credential.binding,
+            frame_redaction=Redaction(session.credential.header_secrets),
+            session_guard=WebsocketSessionGuard(still_authorized, recheck_seconds),
+        )
+
+    return account_websocket_endpoint
 
 
 def _rewrite_vertex_live_setup_model(text_data: str, setup_model_rewriter: Callable[[str], str] | None) -> str:
@@ -2293,6 +2654,20 @@ def _upstream_close_to_relay(task_results: Iterable[object]) -> Close | None:
 _WEBSOCKET_FORWARDED_HEADERS: Final = frozenset(("authorization", "x-api-key", "x-goog-user-project"))
 
 
+def _redacted_frame(frame: str | bytes, redaction: Redaction | None) -> str | bytes:
+    if redaction is None:
+        return frame
+    return redaction.redact_bytes(frame) if isinstance(frame, bytes) else redaction.redact(frame)
+
+
+async def _session_revoked(guard: WebsocketSessionGuard) -> None:
+    """Returns once the guard no longer holds; the handshake has just checked, so the first recheck waits."""
+    while True:
+        await asyncio.sleep(guard.interval_seconds)
+        if not await guard.still_authorized():
+            return
+
+
 def _with_trace_context(headers: Mapping[str, str], parent_span: object) -> dict[str, str]:
     try:
         from litellm.integrations.otel.plumbing.context import inject_trace_context
@@ -2311,6 +2686,9 @@ async def websocket_passthrough_request(
     cost_per_request: float | None = None,
     accept_websocket: bool = True,
     setup_model_rewriter: Callable[[str], str] | None = None,
+    account_binding: AccountRouteBinding | None = None,
+    frame_redaction: Redaction | None = None,
+    session_guard: WebsocketSessionGuard | None = None,
 ):
     """
     WebSocket passthrough request handler.
@@ -2324,6 +2702,8 @@ async def websocket_passthrough_request(
         endpoint: The endpoint path (for logging purposes)
         cost_per_request: Optional field - cost per request to the target endpoint
         setup_model_rewriter: Optional rewrite of the setup frame's model before it reaches the upstream
+        frame_redaction: Optional secrets removed from every upstream frame before it is relayed or logged
+        session_guard: Optional recurring check that closes the relay with a policy violation once it fails
     """
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.proxy_server import proxy_config, proxy_logging_obj
@@ -2405,6 +2785,7 @@ async def websocket_passthrough_request(
         litellm_call_id=litellm_call_id,
         request=dummy_request,
         logging_obj=logging_obj,
+        account_binding=account_binding,
     )
 
     # Update logging environment variables
@@ -2424,7 +2805,10 @@ async def websocket_passthrough_request(
         additional_args={
             "complete_input_dict": {},
             "api_base": target,
-            "headers": upstream_headers,
+            # Account routes carry a named credential in these headers; their values are never logged.
+            "headers": {name: "[redacted]" for name in upstream_headers}  # mutable-ok: logged copy only
+            if account_binding is not None
+            else upstream_headers,
         },
     )
 
@@ -2547,7 +2931,8 @@ async def websocket_passthrough_request(
             is_vertex_live: Final = bool(endpoint and "/vertex_ai/live" in endpoint)
             json_frame_ordinal: Final = count()
 
-            async def relay_upstream_frame(upstream_message: str | bytes) -> None:
+            async def relay_upstream_frame(received: str | bytes) -> None:
+                upstream_message: Final = _redacted_frame(received, frame_redaction)
                 if isinstance(upstream_message, bytes):
                     await websocket.send_bytes(upstream_message)
                 else:
@@ -2577,11 +2962,14 @@ async def websocket_passthrough_request(
                     )
                     raise
 
-            # Create tasks for bidirectional message forwarding
-            tasks: Final = [
+            guard_task: Final = (
+                asyncio.create_task(_session_revoked(session_guard)) if session_guard is not None else None
+            )
+            tasks: Final = (
                 asyncio.create_task(forward_client_to_upstream()),
                 asyncio.create_task(forward_upstream_to_client()),
-            ]
+                *((guard_task,) if guard_task is not None else ()),
+            )
 
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
@@ -2598,6 +2986,9 @@ async def websocket_passthrough_request(
                 exception = task.exception()
                 if exception is not None:
                     raise exception
+
+            if guard_task in done and _client_socket_is_open(websocket):
+                await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION, reason=_ACCESS_REVOKED_REASON)
 
             upstream_close: Final = _upstream_close_to_relay(task.result() for task in done)
             if upstream_close is not None and _client_socket_is_open(websocket):
@@ -2940,6 +3331,14 @@ class SafeRouteAdder:
         )
         return True
 
+    @staticmethod
+    def add_websocket_route_if_not_exists(app: FastAPI, path: str, endpoint: Callable[..., object]) -> bool:
+        """Account WebSocket routes look up their current definition per connection, so one route per path suffices."""
+        if any(isinstance(route, WebSocketRoute) and route.path == path for route in app.routes):
+            return False
+        app.add_api_websocket_route(path=path, endpoint=endpoint)
+        return True
+
 
 class InitPassThroughEndpointHelpers:
     @staticmethod
@@ -2959,8 +3358,13 @@ class InitPassThroughEndpointHelpers:
         config_file_path: str | None = None,
         auth: bool = False,
         timeout: float | None = None,
+        account_credential: AccountHeaderCredential | None = None,
     ):
         """Add exact path route for pass-through endpoint"""
+        if account_credential is not None:
+            validate_account_route(
+                target, auth, forward_headers, custom_headers or {}, default_query_params, account_credential, methods
+            )
         # Default to all methods if none specified (backward compatibility)
         if methods is None or len(methods) == 0:
             methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -2985,25 +3389,28 @@ class InitPassThroughEndpointHelpers:
         )
 
         # Use SafeRouteAdder to only add route if it doesn't exist on the app
-        SafeRouteAdder.add_api_route_if_not_exists(
-            app=app,
-            path=path,
-            endpoint=create_pass_through_route(
-                path,
-                target,
-                custom_headers,
-                forward_headers,
-                merge_query_params,
-                dependencies,
-                cost_per_request=cost_per_request,
-                default_query_params=default_query_params,
-                guardrails=guardrails,
-                config_file_path=config_file_path,
-                timeout=timeout,
-            ),
-            methods=methods,
-            dependencies=dependencies,
-        )
+        if account_credential is not None and is_websocket_route(methods):
+            _ = SafeRouteAdder.add_websocket_route_if_not_exists(app, path, create_account_websocket_route(path))
+        else:
+            SafeRouteAdder.add_api_route_if_not_exists(
+                app=app,
+                path=path,
+                endpoint=create_pass_through_route(
+                    path,
+                    target,
+                    custom_headers,
+                    forward_headers,
+                    merge_query_params,
+                    dependencies,
+                    cost_per_request=cost_per_request,
+                    default_query_params=default_query_params,
+                    guardrails=guardrails,
+                    config_file_path=config_file_path,
+                    timeout=timeout,
+                ),
+                methods=methods,
+                dependencies=dependencies,
+            )
 
         # Always register/update the route metadata (headers, target) even if FastAPI route exists
         _registered_pass_through_routes[route_key] = {
@@ -3022,6 +3429,7 @@ class InitPassThroughEndpointHelpers:
                 "cost_per_request": cost_per_request,
                 "guardrails": guardrails,
                 "timeout": timeout,
+                **({"account_credential": account_credential} if account_credential is not None else {}),
             },
         }
 
@@ -3042,8 +3450,13 @@ class InitPassThroughEndpointHelpers:
         config_file_path: str | None = None,
         auth: bool = False,
         timeout: float | None = None,
+        account_credential: AccountHeaderCredential | None = None,
     ):
         """Add wildcard route for sub-paths"""
+        if account_credential is not None:
+            validate_account_route(
+                target, auth, forward_headers, custom_headers or {}, default_query_params, account_credential, methods
+            )
         # Default to all methods if none specified (backward compatibility)
         if methods is None or len(methods) == 0:
             methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -3106,6 +3519,7 @@ class InitPassThroughEndpointHelpers:
                 "cost_per_request": cost_per_request,
                 "guardrails": guardrails,
                 "timeout": timeout,
+                **({"account_credential": account_credential} if account_credential is not None else {}),
             },
         }
 
@@ -3234,6 +3648,14 @@ def _get_combined_pass_through_endpoints(
     return pass_through_endpoints + config_pass_through_endpoints
 
 
+def _registered_account_policy(raw: object, path: str, include_subpath: bool) -> AccountHeaderCredential | None:
+    if raw is None:
+        return None
+    policy: Final = AccountHeaderCredential.model_validate(raw)
+    validate_account_resources(path, include_subpath, policy)
+    return policy
+
+
 async def _register_pass_through_endpoint(
     endpoint: dict[str, object] | PassThroughGenericEndpoint,
     app: FastAPI,
@@ -3275,6 +3697,9 @@ async def _register_pass_through_endpoint(
 
     if target is None:
         return
+    account_policy: Final = _registered_account_policy(
+        endpoint_data.get("account_credential"), path, endpoint_data.get("include_subpath", False) is True
+    )
 
     guardrails: Final = endpoint_data.get("guardrails")
     methods: Final = endpoint_data.get("methods")
@@ -3298,6 +3723,7 @@ async def _register_pass_through_endpoint(
         config_file_path=config_file_path,
         auth=auth_enforced,
         timeout=timeout,
+        account_credential=account_policy,
     )
 
     methods_for_key: Final = methods if methods else ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -3325,6 +3751,7 @@ async def _register_pass_through_endpoint(
             config_file_path=config_file_path,
             auth=auth_enforced,
             timeout=timeout,
+            account_credential=account_policy,
         )
         visited_endpoints.add(f"{endpoint_id}:subpath:{path}:{methods_str}")
 
@@ -3593,19 +4020,165 @@ async def get_pass_through_endpoints(
     return PassThroughEndpointResponse(endpoints=pass_through_endpoints)
 
 
-@router.post(
-    "/config/pass_through_endpoint/{endpoint_id}",
-    dependencies=[Depends(user_api_key_auth)],
-)
-async def update_pass_through_endpoints(
-    endpoint_id: str,
-    data: PassThroughGenericEndpoint,
-    request: Request,
-    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
-):
-    """
-    Update a pass-through endpoint by ID.
-    """
+_ENDPOINT_JSON: Final[TypeAdapter[dict[str, JsonValue]]] = TypeAdapter(dict[str, JsonValue])
+
+
+def pass_through_settings_database() -> GrantDatabase | None:
+    from litellm.proxy import proxy_server
+
+    if proxy_server.prisma_client is None or proxy_server.proxy_config.settings.owned_by_config(
+        "pass_through_endpoints"
+    ):
+        return None
+    return cast(  # cast-ok: PrismaClient provides the tx() protocol used for account configuration
+        GrantDatabase, proxy_server.prisma_client
+    )
+
+
+SettingsDatabase: TypeAlias = Annotated[GrantDatabase | None, Depends(pass_through_settings_database)]
+
+
+def _stored_routes(settings: Mapping[str, JsonValue]) -> tuple[Mapping[str, JsonValue], ...]:
+    value: Final = settings.get("pass_through_endpoints")
+    return tuple(entry for entry in value if isinstance(entry, Mapping)) if isinstance(value, list) else ()
+
+
+def _route_with_id(routes: tuple[Mapping[str, JsonValue], ...], endpoint_id: str) -> Mapping[str, JsonValue] | None:
+    matches: Final = tuple(route for route in routes if route.get("id") == endpoint_id)
+    return matches[0] if len(matches) == 1 else None
+
+
+class RoutesPublisher(Protocol):
+    async def __call__(self, mutation: RoutesMutation, user_api_key_dict: UserAPIKeyAuth, /) -> None: ...
+
+
+async def publish_settings_routes(mutation: RoutesMutation, user_api_key_dict: UserAPIKeyAuth, /) -> None:
+    from litellm.proxy.proxy_server import create_config_audit_log, proxy_config
+
+    await invalidate_config_param("general_settings")
+    proxy_config.settings.apply_db_row("general_settings", mutation.after)
+    asyncio.create_task(
+        create_config_audit_log(
+            "general_settings", "updated", dict(mutation.before), dict(mutation.after), user_api_key_dict
+        )
+    )
+
+
+def settings_routes_publisher() -> RoutesPublisher:
+    return publish_settings_routes
+
+
+SettingsPublisher: TypeAlias = Annotated[RoutesPublisher | None, Depends(settings_routes_publisher)]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredRoutes:
+    database: GrantDatabase
+    publish: RoutesPublisher
+
+
+async def _commit_stored_routes(
+    stored: StoredRoutes,
+    plan: RoutesPlan,
+    user_api_key_dict: UserAPIKeyAuth,
+    removed_route_id: str | None = None,
+) -> RoutesMutation | GrantFailure:
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(status_code=400, detail={"error": CommonProxyErrors.not_allowed_access.value})
+    mutation: Final = await mutate_settings_routes(stored.database, plan, removed_route_id)
+    if isinstance(mutation, GrantFailure):
+        return mutation
+    await stored.publish(mutation, user_api_key_dict)
+    return mutation
+
+
+async def _create_stored_endpoint(
+    stored_routes: StoredRoutes, data_dict: Mapping[str, JsonValue], user_api_key_dict: UserAPIKeyAuth
+) -> None:
+    def plan(routes: tuple[Mapping[str, JsonValue], ...]) -> tuple[Mapping[str, JsonValue], ...] | GrantFailure:
+        if any(route.get("id") == data_dict.get("id") for route in routes):
+            return GrantFailure("conflict")
+        return (*routes, data_dict)
+
+    created: Final = await _commit_stored_routes(stored_routes, plan, user_api_key_dict)
+    if isinstance(created, GrantFailure):
+        raise HTTPException(
+            status_code=409 if created.kind == "conflict" else 400,
+            detail={"error": "A pass-through endpoint with this ID already exists"}
+            if created.kind == "conflict"
+            else {"error": "Stored pass-through endpoints are invalid"},
+        )
+
+
+async def _update_stored_endpoint(
+    stored_routes: StoredRoutes, endpoint_id: str, data: PassThroughGenericEndpoint, user_api_key_dict: UserAPIKeyAuth
+) -> PassThroughGenericEndpoint:
+    # Only fields the caller sent are merged, so omitted fields keep their stored value
+    update_data: Final = _ENDPOINT_JSON.validate_python(
+        data.model_dump(mode="json", exclude_unset=True, exclude_none=True, exclude={"is_from_config"})
+    )
+
+    def plan(routes: tuple[Mapping[str, JsonValue], ...]) -> tuple[Mapping[str, JsonValue], ...] | GrantFailure:
+        existing: Final = _route_with_id(routes, endpoint_id)
+        if existing is None:
+            return GrantFailure("not_found")
+        new_id: Final = update_data.get("id", endpoint_id)
+        if new_id != endpoint_id and any(route.get("id") == new_id for route in routes):
+            return GrantFailure("conflict")
+        merged: Final = {
+            **PassThroughGenericEndpoint.model_validate(existing).model_dump(mode="json", exclude={"is_from_config"}),
+            **update_data,
+            "id": update_data.get("id", existing.get("id")),
+        }
+        replacement: Final = PassThroughGenericEndpoint.model_validate(merged).model_dump(
+            mode="json", exclude={"is_from_config"}
+        )
+        return tuple(replacement if route.get("id") == endpoint_id else route for route in routes)
+
+    updated: Final = await _commit_stored_routes(stored_routes, plan, user_api_key_dict)
+    if isinstance(updated, GrantFailure):
+        raise HTTPException(
+            status_code={"not_found": 404, "conflict": 409}.get(updated.kind, 400),
+            detail={
+                "not_found": {"error": f"Endpoint with ID '{endpoint_id}' not found"},
+                "conflict": {"error": "A pass-through endpoint with this ID already exists"},
+            }.get(updated.kind, {"error": "Stored pass-through endpoints are invalid"}),
+        )
+    requested_id: Final = update_data.get("id")
+    stored: Final = _route_with_id(
+        _stored_routes(updated.after), requested_id if isinstance(requested_id, str) else endpoint_id
+    )
+    if stored is None:
+        raise HTTPException(status_code=500, detail={"error": "Updated pass-through endpoint could not be read back"})
+    return PassThroughGenericEndpoint.model_validate(stored)
+
+
+async def _delete_stored_endpoint(
+    stored_routes: StoredRoutes, endpoint_id: str, user_api_key_dict: UserAPIKeyAuth
+) -> PassThroughEndpointResponse:
+    def plan(routes: tuple[Mapping[str, JsonValue], ...]) -> tuple[Mapping[str, JsonValue], ...] | GrantFailure:
+        if _route_with_id(routes, endpoint_id) is None:
+            return GrantFailure("not_found")
+        return tuple(route for route in routes if route.get("id") != endpoint_id)
+
+    deleted: Final = await _commit_stored_routes(stored_routes, plan, user_api_key_dict, endpoint_id)
+    if isinstance(deleted, GrantFailure):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"Endpoint with ID '{endpoint_id}' was not found in pass-through endpoint list."}
+            if deleted.kind == "not_found"
+            else {"error": "Stored pass-through endpoints are invalid"},
+        )
+    removed: Final = _route_with_id(_stored_routes(deleted.before), endpoint_id)
+    InitPassThroughEndpointHelpers.remove_endpoint_routes(endpoint_id)
+    return PassThroughEndpointResponse(
+        endpoints=[PassThroughGenericEndpoint.model_validate(removed)] if removed is not None else []
+    )
+
+
+async def _update_endpoint_in_settings_view(
+    endpoint_id: str, data: PassThroughGenericEndpoint, user_api_key_dict: UserAPIKeyAuth
+) -> PassThroughGenericEndpoint:
     from litellm.proxy.proxy_server import (
         get_config_general_settings,
         update_config_general_settings,
@@ -3677,9 +4250,6 @@ async def update_pass_through_endpoints(
     # Update the list
     pass_through_endpoint_data[endpoint_index] = endpoint_dict
 
-    # Remove old routes from registry before they get re-registered
-    InitPassThroughEndpointHelpers.remove_endpoint_routes(endpoint_id)
-
     ## Update db
     updated_data: Final = ConfigFieldUpdate(
         field_name="pass_through_endpoints",
@@ -3688,6 +4258,36 @@ async def update_pass_through_endpoints(
     )
 
     await update_config_general_settings(data=updated_data, user_api_key_dict=user_api_key_dict)
+    return updated_endpoint
+
+
+@router.post(
+    "/config/pass_through_endpoint/{endpoint_id}",
+    dependencies=[Depends(user_api_key_auth)],
+)
+async def update_pass_through_endpoints(
+    endpoint_id: str,
+    data: PassThroughGenericEndpoint,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    settings_database: SettingsDatabase = None,
+    settings_publisher: SettingsPublisher = None,
+):
+    """
+    Update a pass-through endpoint by ID.
+    """
+    updated_endpoint: Final = await (
+        _update_stored_endpoint(
+            StoredRoutes(settings_database, settings_publisher or publish_settings_routes),
+            endpoint_id,
+            data,
+            user_api_key_dict,
+        )
+        if settings_database is not None
+        else _update_endpoint_in_settings_view(endpoint_id, data, user_api_key_dict)
+    )
+    # Remove old routes from registry before they get re-registered
+    InitPassThroughEndpointHelpers.remove_endpoint_routes(endpoint_id)
 
     # Re-register the route with updated headers
     _custom_headers: dict | None = updated_endpoint.headers or {}
@@ -3710,6 +4310,11 @@ async def update_pass_through_endpoints(
             default_query_params=updated_endpoint.default_query_params,
             auth=updated_endpoint.auth,
             timeout=updated_endpoint.timeout,
+            **(
+                {"account_credential": updated_endpoint.account_credential}
+                if updated_endpoint.account_credential is not None
+                else {}
+            ),
         )
     else:
         InitPassThroughEndpointHelpers.add_exact_path_route(
@@ -3727,24 +4332,19 @@ async def update_pass_through_endpoints(
             default_query_params=updated_endpoint.default_query_params,
             auth=updated_endpoint.auth,
             timeout=updated_endpoint.timeout,
+            **(
+                {"account_credential": updated_endpoint.account_credential}
+                if updated_endpoint.account_credential is not None
+                else {}
+            ),
         )
 
     return PassThroughEndpointResponse(endpoints=[updated_endpoint] if updated_endpoint else [])
 
 
-@router.post(
-    "/config/pass_through_endpoint",
-    dependencies=[Depends(user_api_key_auth)],
-)
-async def create_pass_through_endpoints(
-    data: PassThroughGenericEndpoint,
-    request: Request,
-    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
-):
-    """
-    Create new pass-through endpoint
-    """
-    from litellm._uuid import uuid
+async def _create_endpoint_in_settings_view(
+    data_dict: Mapping[str, JsonValue], user_api_key_dict: UserAPIKeyAuth
+) -> None:
     from litellm.proxy.proxy_server import (
         get_config_general_settings,
         update_config_general_settings,
@@ -3759,16 +4359,10 @@ async def create_pass_through_endpoints(
     except Exception:
         response = ConfigFieldInfo(field_name="pass_through_endpoints", field_value=None)
 
-    ## Auto-generate ID if not provided
-    # Exclude is_from_config as it's a response-only field (computed at read time)
-    data_dict: Final = data.model_dump(exclude={"is_from_config"})
-    if data_dict.get("id") is None:
-        data_dict["id"] = str(uuid.uuid4())
-
     if response.field_value is None:
-        response.field_value = [data_dict]
+        response.field_value = [dict(data_dict)]
     elif isinstance(response.field_value, list):
-        response.field_value.append(data_dict)
+        response.field_value.append(dict(data_dict))
 
     ## Update db
     updated_data: Final = ConfigFieldUpdate(
@@ -3777,6 +4371,35 @@ async def create_pass_through_endpoints(
         config_type="general_settings",
     )
     await update_config_general_settings(data=updated_data, user_api_key_dict=user_api_key_dict)
+
+
+@router.post(
+    "/config/pass_through_endpoint",
+    dependencies=[Depends(user_api_key_auth)],
+)
+async def create_pass_through_endpoints(
+    data: PassThroughGenericEndpoint,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    settings_database: SettingsDatabase = None,
+    settings_publisher: SettingsPublisher = None,
+):
+    """
+    Create new pass-through endpoint
+    """
+    from litellm._uuid import uuid
+
+    ## Auto-generate ID if not provided
+    # Exclude is_from_config as it's a response-only field (computed at read time)
+    dumped: Final = _ENDPOINT_JSON.validate_python(data.model_dump(mode="json", exclude={"is_from_config"}))
+    data_dict: Final = MappingProxyType({**dumped, "id": dumped.get("id") or str(uuid.uuid4())})
+
+    if settings_database is not None:
+        await _create_stored_endpoint(
+            StoredRoutes(settings_database, settings_publisher or publish_settings_routes), data_dict, user_api_key_dict
+        )
+    else:
+        await _create_endpoint_in_settings_view(data_dict, user_api_key_dict)
 
     # Return the created endpoint with the generated ID
     created_endpoint: Final = PassThroughGenericEndpoint.model_validate(data_dict)
@@ -3802,6 +4425,11 @@ async def create_pass_through_endpoints(
             default_query_params=created_endpoint.default_query_params,
             auth=created_endpoint.auth,
             timeout=created_endpoint.timeout,
+            **(
+                {"account_credential": created_endpoint.account_credential}
+                if created_endpoint.account_credential is not None
+                else {}
+            ),
         )
     else:
         InitPassThroughEndpointHelpers.add_exact_path_route(
@@ -3819,6 +4447,11 @@ async def create_pass_through_endpoints(
             default_query_params=created_endpoint.default_query_params,
             auth=created_endpoint.auth,
             timeout=created_endpoint.timeout,
+            **(
+                {"account_credential": created_endpoint.account_credential}
+                if created_endpoint.account_credential is not None
+                else {}
+            ),
         )
 
     return PassThroughEndpointResponse(endpoints=[created_endpoint])
@@ -3832,12 +4465,20 @@ async def create_pass_through_endpoints(
 async def delete_pass_through_endpoints(
     endpoint_id: str,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    settings_database: SettingsDatabase = None,
+    settings_publisher: SettingsPublisher = None,
 ):
     """
     Delete a pass-through endpoint by ID.
 
     Returns - the deleted endpoint
     """
+    if settings_database is not None:
+        return await _delete_stored_endpoint(
+            StoredRoutes(settings_database, settings_publisher or publish_settings_routes),
+            endpoint_id,
+            user_api_key_dict,
+        )
     from litellm.proxy.proxy_server import (
         get_config_general_settings,
         update_config_general_settings,

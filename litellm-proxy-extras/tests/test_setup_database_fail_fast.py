@@ -6,7 +6,9 @@ The v2 resolver is opt-in via `--use_v2_migration_resolver` / the
 """
 
 import subprocess
+from collections.abc import Mapping
 from types import SimpleNamespace
+from typing import Final
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -63,6 +65,15 @@ def test_strip_prisma_query_params_removes_connection_limit():
     assert "connection_limit" not in stripped
     assert "pool_timeout" not in stripped
     assert "sslmode=require" in stripped
+
+
+def test_strip_prisma_query_params_keeps_a_unix_socket_host_for_psycopg():
+    from psycopg.conninfo import conninfo_to_dict
+
+    url: Final[str] = "postgresql://user@localhost/db?host=/run/postgresql&schema=litellm&connection_limit=5"
+    parsed: Final[Mapping[str, object]] = conninfo_to_dict(ProxyExtrasDBManager._strip_prisma_query_params(url))
+    assert (parsed["host"], parsed["dbname"], parsed["user"]) == ("/run/postgresql", "db", "user")
+    assert "schema" not in parsed and "connection_limit" not in parsed
 
 
 def test_strip_prisma_query_params_passthrough_no_query():

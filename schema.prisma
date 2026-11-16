@@ -39,6 +39,20 @@ model LiteLLM_BudgetTable {
 }
 
 // Models on proxy
+model LiteLLM_AccountResourceOwnership {
+  account_id           String
+  resource_type        String
+  resource_id          String
+  route_id             String
+  owner_application_id String
+  provenance           String
+  creator_key_hash     String?
+  created_at           DateTime @default(now())
+
+  @@id([account_id, resource_type, resource_id])
+  @@index([owner_application_id], map: "idx_account_resource_owner")
+}
+
 model LiteLLM_CredentialsTable {
   credential_id String @id @default(uuid())
   credential_name String @unique

@@ -438,11 +438,11 @@ def test_rag_ingest_db_managed_store_drops_the_callers_credential_name(client_in
             **_ingest_form({"vector_store_id": "db-store", "litellm_credential_name": "team-openai"}),
         )
 
-    assert response.status_code == 200, response.json()
-    forwarded = mock_aingest.await_args.kwargs["ingest_options"]["vector_store"]
-    assert "litellm_credential_name" not in forwarded
-    assert forwarded["custom_llm_provider"] == "openai"
-    assert forwarded["ttl_days"] == 7
+    # CubeLLM rejects a client-chosen named credential outright instead of dropping it (see
+    # cube_control/DEVELOPMENT.md, "Native credential selection boundary"); nothing is ingested.
+    assert response.status_code == 400, response.json()
+    assert "litellm_credential_name" in str(response.json())
+    mock_aingest.assert_not_awaited()
 
 
 def test_rag_ingest_registry_store_credential_name_beats_the_callers(client_internal_user):
@@ -459,9 +459,9 @@ def test_rag_ingest_registry_store_credential_name_beats_the_callers(client_inte
             **_ingest_form({"vector_store_id": "cred-store", "litellm_credential_name": "team-openai"}),
         )
 
-    assert response.status_code == 200, response.json()
-    forwarded = mock_aingest.await_args.kwargs["ingest_options"]["vector_store"]
-    assert forwarded["litellm_credential_name"] == "registry-openai"
+    # The caller cannot name a credential at all (CubeLLM boundary); the request is refused before ingestion.
+    assert response.status_code == 400, response.json()
+    mock_aingest.assert_not_awaited()
 
 
 def test_rag_ingest_registry_store_keeps_the_callers_vertex_embedding_throttle(client_internal_user):

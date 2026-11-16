@@ -157,7 +157,9 @@ async def get_credentials(
         masked_credentials: Final = [
             {
                 "credential_name": credential.credential_name,
-                "credential_values": _get_masked_values(credential.credential_values),
+                "credential_values": _get_masked_values(
+                    credential.credential_values, mask_all_values=True, unmasked_length=0
+                ),
                 "credential_info": credential.credential_info,
             }
             for credential in litellm.credential_list
@@ -189,7 +191,8 @@ async def get_credential_by_name(
                     credential_name=credential.credential_name,
                     credential_values=_get_masked_values(
                         credential.credential_values,
-                        unmasked_length=4,
+                        mask_all_values=True,
+                        unmasked_length=0,
                         number_of_asterisks=4,
                     ),
                     credential_info=credential.credential_info,
@@ -232,7 +235,8 @@ async def get_credential_by_model(
             raise HTTPException(status_code=404, detail="Model not found")
         masked_credential_values: Final = _get_masked_values(
             credential_values,
-            unmasked_length=4,
+            mask_all_values=True,
+            unmasked_length=0,
             number_of_asterisks=4,
         )
         credential: Final = CredentialItem(

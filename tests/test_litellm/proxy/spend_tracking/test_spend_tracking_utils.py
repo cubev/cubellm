@@ -74,6 +74,97 @@ def _get_additional_usage_values_for_usage(usage: litellm.Usage) -> dict:
     return metadata["additional_usage_values"]
 
 
+@pytest.mark.parametrize(
+    "binding,expected",
+    [
+        ("application-one", "application-one"),
+        (None, None),
+        (True, None),
+        ({"nested": "application"}, None),
+        ("invalid/application", None),
+        ("a" * 129, None),
+    ],
+)
+def test_authenticated_application_binding_is_stamped_and_retained_without_other_key_metadata(
+    binding: object,
+    expected: str | None,
+) -> None:
+    auth: Final = UserAPIKeyAuth(
+        api_key="inert-fixture",
+        metadata={
+            "cube_application_id": binding,
+            "opaque_vendor_value": "private-key-metadata-canary",
+        },
+    )
+    request: Final = {
+        "metadata": {
+            "user_api_key_application_id": "forged-by-client",
+            "provider_account_id": "forged-account",
+            "provider_cost_status": "verified",
+            "_cube_account_binding": {"account_id": "forged-account"},
+        }
+    }
+    result: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(request, auth, "metadata")
+    assert result["metadata"]["user_api_key_application_id"] == expected
+    assert result["metadata"]["provider_account_id"] is None
+    assert result["metadata"]["provider_cost_status"] is None
+    assert result["metadata"]["_cube_account_binding"] is None
+    standard: Final = StandardLoggingPayloadSetup.get_standard_logging_metadata(result["metadata"])
+    stored: Final = _get_spend_logs_metadata(dict(standard), user_api_key_auth=auth)
+    assert stored.get("user_api_key_application_id") == expected
+    assert "private-key-metadata-canary" not in json.dumps(stored)
+    assert auth.metadata["cube_application_id"] == binding
+
+
+def test_management_target_metadata_cannot_reassign_the_calling_application() -> None:
+    auth: Final = UserAPIKeyAuth(api_key="inert-fixture", metadata={"cube_application_id": "calling-app"})
+    request: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+        {"metadata": {}}, auth, "metadata"
+    )
+    merged: Final = LiteLLMProxyRequestSetup.add_management_endpoint_metadata_to_request_metadata(
+        request, {"cube_application_id": "target-app"}, "metadata"
+    )
+    standard: Final = StandardLoggingPayloadSetup.get_standard_logging_metadata(merged["metadata"])
+    stored: Final = _get_spend_logs_metadata(dict(standard), user_api_key_auth=auth)
+    assert stored.get("user_api_key_application_id") == "calling-app"
+    assert auth.metadata["cube_application_id"] == "calling-app"
+
+
+@pytest.mark.parametrize("authenticated", [True, False])
+def test_application_binding_requires_an_authenticated_object_at_the_spend_writer(authenticated: bool) -> None:
+    auth: Final = UserAPIKeyAuth(api_key="inert-fixture", metadata={"cube_application_id": "server-app",
+                                                                  "opaque_vendor_value":"private-key-metadata-canary"})
+    metadata: Final = {
+        "user_api_key_application_id": "forged-by-client",
+        "user_api_key_auth": auth if authenticated else auth.model_dump(),
+    }
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={"model": "gpt-4o-mini", "litellm_params": {"metadata": metadata}},
+        response_obj=litellm.ModelResponse(
+            id="fixture", choices=[], usage=litellm.Usage(prompt_tokens=1, completion_tokens=1)
+        ),
+        start_time=now,
+        end_time=now,
+    )
+    stored: Final = json.loads(payload["metadata"])
+    assert stored.get("user_api_key_application_id") == ("server-app" if authenticated else None)
+    assert "private-key-metadata-canary" not in safe_dumps(payload)
+
+
+def test_application_binding_keeps_request_snapshot_after_key_metadata_changes() -> None:
+    auth: Final = UserAPIKeyAuth(api_key="inert-fixture",metadata={"cube_application_id":"original-app"})
+    request: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata({"metadata":{}},auth,"metadata")
+    auth.metadata["cube_application_id"] = "later-app"
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={"model":"gpt-4o-mini","litellm_params":{"metadata":request["metadata"]}},
+        response_obj=litellm.ModelResponse(id="fixture",choices=[],usage=litellm.Usage(prompt_tokens=1,completion_tokens=1)),
+        start_time=now,end_time=now,
+    )
+    assert json.loads(payload["metadata"]).get("user_api_key_application_id") == "original-app"
+
+
 @pytest.mark.parametrize("store_prompts,redact", [(True, False), (False, False), (True, True)])
 def test_classifier_audit_spend_storage_obeys_privacy_and_truncation(monkeypatch, store_prompts, redact):
     from litellm.proxy import proxy_server
@@ -83,10 +174,16 @@ def test_classifier_audit_spend_storage_obeys_privacy_and_truncation(monkeypatch
         "classifier_input": {"system": "rubric" * 1000, "messages": [{"role": "user", "content": "ask"}]},
         "originating_request_masked": {"input": "source-only", "api_key": "REDACTED"},
     }
-    stored: Final = json.loads(_get_proxy_server_request_for_spend_logs_payload(
-        metadata={}, litellm_params={"proxy_server_request": {"body": {"model": "classifier"}}},
-        kwargs={"standard_logging_object": audit, "standard_callback_dynamic_params": {"turn_off_message_logging": redact}},
-    ))
+    stored: Final = json.loads(
+        _get_proxy_server_request_for_spend_logs_payload(
+            metadata={},
+            litellm_params={"proxy_server_request": {"body": {"model": "classifier"}}},
+            kwargs={
+                "standard_logging_object": audit,
+                "standard_callback_dynamic_params": {"turn_off_message_logging": redact},
+            },
+        )
+    )
     if not store_prompts or redact:
         assert "classifier_input" not in stored
         assert "originating_request_masked" not in stored
@@ -212,9 +309,7 @@ def test_batch_lifecycle_rows_derive_the_same_session_from_the_batch_id():
     from litellm.proxy.spend_tracking.spend_tracking_utils import _get_batch_trace_session_id
 
     create_session: Final = _get_batch_trace_session_id(call_type="acreate_batch", request_id="batch-uid-1")
-    cost_session: Final = _get_batch_trace_session_id(
-        call_type="aretrieve_batch", request_id="batch-uid-1_batch_cost"
-    )
+    cost_session: Final = _get_batch_trace_session_id(call_type="aretrieve_batch", request_id="batch-uid-1_batch_cost")
     assert create_session == cost_session == "batch-uid-1"
 
 
@@ -612,7 +707,7 @@ def test_sanitize_request_body_for_spend_logs_payload_mixed_types():
     request_body = {
         "text": long_string,
         "number": 42,
-        "nested": {"list": ["short", long_string], "dict": {"key": long_string}},
+        "nested": {"list": ["short", long_string], "dict": {"text": long_string}},
     }
     sanitized = _sanitize_request_body_for_spend_logs_payload(request_body)
 
@@ -631,7 +726,7 @@ def test_sanitize_request_body_for_spend_logs_payload_mixed_types():
     assert sanitized["number"] == 42
     assert sanitized["nested"]["list"][0] == "short"
     assert len(sanitized["nested"]["list"][1]) == expected_length
-    assert len(sanitized["nested"]["dict"]["key"]) == expected_length
+    assert len(sanitized["nested"]["dict"]["text"]) == expected_length
 
 
 def test_sanitize_request_body_for_spend_logs_payload_uses_runtime_env_override(
@@ -4974,7 +5069,7 @@ ANTHROPIC_MESSAGES_SSE_CHUNKS: Final = (
     'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
     'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
     '"usage":{"output_tokens":4}}\n\n',
-    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
 )
 
 
@@ -5012,9 +5107,7 @@ def test_spend_log_request_id_is_the_message_id_a_non_streaming_messages_caller_
     """
     logging_obj = _anthropic_messages_logging_obj(stream=False)
 
-    logged_response = logging_obj._handle_anthropic_messages_response_logging(
-        result=ANTHROPIC_MESSAGES_RESPONSE
-    )
+    logged_response = logging_obj._handle_anthropic_messages_response_logging(result=ANTHROPIC_MESSAGES_RESPONSE)
 
     assert logged_response.id == "msg_01Lit6806NonStreaming"
     assert (
@@ -5090,9 +5183,7 @@ def test_spend_log_request_id_still_falls_back_to_litellm_call_id_without_a_prov
         end_time=datetime.datetime.now(timezone.utc),
         logging_obj=logging_obj,
     )
-    assert logging_obj.model_call_details["complete_streaming_response"].id == (
-        "6806cafe-0000-4000-8000-000000000001"
-    )
+    assert logging_obj.model_call_details["complete_streaming_response"].id == ("6806cafe-0000-4000-8000-000000000001")
 
 
 def test_spend_log_request_id_for_chat_completions_is_untouched():
@@ -5273,11 +5364,198 @@ def test_baseline_estimate_metadata_comes_from_the_logging_stamp() -> None:
     supplied: Final = MappingProxyType({"version": 1, "status": "estimated", "reason": "caller_supplied"})
     recorded: Final = MappingProxyType({"version": 1, "status": "unknown", "reason": "history_unavailable"})
     result: Final = _get_spend_logs_metadata(
-        {"autorouter_savings": 999.0, "autorouter_savings_estimate": supplied},  # mutable-ok: legacy metadata helper accepts dicts
+        {
+            "autorouter_savings": 999.0,
+            "autorouter_savings_estimate": supplied,
+        },  # mutable-ok: legacy metadata helper accepts dicts
         autorouter_savings=None,
         autorouter_savings_estimate=recorded,
     )
     assert result["autorouter_savings"] is None
     assert result["autorouter_savings_estimate"] == recorded
-    absent: Final = _get_spend_logs_metadata({"autorouter_savings_estimate": supplied})  # mutable-ok: legacy metadata helper accepts dicts
+    absent: Final = _get_spend_logs_metadata(
+        {"autorouter_savings_estimate": supplied}
+    )  # mutable-ok: legacy metadata helper accepts dicts
     assert absent["autorouter_savings_estimate"] is None
+
+
+def test_request_credentials_are_removed_at_every_depth_without_changing_provider_input() -> None:
+    marker: Final = "public-canary-not-a-credential"
+    for key in (
+        "api_key",
+        "key",
+        "keys",
+        "apiKey",
+        "API-KEY",
+        "Authorization",
+        "X-API-KEY",
+        "x-goog-api-key",
+        "azure_ad_token",
+        "access_token",
+        "api_token",
+        "client_secret",
+        "api_secret",
+        "secret_key",
+        "AWS_SECRET_ACCESS_KEY",
+        "aws_session_token",
+        "refresh_token",
+        "private_key",
+        "password",
+        "xi-api-key",
+        "credential_values",
+        "SECRET_FIELDS",
+    ):
+        original: Final[dict[str, object]] = {
+            "model": "fixture-model",
+            key: marker,
+            "nested": [{key: marker, "keep": 1}, {"headers": {key: marker, "content-type": "application/json"}}],
+        }
+        sanitized: Final = _sanitize_request_body_for_spend_logs_payload(original)
+        assert sanitized == {
+            "model": "fixture-model",
+            "nested": [{"keep": 1}, {"headers": {"content-type": "application/json"}}],
+        }
+        assert original[key] == marker
+        assert original["nested"] == [
+            {key: marker, "keep": 1},
+            {"headers": {key: marker, "content-type": "application/json"}},
+        ]
+
+
+@pytest.mark.parametrize("store_prompts", (False, True))
+def test_native_credential_values_are_redacted_without_vendor_specific_field_names(store_prompts: bool) -> None:
+    marker: Final = "public-canary-not-a-credential"
+    values: Final = MappingProxyType({"vendor_specific_secret": marker, "nested": {"another_secret": marker}})
+    request: Final = MappingProxyType(
+        {
+            "credential_name": "fixture-credential",
+            "credential_values": values,
+            "credential_info": {"account_id": "fixture-account"},
+        }
+    )
+    assert _sanitize_request_body_for_spend_logs_payload(request) == {
+        "credential_name": "fixture-credential",
+        "credential_info": {"account_id": "fixture-account"},
+    }
+    assert values["vendor_specific_secret"] == marker
+    error: Final[StandardLoggingPayloadErrorInformation] = {
+        "error_code": "400",
+        "error_class": "ProviderError",
+        "llm_provider": "openai",
+        "error_message": json.dumps({"credential_values": dict(values), "detail": "public diagnostic"}),
+    }
+    with patch(
+        "litellm.proxy.spend_tracking.spend_tracking_utils.should_store_prompts_and_responses_in_spend_logs",
+        return_value=store_prompts,
+    ):
+        sanitized: Final = _sanitize_error_information_for_spend_logs(error)
+    assert marker not in json.dumps(sanitized)
+    assert "public diagnostic" in json.dumps(sanitized)
+
+
+@pytest.mark.parametrize("store_prompts", (False, True))
+def test_native_virtual_key_fields_do_not_enter_stored_request_or_error_logs(store_prompts: bool) -> None:
+    marker: Final = "inert-virtual-key-canary"
+    original: Final = {"key": marker, "nested": {"keys": [marker]}, "key_alias": "fixture-app"}
+    assert _sanitize_request_body_for_spend_logs_payload(original) == {"nested": {}, "key_alias": "fixture-app"}
+    error: Final[StandardLoggingPayloadErrorInformation] = {
+        "error_code": "400",
+        "error_class": "BadRequest",
+        "llm_provider": "openai",
+        "error_message": repr(original),
+        "traceback": json.dumps(original),
+    }
+    with patch(
+        "litellm.proxy.spend_tracking.spend_tracking_utils.should_store_prompts_and_responses_in_spend_logs",
+        return_value=store_prompts,
+    ):
+        sanitized: Final = _sanitize_error_information_for_spend_logs(error)
+    assert marker not in safe_dumps(sanitized)
+    assert original["key"] == marker
+
+
+def test_stored_success_request_excludes_credentials_even_when_body_logging_is_enabled() -> None:
+    marker: Final = "public-canary-not-a-credential"
+    original: Final = {
+        "model": "fixture-model",
+        "api_key": marker,
+        "messages": [{"role": "user", "content": "public message"}],
+    }
+    with patch(
+        "litellm.proxy.spend_tracking.spend_tracking_utils.should_store_prompts_and_responses_in_spend_logs",
+        return_value=True,
+    ):
+        payload: Final = _get_proxy_server_request_for_spend_logs_payload(
+            metadata={}, litellm_params={"proxy_server_request": {"body": original}}, kwargs={}
+        )
+    assert json.loads(payload) == {"model": "fixture-model", "messages": original["messages"]}
+    assert original["api_key"] == marker
+
+
+@pytest.mark.parametrize("trusted", (False, True))
+def test_provider_account_binding_requires_a_server_object_at_spend_writer(trusted: bool) -> None:
+    from litellm.proxy.pass_through_endpoints.account_credentials import AccountRouteBinding
+
+    binding: Final = AccountRouteBinding(
+        account_id="selected-account",
+        credential_name="fixture-credential",
+        origin="https://selected.example",
+        provider="selected-provider",
+    )
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "fixture-model",
+            "litellm_params": {
+                "metadata": {
+                    "provider_account_provider": "forged-provider",
+                    "provider_origin": "https://forged.example",
+                    "provider_account_id": "forged-account",
+                    "provider_account_source": "configured_credential",
+                    "provider_cost_status": "verified",
+                    "_cube_account_binding": binding if trusted else {"account_id": "selected-account"},
+                }
+            },
+        },
+        response_obj=litellm.ModelResponse(id="fixture-call", choices=[], usage=litellm.Usage()),
+        start_time=now,
+        end_time=now,
+    )
+    metadata: Final = json.loads(payload["metadata"])
+    assert metadata["provider_account_provider"] == ("selected-provider" if trusted else None)
+    assert metadata["provider_origin"] == ("https://selected.example" if trusted else None)
+    assert metadata["provider_account_id"] == ("selected-account" if trusted else None)
+    assert metadata["provider_account_source"] == ("configured_credential" if trusted else None)
+    assert metadata["provider_cost_status"] == ("unverified" if trusted else None)
+    assert "_cube_account_binding" not in metadata
+    assert "fixture-credential" not in payload["metadata"]
+
+
+def test_stored_provider_errors_never_echo_credentials_with_either_prompt_policy() -> None:
+    marker: Final = "public-canary-not-a-credential"
+    for store_prompts in (False, True):
+        error: Final[StandardLoggingPayloadErrorInformation] = {
+            "error_code": "401",
+            "error_class": "ProviderError",
+            "llm_provider": "openai",
+            "error_message": json.dumps({"apiKey": marker, "prompt": "public message"}),
+            "traceback": "api_key=" + marker + "\npublic trace",
+        }
+        with patch(
+            "litellm.proxy.spend_tracking.spend_tracking_utils.should_store_prompts_and_responses_in_spend_logs",
+            return_value=store_prompts,
+        ):
+            sanitized: Final = _sanitize_error_information_for_spend_logs(error)
+        assert sanitized == {
+            "error_code": "401",
+            "error_class": "ProviderError",
+            "llm_provider": "openai",
+            "error_message": json.dumps(
+                {
+                    "apiKey": REDACTED_BY_LITELM_STRING,
+                    "prompt": "public message" if store_prompts else REDACTED_BY_LITELM_STRING,
+                }
+            ),
+            "traceback": 'api_key="' + REDACTED_BY_LITELM_STRING + '"\npublic trace',
+        }
+        assert error["traceback"] == "api_key=" + marker + "\npublic trace"
