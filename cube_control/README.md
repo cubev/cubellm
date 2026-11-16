@@ -672,7 +672,7 @@ configuration/management endpoint with an explicit method list:
     "headers": [{"name":"Authorization","field":"api_key","prefix":"Bearer "}],
     "application_grants": [{
       "application_id": "example-app",
-      "key_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "key_hash": "<SHA-256 hex digest of the application key>",
       "account_id": "example-account",
       "path": "/example-account/quota",
       "methods": ["GET"]
