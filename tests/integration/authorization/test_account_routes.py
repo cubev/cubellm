@@ -716,13 +716,16 @@ def test_client_certificate_route_presents_the_account_certificate_only_for_the_
         assert [form for form in _encoded(query_key) if form in stored] == []
 
 
+def _websocket_url(gateway: Gateway, path: str, query: str = "") -> str:
+    return str(gateway.client.base_url).replace("http://", "ws://", 1).rstrip("/") + path + query
+
+
 def _websocket_handshake(gateway: Gateway, path: str, key: str, query: str = "") -> list[str]:
     """Opens the gateway WebSocket route, sends one frame and returns what came back, or raises on refusal."""
     from websockets.sync.client import connect
 
-    url: Final = str(gateway.client.base_url).replace("http://", "ws://", 1).rstrip("/") + path + query
     with connect(
-        url,
+        _websocket_url(gateway, path, query),
         additional_headers={"Authorization": f"Bearer {key}", "X-Integration-Client": "must-not-forward"},
         open_timeout=15,
     ) as socket:
@@ -732,58 +735,59 @@ def _websocket_handshake(gateway: Gateway, path: str, key: str, query: str = "")
     return [str(greeting), str(echoed)]
 
 
+def _granted_websocket_route(
+    gateway: Gateway, scenario: Scenario, marker: str, provider_value: str
+) -> tuple[dict[str, JsonValue], str, str]:
+    """An account WebSocket route to the scripted echo provider, granted to one application key."""
+    account: Final = f"integration-account-{marker}"
+    path: Final = f"/cube_api/integration-{marker}/realtime"
+    route_id: Final = f"integration-ws-route-{marker}"
+    definition: Final[dict[str, JsonValue]] = {
+        "id": route_id,
+        "path": path,
+        "target": gateway.upstream_url.replace("http://", "ws://", 1) + f"/__ws_echo/{marker}",
+        "methods": ["WEBSOCKET"],
+        "account_credential": {
+            "account_id": account,
+            "credential_name": _credential(gateway, scenario, account, provider_value),
+            "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+            "allowed_query_parameters": ["model"],
+        },
+    }
+    created: Final = gateway.post("/cube_control/account_routes", {"route": definition})
+    scenario.cleanups.callback(_delete_route_if_present, gateway, route_id)
+    assert created["created"] is True
+    key, key_hash = _application_key(scenario, f"integration-app-{marker}", [path])
+    _grant(
+        gateway,
+        route_id,
+        string_value(object_value(created["route"])["fingerprint"]),
+        {
+            "application_id": f"integration-app-{marker}",
+            "key_hash": key_hash,
+            "account_id": account,
+            "path": path,
+            "methods": ["WEBSOCKET"],
+        },
+    )
+    return definition, key, key_hash
+
+
 def test_websocket_route_authenticates_the_handshake_and_injects_only_the_account_header(gateway: Gateway) -> None:
     from websockets.exceptions import InvalidStatus
 
     marker: Final = uuid.uuid4().hex
-    account: Final = f"integration-account-{marker}"
     provider_value: Final = f"synthetic-ws-{marker}"
-    path: Final = f"/cube_api/integration-{marker}/realtime"
-    route_id: Final = f"integration-ws-route-{marker}"
-    application: Final = f"integration-app-{marker}"
     with gateway.scenario() as scenario:
-        credential: Final = _credential(gateway, scenario, account, provider_value)
-        definition: Final[dict[str, JsonValue]] = {
-            "id": route_id,
-            "path": path,
-            "target": gateway.upstream_url.replace("http://", "ws://", 1) + f"/__ws_echo/{marker}",
-            "methods": ["WEBSOCKET"],
-            "account_credential": {
-                "account_id": account,
-                "credential_name": credential,
-                "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
-                "allowed_query_parameters": ["model"],
-            },
-        }
         assert gateway.get("/cube_control/capabilities")["passthrough_account_websocket_route"] == "websocket_v1"
-        created: Final = gateway.post("/cube_control/account_routes", {"route": definition})
-        scenario.cleanups.callback(_delete_route, gateway, route_id)
-        route: Final = object_value(created["route"])
+        definition, key, key_hash = _granted_websocket_route(gateway, scenario, marker, provider_value)
+        path: Final = string_value(definition["path"])
         repeated: Final = gateway.post("/cube_control/account_routes", {"route": definition})
-        assert (created["created"], repeated["created"]) == (True, False)
-        assert route["methods"] == ["WEBSOCKET"]
-        mixed: Final = {**definition, "methods": ["WEBSOCKET", "GET"]}
-        assert (
-            gateway.request(
-                "POST", "/cube_control/account_routes", {"route": {**mixed, "id": f"{route_id}-x"}}
-            ).status_code
-            == 422
-        )
-
-        key, key_hash = _application_key(scenario, application, [path])
+        assert repeated["created"] is False
+        assert object_value(repeated["route"])["methods"] == ["WEBSOCKET"]
+        mixed: Final = {**definition, "methods": ["WEBSOCKET", "GET"], "id": f"{definition['id']}-x"}
+        assert gateway.request("POST", "/cube_control/account_routes", {"route": mixed}).status_code == 422
         other_key, _ = _application_key(scenario, f"integration-other-{marker}", [path])
-        _grant(
-            gateway,
-            route_id,
-            string_value(route["fingerprint"]),
-            {
-                "application_id": application,
-                "key_hash": key_hash,
-                "account_id": account,
-                "path": path,
-                "methods": ["WEBSOCKET"],
-            },
-        )
 
         def attempt() -> list[str] | None:
             try:
@@ -793,8 +797,12 @@ def test_websocket_route_authenticates_the_handshake_and_injects_only_the_accoun
 
         frames: Final = eventually(attempt, lambda value: value is not None, seconds=60)
         assert frames is not None
-        greeting: Final = JSON_OBJECT.validate_json(frames[0])
-        assert greeting == {"authorization": f"Bearer {provider_value}", "query": "model=fixture", "client_header": ""}
+        assert JSON_OBJECT.validate_json(frames[0]) == {
+            "authorization": "Bearer [redacted]",
+            "authorization_sha256": sha256(f"Bearer {provider_value}".encode()).hexdigest(),
+            "query": "model=fixture",
+            "client_header": "",
+        }
         assert frames[1] == "ping"
 
         for refused_key, query in ((other_key, ""), (key, "?unknown=1")):
@@ -807,8 +815,40 @@ def test_websocket_route_authenticates_the_handshake_and_injects_only_the_accoun
             seconds=70,
         )
         metadata: Final = object_value(rows[0]["metadata"])
-        assert (metadata["provider_account_id"], metadata["user_api_key_application_id"]) == (account, application)
+        assert (metadata["provider_account_id"], metadata["user_api_key_application_id"]) == (
+            f"integration-account-{marker}",
+            f"integration-app-{marker}",
+        )
         assert [form for form in _encoded(provider_value) if form in json.dumps(rows, default=str)] == []
+
+
+def test_an_open_websocket_connection_is_closed_once_its_route_is_deleted(gateway: Gateway) -> None:
+    from websockets.exceptions import ConnectionClosed, InvalidStatus
+    from websockets.sync.client import ClientConnection, connect
+
+    marker: Final = uuid.uuid4().hex
+    provider_value: Final = f"synthetic-ws-{marker}"
+    with gateway.scenario() as scenario:
+        definition, key, _ = _granted_websocket_route(gateway, scenario, marker, provider_value)
+        url: Final = _websocket_url(gateway, string_value(definition["path"]))
+
+        def opened() -> ClientConnection | None:
+            try:
+                return connect(url, additional_headers={"Authorization": f"Bearer {key}"}, open_timeout=15)
+            except (InvalidStatus, OSError, TimeoutError):
+                return None
+
+        socket: Final = eventually(opened, lambda value: value is not None, seconds=60)
+        assert socket is not None
+        with socket:
+            _ = socket.recv(timeout=15)
+            socket.send(f"echo {provider_value}")
+            assert socket.recv(timeout=15) == "echo [redacted]"
+            _delete_route(gateway, string_value(definition["id"]))
+            with pytest.raises(ConnectionClosed) as closed:
+                _ = socket.recv(timeout=120)
+        assert closed.value.rcvd is not None, "the gateway dropped the connection without a close frame"
+        assert (closed.value.rcvd.code, closed.value.rcvd.reason) == (1008, "Account route access revoked")
 
 
 def _delete_ownership(account: str) -> None:

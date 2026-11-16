@@ -11,6 +11,7 @@ import zlib
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from queue import SimpleQueue
 from typing import Final, cast
@@ -299,11 +300,16 @@ class Provider:
         return self._response(response, scenario_id)
 
     async def websocket_echo(self, websocket: WebSocket) -> None:
-        """Reports the handshake it received (authorization, query, a client-only header), then echoes text frames."""
+        """Reports the handshake it received (authorization, query, a client-only header), then echoes text frames.
+
+        The digest lets a test prove which credential arrived even when the gateway redacts the echoed value.
+        """
+        authorization: Final = websocket.headers.get("authorization", "")
         await websocket.accept()
         await websocket.send_json(
             {
-                "authorization": websocket.headers.get("authorization", ""),
+                "authorization": authorization,
+                "authorization_sha256": sha256(authorization.encode()).hexdigest(),
                 "query": websocket.url.query,
                 "client_header": websocket.headers.get("x-integration-client", ""),
             }
