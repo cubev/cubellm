@@ -4,7 +4,7 @@ import os
 import secrets
 import stat
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self
@@ -213,6 +213,45 @@ def prepare_application_access(spec: ApplicationAccessSpec, directory: Path) -> 
         return ApplicationAccessResult(
             application_id=spec.application_id, status="error", message="Private application state unavailable"
         )
+
+
+def prepare_application_rotation(directory: Path, successor_directory: Path) -> ApplicationAccessResult:
+    """Prepares a successor credential for a provisioned application in its own private state directory.
+
+    The successor keeps the scope and operation identity of its predecessor and gets a new key, so the gateway
+    treats both as the same application. Nothing is sent to the gateway: provision and deliver the successor,
+    then revoke the predecessor. A revoked application is never rotated back into service.
+    """
+
+    def result(status: Literal["prepared", "error"], application_id: str, message: str) -> ApplicationAccessResult:
+        return ApplicationAccessResult(application_id=application_id, status=status, message=message)
+
+    try:
+        with _locked_directory(directory) as descriptor:
+            predecessor: Final = _load(descriptor)
+            if predecessor is None:
+                return result("error", "unknown", "Application state is missing")
+            application_id: Final = predecessor.spec.application_id
+            if predecessor.revocation_requested:
+                return result("error", application_id, "Application revocation was requested")
+            with _locked_directory(successor_directory) as successor_descriptor:
+                existing: Final = _load(successor_descriptor)
+                if existing is not None and (
+                    existing.operation_id != predecessor.operation_id or existing.revocation_requested
+                ):
+                    return result("error", application_id, "Successor state conflicts")
+                if existing is None:
+                    _save(
+                        successor_descriptor,
+                        ApplicationAccessState(
+                            spec=predecessor.spec,
+                            operation_id=predecessor.operation_id,
+                            token=SecretStr("sk-" + secrets.token_urlsafe(32)),
+                        ),
+                    )
+        return result("prepared", application_id, "Successor prepared privately; no gateway change made")
+    except (OSError, ValueError):
+        return result("error", "unknown", "Private application state unavailable")
 
 
 class _Capabilities(BaseModel):
@@ -461,33 +500,54 @@ def provision_application_access(
         )
 
 
-def _deliver_key(descriptor: int, token: SecretStr) -> None:
+def _publish_key(descriptor: int, content: str, replace: bool) -> None:
+    temporary: Final = ".key-" + secrets.token_hex(16)
+    temporary_fd: Final = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=descriptor,
+    )
+    try:
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if replace:
+            os.replace(temporary, "api-key", src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        else:
+            os.link(temporary, "api-key", src_dir_fd=descriptor, dst_dir_fd=descriptor, follow_symlinks=False)
+        os.fsync(descriptor)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=descriptor)
+        os.fsync(descriptor)
+
+
+def _deliver_key(descriptor: int, token: SecretStr, replaced: SecretStr | None = None) -> None:
+    """Writes the key file once. An existing file is only replaced when it holds exactly the replaced key."""
     content: Final = token.get_secret_value() + "\n"
     try:
         existing_fd: Final = os.open("api-key", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
     except FileNotFoundError:
-        temporary: Final = ".key-" + secrets.token_hex(16)
-        temporary_fd: Final = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=descriptor,
-        )
-        try:
-            with os.fdopen(temporary_fd, "w", encoding="utf-8") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.link(temporary, "api-key", src_dir_fd=descriptor, dst_dir_fd=descriptor, follow_symlinks=False)
-            os.fsync(descriptor)
-        finally:
-            os.unlink(temporary, dir_fd=descriptor)
-            os.fsync(descriptor)
+        _publish_key(descriptor, content, replace=False)
         return
     with os.fdopen(existing_fd, encoding="utf-8") as stream:
         _require_private(stream.fileno(), 0o600)
-        if stream.read(8193) != content:
-            raise ValueError("Destination contains a different credential")
+        current: Final = stream.read(8193)
+    if current == content:
+        return
+    if replaced is None or current != replaced.get_secret_value() + "\n":
+        raise ValueError("Destination contains a different credential")
+    _publish_key(descriptor, content, replace=True)
+
+
+def _predecessor_token(directory: Path, successor: ApplicationAccessState) -> SecretStr:
+    with _locked_directory(directory) as descriptor:
+        predecessor: Final = _load(descriptor)
+    if predecessor is None or predecessor.operation_id != successor.operation_id:
+        raise ValueError("Replaced state is not a predecessor of this application credential")
+    return predecessor.token
 
 
 def deliver_application_access(
@@ -495,7 +555,9 @@ def deliver_application_access(
     destination_directory: Path,
     master_key: SecretStr,
     transport: httpx.BaseTransport | None = None,
+    replaces: Path | None = None,
 ) -> ApplicationAccessResult:
+    """Delivers the verified key. `replaces` names the predecessor state whose delivered key may be replaced."""
     try:
         with _locked_directory(directory) as descriptor:
             state: Final = _load(descriptor)
@@ -509,8 +571,9 @@ def deliver_application_access(
                 verified: Final = _provision(client, descriptor, state, allow_creation=False)
             if verified.status != "provisioned":
                 return verified
+            replaced: Final = _predecessor_token(replaces, state) if replaces is not None else None
             with _locked_directory(destination_directory) as destination:
-                _deliver_key(destination, state.token)
+                _deliver_key(destination, state.token, replaced)
             return ApplicationAccessResult(
                 application_id=state.spec.application_id,
                 status="delivered",

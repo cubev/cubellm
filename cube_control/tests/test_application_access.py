@@ -1,5 +1,6 @@
 import fcntl
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from cube_control.application_access import (
     ApplicationAccessSpec,
     deliver_application_access,
     prepare_application_access,
+    prepare_application_rotation,
     provision_application_access,
     revoke_application_access,
 )
@@ -105,6 +107,265 @@ class GatewayFixture:
             self.lookups.append(request.url.params["key"])
             return httpx.Response(404) if self.key is None else httpx.Response(200, json={"info": self.key})
         return httpx.Response(404)
+
+
+def gateway_handler(gateway: GatewayFixture) -> type[BaseHTTPRequestHandler]:
+    """Serves the fixture over real HTTP for CLI subprocesses: reads with the master key, and no write but a block."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.headers.get("Authorization") != "Bearer inert-master":
+                self.send_error(403)
+                return
+            response: Final = gateway(httpx.Request("GET", "http://localhost" + self.path))
+            self._reply(response)
+
+        def do_POST(self) -> None:
+            if self.headers.get("Authorization") != "Bearer inert-master" or self.path != "/key/block":
+                self.send_error(403)
+                return
+            response: Final = gateway(
+                httpx.Request(
+                    "POST",
+                    "http://localhost" + self.path,
+                    content=self.rfile.read(int(self.headers.get("Content-Length", "0"))),
+                )
+            )
+            self._reply(response)
+
+        def _reply(self, response: httpx.Response) -> None:
+            self.send_response(response.status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response.content)))
+            self.end_headers()
+            self.wfile.write(response.content)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    return Handler
+
+
+class KeyedGateway(GatewayFixture):
+    """Keeps every generated key under its hash, so a predecessor and its successor can exist side by side."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.keys: Final[dict[str, dict[str, object]]] = {}
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path: Final = request.url.path
+        if path == "/key/info":
+            stored: Final = self.keys.get(request.url.params["key"])
+            return httpx.Response(404) if stored is None else httpx.Response(200, json={"info": stored})
+        if request.method != "POST" or path not in ("/key/generate", "/key/block"):
+            return super().__call__(request)
+        self.posts.append(path)
+        body: Final = TypeAdapter(dict[str, object]).validate_json(request.content)
+        if path == "/key/generate":
+            self.keys[sha256(str(body["key"]).encode()).hexdigest()] = body | {"status": "active"}
+            return httpx.Response(200, json={})
+        blocked: Final = self.keys.get(str(body["key"]))
+        if blocked is None:
+            return httpx.Response(404)
+        self.keys[str(body["key"])] = blocked | {"blocked": True, "status": "revoked"}
+        return httpx.Response(200, json={})
+
+
+def stored_token(directory: Path) -> str:
+    return str(TypeAdapter(dict[str, object]).validate_json((directory / "state.json").read_bytes())["token"])
+
+
+class ApplicationRotationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        root: Final = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        self.predecessor = Path(root.name) / "application"
+        self.successor = Path(root.name) / "application-next"
+        self.destination = Path(root.name) / "consumer"
+        self.gateway = KeyedGateway()
+        self.transport = httpx.MockTransport(self.gateway)
+        self.master = SecretStr("inert-master")
+        prepare_application_access(SPEC, self.predecessor)
+        provision_application_access(self.predecessor, self.master, self.transport)
+
+    def test_rotation_issues_a_successor_replaces_the_delivered_key_and_blocks_only_the_predecessor(self) -> None:
+        deliver_application_access(self.predecessor, self.destination, self.master, self.transport)
+        old_token: Final = stored_token(self.predecessor)
+        prepared: Final = prepare_application_rotation(self.predecessor, self.successor)
+        self.assertEqual(prepared.status, "prepared")
+        new_token: Final = stored_token(self.successor)
+        self.assertNotEqual(new_token, old_token)
+        self.assertRegex(new_token, r"^sk-[A-Za-z0-9_-]{43}$")
+        self.assertEqual(os.stat(self.successor).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(self.successor / "state.json").st_mode & 0o777, 0o600)
+        self.assertEqual(prepare_application_rotation(self.predecessor, self.successor), prepared)
+        self.assertEqual(stored_token(self.successor), new_token)
+        self.assertEqual(self.gateway.posts, ["/user/new", "/key/generate"])
+
+        provisioned: Final = provision_application_access(self.successor, self.master, self.transport)
+        self.assertEqual(provisioned.status, "provisioned")
+        old_hash, new_hash = (sha256(token.encode()).hexdigest() for token in (old_token, new_token))
+        self.assertEqual(sorted(self.gateway.keys), sorted((old_hash, new_hash)))
+        self.assertEqual(self.gateway.keys[new_hash]["metadata"], self.gateway.keys[old_hash]["metadata"])
+
+        unreplaced: Final = deliver_application_access(self.successor, self.destination, self.master, self.transport)
+        self.assertEqual(unreplaced.status, "error")
+        self.assertEqual((self.destination / "api-key").read_text(), old_token + "\n")
+        delivered: Final = deliver_application_access(
+            self.successor, self.destination, self.master, self.transport, self.predecessor
+        )
+        self.assertEqual(delivered.status, "delivered")
+        self.assertEqual((self.destination / "api-key").read_text(), new_token + "\n")
+        self.assertEqual(os.stat(self.destination / "api-key").st_mode & 0o777, 0o600)
+        self.assertEqual(sorted(os.listdir(self.destination)), [".lock", "api-key"])
+        again: Final = deliver_application_access(
+            self.successor, self.destination, self.master, self.transport, self.predecessor
+        )
+        self.assertEqual(again, delivered)
+
+        revoked: Final = revoke_application_access(self.predecessor, self.master, self.transport)
+        self.assertEqual(revoked.status, "blocked")
+        self.assertEqual(
+            (self.gateway.keys[old_hash].get("blocked"), self.gateway.keys[new_hash].get("blocked")), (True, None)
+        )
+        self.assertEqual(self.gateway.posts, ["/user/new", "/key/generate", "/key/generate", "/key/block"])
+        self.assertEqual(provision_application_access(self.successor, self.master, self.transport), provisioned)
+        for result in (prepared, provisioned, unreplaced, delivered, revoked):
+            self.assertNotIn(old_token, result.model_dump_json())
+            self.assertNotIn(new_token, result.model_dump_json())
+
+    def test_rotation_never_starts_from_a_missing_or_revoked_application_or_into_a_foreign_state(self) -> None:
+        missing: Final = prepare_application_rotation(self.predecessor.with_name("absent"), self.successor)
+        self.assertEqual(missing.status, "error")
+        self.assertFalse(self.successor.exists())
+        same: Final = prepare_application_rotation(self.predecessor, self.predecessor)
+        self.assertEqual(same.status, "error")
+
+        other: Final = ApplicationAccessSpec.model_validate(SPEC.model_dump() | {"application_id": "other-app"})
+        foreign: Final = self.successor.with_name("foreign")
+        prepare_application_access(other, foreign)
+        foreign_token: Final = stored_token(foreign)
+        self.assertEqual(prepare_application_rotation(self.predecessor, foreign).status, "error")
+        self.assertEqual(stored_token(foreign), foreign_token)
+        rerolled: Final = self.successor.with_name("rerolled")
+        prepare_application_access(SPEC, rerolled)
+        self.assertEqual(prepare_application_rotation(self.predecessor, rerolled).status, "error")
+
+        self.assertEqual(prepare_application_rotation(self.predecessor, self.successor).status, "prepared")
+        provision_application_access(self.successor, self.master, self.transport)
+        revoke_application_access(self.successor, self.master, self.transport)
+        self.assertEqual(prepare_application_rotation(self.predecessor, self.successor).status, "error")
+        shutil.rmtree(self.successor)
+
+        revoke_application_access(self.predecessor, self.master, self.transport)
+        after_revocation: Final = prepare_application_rotation(self.predecessor, self.successor)
+        self.assertEqual(after_revocation.status, "error")
+        self.assertFalse((self.successor / "state.json").exists())
+        self.assertEqual(
+            self.gateway.posts, ["/user/new", "/key/generate", "/key/generate", "/key/block", "/key/block"]
+        )
+
+    def test_a_delivered_key_is_only_replaced_when_it_is_the_named_predecessor(self) -> None:
+        deliver_application_access(self.predecessor, self.destination, self.master, self.transport)
+        old_token: Final = stored_token(self.predecessor)
+        prepare_application_rotation(self.predecessor, self.successor)
+        provision_application_access(self.successor, self.master, self.transport)
+        unrelated: Final = self.successor.with_name("unrelated")
+        prepare_application_access(SPEC, unrelated)
+        credential: Final = self.destination / "api-key"
+
+        not_a_predecessor: Final = deliver_application_access(
+            self.successor, self.destination, self.master, self.transport, unrelated
+        )
+        self.assertEqual(not_a_predecessor.status, "error")
+        self.assertEqual(credential.read_text(), old_token + "\n")
+
+        other: Final = ApplicationAccessSpec.model_validate(SPEC.model_dump() | {"application_id": "other-app"})
+        foreign: Final = self.successor.with_name("foreign")
+        prepare_application_access(other, foreign)
+        for state in (unrelated, foreign):
+            with self.subTest(delivered_key_of=state.name):
+                _ = credential.write_text(stored_token(state) + "\n")
+                refused: Final = deliver_application_access(
+                    self.successor, self.destination, self.master, self.transport, state
+                )
+                self.assertEqual(refused.status, "error")
+                self.assertEqual(credential.read_text(), stored_token(state) + "\n")
+
+        credential.write_text("existing-unrelated-credential\n")
+        other_content: Final = deliver_application_access(
+            self.successor, self.destination, self.master, self.transport, self.predecessor
+        )
+        self.assertEqual(other_content.status, "error")
+        self.assertEqual(credential.read_text(), "existing-unrelated-credential\n")
+
+        credential.write_text(old_token + "\n")
+        credential.chmod(0o644)
+        public: Final = deliver_application_access(
+            self.successor, self.destination, self.master, self.transport, self.predecessor
+        )
+        self.assertEqual(public.status, "error")
+        self.assertEqual(credential.read_text(), old_token + "\n")
+
+    def test_rotation_cli_prepares_and_replaces_without_printing_a_credential(self) -> None:
+        gateway: Final = KeyedGateway()
+        transport: Final = httpx.MockTransport(gateway)
+        with ThreadingHTTPServer(("127.0.0.1", 0), gateway_handler(gateway)) as server:
+            thread: Final = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join, 5)
+            self.addCleanup(server.shutdown)
+            served: Final = ApplicationAccessSpec.model_validate(
+                SPEC.model_dump() | {"gateway_origin": f"http://127.0.0.1:{server.server_port}"}
+            )
+            predecessor: Final = self.predecessor.with_name("served")
+            successor: Final = self.predecessor.with_name("served-next")
+            prepare_application_access(served, predecessor)
+            provision_application_access(predecessor, self.master, transport)
+            deliver_application_access(predecessor, self.destination, self.master, transport)
+            admin: Final = self.predecessor.with_name("admin.env")
+            _ = admin.write_text("LITELLM_MASTER_KEY=inert-master\n")
+            admin.chmod(0o600)
+
+            def control(*arguments: str | Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-m", "cube_control", *arguments],
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                    env={name: value for name, value in os.environ.items() if name != "CUBE_CONTROL_DATABASE_URL"},
+                )
+
+            prepared: Final = control(
+                "prepare-application-rotation", "--state-directory", predecessor, "--successor-directory", successor
+            )
+            self.assertEqual(
+                (prepared.returncode, '"status":"prepared"' in prepared.stdout), (0, True), prepared.stderr
+            )
+            provision_application_access(successor, self.master, transport)
+            deliver: Final = ("deliver-application", "--state-directory", successor, "--config", admin)
+            unreplaced: Final = control(*deliver, "--destination-directory", self.destination)
+            self.assertEqual(unreplaced.returncode, 1)
+            self.assertEqual((self.destination / "api-key").read_text(), stored_token(predecessor) + "\n")
+            replaced: Final = control(
+                *deliver, "--destination-directory", self.destination, "--replaces-state-directory", predecessor
+            )
+            self.assertEqual(
+                (replaced.returncode, '"status":"delivered"' in replaced.stdout), (0, True), replaced.stderr
+            )
+            self.assertEqual((self.destination / "api-key").read_text(), stored_token(successor) + "\n")
+            absent: Final = control(
+                "prepare-application-rotation",
+                "--state-directory",
+                predecessor.with_name("absent"),
+                "--successor-directory",
+                predecessor.with_name("unused"),
+            )
+            self.assertEqual(absent.returncode, 1)
+            printed: Final = "".join(run.stdout + run.stderr for run in (prepared, unreplaced, replaced, absent))
+            for secret in (stored_token(predecessor), stored_token(successor), "inert-master"):
+                self.assertNotIn(secret, printed)
 
 
 class ApplicationAccessTests(unittest.TestCase):
@@ -680,36 +941,7 @@ class ApplicationAccessTests(unittest.TestCase):
     def test_application_cli_delivers_read_only_then_records_revocation_without_secret_output(self) -> None:
         gateway: Final = GatewayFixture()
 
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                if self.headers.get("Authorization") != "Bearer inert-master":
-                    self.send_error(403)
-                    return
-                response: Final = gateway(httpx.Request("GET", "http://localhost" + self.path))
-                self._reply(response)
-
-            def do_POST(self) -> None:
-                if self.headers.get("Authorization") != "Bearer inert-master" or self.path != "/key/block":
-                    self.send_error(403)
-                    return
-                response: Final = gateway(
-                    httpx.Request(
-                        "POST",
-                        "http://localhost" + self.path,
-                        content=self.rfile.read(int(self.headers.get("Content-Length", "0"))),
-                    )
-                )
-                self._reply(response)
-
-            def _reply(self, response: httpx.Response) -> None:
-                self.send_response(response.status_code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(response.content)))
-                self.end_headers()
-                self.wfile.write(response.content)
-
-            def log_message(self, format: str, *args: object) -> None:
-                return
+        Handler: Final = gateway_handler(gateway)
 
         with tempfile.TemporaryDirectory() as root, ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
             thread: Final = threading.Thread(target=server.serve_forever, daemon=True)

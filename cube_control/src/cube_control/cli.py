@@ -23,6 +23,7 @@ from cube_control.application_access import (
     ApplicationAccessSpec,
     deliver_application_access,
     prepare_application_access,
+    prepare_application_rotation,
     provision_application_access,
     revoke_application_access,
 )
@@ -63,7 +64,9 @@ class CommandArguments(argparse.Namespace):
     port: int
     account_name: str
     state_directory: Path
+    successor_directory: Path
     destination_directory: Path
+    replaces_state_directory: Path | None
     gateway_origin: str
     source_id: str
     register: Path
@@ -106,6 +109,9 @@ def main() -> int:
     sub.add_parser("prepare-edge")
     prepare_access_parser: Final = sub.add_parser("prepare-application")
     prepare_access_parser.add_argument("--state-directory", required=True, type=Path)
+    rotation_parser: Final = sub.add_parser("prepare-application-rotation")
+    rotation_parser.add_argument("--state-directory", required=True, type=Path)
+    rotation_parser.add_argument("--successor-directory", required=True, type=Path)
     provision_access_parser: Final = sub.add_parser("provision-application")
     provision_access_parser.add_argument("--state-directory", required=True, type=Path)
     provision_access_parser.add_argument("--config", required=True, type=Path)
@@ -119,6 +125,7 @@ def main() -> int:
     deliver_access_parser: Final = sub.add_parser("deliver-application")
     deliver_access_parser.add_argument("--state-directory", required=True, type=Path)
     deliver_access_parser.add_argument("--destination-directory", required=True, type=Path)
+    deliver_access_parser.add_argument("--replaces-state-directory", type=Path)
     deliver_access_parser.add_argument("--config", required=True, type=Path)
     manage_parser: Final = sub.add_parser("manage")
     manage_parser.add_argument("path", nargs="?", default="-")
@@ -177,6 +184,10 @@ def main() -> int:
         application_prepared: Final = prepare_application_access(application_spec, args.state_directory)
         print(application_prepared.model_dump_json())
         return 0 if application_prepared.status == "prepared" else 1
+    if args.command == "prepare-application-rotation":
+        rotation_prepared: Final = prepare_application_rotation(args.state_directory, args.successor_directory)
+        print(rotation_prepared.model_dump_json())
+        return 0 if rotation_prepared.status == "prepared" else 1
     if args.command == "provision-account-route":
         raw_route: Final = sys.stdin.read(65537)
         try:
@@ -223,6 +234,7 @@ def main() -> int:
                 args.state_directory,
                 args.destination_directory,
                 master_key,
+                replaces=args.replaces_state_directory,
             )
             print(application_delivered.model_dump_json())
             return 0 if application_delivered.status == "delivered" else 1
