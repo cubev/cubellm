@@ -227,6 +227,7 @@ class ResolvedAccountCredential:
     outbound: QueryCredentialAuth | SigV4CredentialAuth | OAuthClientCredentialsAuth | MTLSCredentialAuth | None = (
         field(default=None, repr=False)
     )
+    header_secrets: tuple[str, ...] = field(default=(), repr=False)
 
 
 WEBSOCKET_METHOD: Final = "WEBSOCKET"
@@ -359,6 +360,7 @@ def resolve_account_credential(
             raise ValueError("Named account credential field is unavailable or invalid")
         return value
 
+    header_secrets: Final = tuple(bare_secret(header.field) for header in policy.headers)
     return ResolvedAccountCredential(
         binding=AccountRouteBinding(
             account_id=policy.account_id,
@@ -366,7 +368,10 @@ def resolve_account_credential(
             origin=origin,
             provider=info.cube_provider_id,
         ),
-        headers=MappingProxyType({header.name: header.prefix + bare_secret(header.field) for header in policy.headers}),
+        headers=MappingProxyType(
+            {header.name: header.prefix + secret for header, secret in zip(policy.headers, header_secrets, strict=True)}
+        ),
+        header_secrets=header_secrets,
         outbound=_with_tls(
             policy.mtls,
             values,

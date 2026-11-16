@@ -1,11 +1,14 @@
-from collections.abc import Iterator, Mapping
+import asyncio
+import time
+from collections.abc import Callable, Iterator, Mapping
 from hashlib import sha256
-from typing import Final
+from typing import Final, Self
 
 import pytest
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from starlette.exceptions import WebSocketException
 from starlette.websockets import WebSocketDisconnect
 
 from litellm.models.credentials import CredentialItem
@@ -104,25 +107,40 @@ class Relay:
         await websocket.close()
 
 
+ROUTE_KEY: Final = f"fixture:exact:{PATH}:WEBSOCKET"
+
+
+class Gateway:
+    """The gateway state a handshake and every later recheck read: registered route, credential and valid keys."""
+
+    def __init__(self) -> None:
+        self.credential: CredentialItem = CREDENTIAL
+        self.deleted_keys: Final[set[str]] = set()  # mutable-ok: test state
+        self.application_of_key = "fixture-app"
+        self.authentications = 0
+
+
 @pytest.fixture
-def relay(monkeypatch: pytest.MonkeyPatch) -> Iterator[Relay]:
-    recorder: Final = Relay()
+def gateway(monkeypatch: pytest.MonkeyPatch) -> Iterator[Gateway]:
+    state: Final = Gateway()
 
     async def authenticate(websocket: WebSocket) -> UserAPIKeyAuth:
+        state.authentications += 1
         token: Final = websocket.headers.get("authorization", "").removeprefix("Bearer ")
+        if token in state.deleted_keys:
+            raise WebSocketException(code=1008)
         if token not in (KEY, "sk-other-key"):
             await websocket.close(code=1008)
             raise HTTPException(status_code=403, detail="No API key provided")
         return UserAPIKeyAuth(
             token=sha256(token.encode()).hexdigest(),
-            metadata={"cube_application_id": "fixture-app" if token == KEY else "other-app"},
+            metadata={"cube_application_id": state.application_of_key if token == KEY else "other-app"},
         )
 
-    monkeypatch.setattr(module, "websocket_passthrough_request", recorder)
     monkeypatch.setattr("litellm.proxy.auth.user_api_key_auth.user_api_key_auth_websocket", authenticate)
-    monkeypatch.setattr(module.CredentialAccessor, "find_credential", staticmethod(lambda name: CREDENTIAL))
+    monkeypatch.setattr(module.CredentialAccessor, "find_credential", staticmethod(lambda name: state.credential))
     module._registered_pass_through_routes.clear()
-    module._registered_pass_through_routes[f"fixture:exact:{PATH}:WEBSOCKET"] = {
+    module._registered_pass_through_routes[ROUTE_KEY] = {
         "endpoint_id": "fixture",
         "path": PATH,
         "type": "exact",
@@ -135,13 +153,22 @@ def relay(monkeypatch: pytest.MonkeyPatch) -> Iterator[Relay]:
             "account_credential": POLICY,
         },
     }
-    yield recorder
+    yield state
     module._registered_pass_through_routes.clear()
 
 
-def client() -> TestClient:
+@pytest.fixture
+def relay(monkeypatch: pytest.MonkeyPatch, gateway: Gateway) -> Relay:
+    recorder: Final = Relay()
+    monkeypatch.setattr(module, "websocket_passthrough_request", recorder)
+    return recorder
+
+
+def client(recheck_seconds: float = 5.0) -> TestClient:
     app: Final = FastAPI()
-    _ = module.SafeRouteAdder.add_websocket_route_if_not_exists(app, PATH, module.create_account_websocket_route(PATH))
+    _ = module.SafeRouteAdder.add_websocket_route_if_not_exists(
+        app, PATH, module.create_account_websocket_route(PATH, recheck_seconds)
+    )
     assert not module.SafeRouteAdder.add_websocket_route_if_not_exists(
         app, PATH, module.create_account_websocket_route(PATH)
     )
@@ -179,9 +206,7 @@ def test_denied_handshakes_never_reach_the_provider(relay: Relay, headers: dict[
 def test_a_deleted_route_or_revoked_grant_applies_to_the_next_handshake(relay: Relay) -> None:
     connection: Final = client()
     revoked: Final = POLICY.model_copy(update={"application_grants": ()})
-    module._registered_pass_through_routes[f"fixture:exact:{PATH}:WEBSOCKET"]["passthrough_params"][
-        "account_credential"
-    ] = revoked
+    module._registered_pass_through_routes[ROUTE_KEY]["passthrough_params"]["account_credential"] = revoked
     with (
         pytest.raises(WebSocketDisconnect),
         connection.websocket_connect(PATH, headers={"Authorization": f"Bearer {KEY}"}) as socket,
@@ -238,3 +263,110 @@ def test_account_credentials_in_upstream_handshake_headers_are_masked_in_logs(mo
     assert upstream and upstream[0]["Authorization"] == "Bearer inert-provider-canary"
     headers: Final = [entry["headers"] for entry in logged if isinstance(entry, dict) and "headers" in entry]
     assert headers and all("inert-provider-canary" not in str(value) for value in headers), headers
+
+
+class Provider:
+    """Scripted provider socket: echoes every frame it is sent and records the handshake and its own closing."""
+
+    def __init__(self) -> None:
+        self._frames: Final[asyncio.Queue[str | bytes]] = asyncio.Queue()
+        self.handshakes: Final[list[Mapping[str, str]]] = []  # mutable-ok: test recorder
+        self.closed = False
+
+    def connect(self, target: str, additional_headers: Mapping[str, str]) -> Self:
+        self.handshakes.append(dict(additional_headers))
+        return self
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        self.closed = True
+
+    async def send(self, frame: str | bytes) -> None:
+        await self._frames.put(frame)
+
+    async def recv(self) -> str | bytes:
+        return await self._frames.get()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def provider(monkeypatch: pytest.MonkeyPatch, gateway: Gateway) -> Provider:
+    scripted: Final = Provider()
+    monkeypatch.setattr(module, "connect", scripted.connect)
+    return scripted
+
+
+def _revoke_grant(gateway: Gateway) -> None:
+    module._registered_pass_through_routes[ROUTE_KEY]["passthrough_params"]["account_credential"] = POLICY.model_copy(
+        update={"application_grants": ()}
+    )
+
+
+def _delete_route(gateway: Gateway) -> None:
+    module._registered_pass_through_routes.clear()
+
+
+def _rotate_credential(gateway: Gateway) -> None:
+    gateway.credential = CREDENTIAL.model_copy(update={"credential_values": {"api key": "rotated-provider-canary"}})
+
+
+def _delete_key(gateway: Gateway) -> None:
+    gateway.deleted_keys.add(KEY)
+
+
+def _rebind_key_to_another_application(gateway: Gateway) -> None:
+    gateway.application_of_key = "other-app"
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    "revoke", (_revoke_grant, _delete_route, _rotate_credential, _delete_key, _rebind_key_to_another_application)
+)
+def test_an_open_connection_is_cut_once_its_authorization_no_longer_holds(
+    gateway: Gateway, provider: Provider, revoke: Callable[[Gateway], None]
+) -> None:
+    with client(recheck_seconds=0.01).websocket_connect(PATH, headers={"Authorization": f"Bearer {KEY}"}) as socket:
+        socket.send_text("before")
+        assert socket.receive_text() == "before"
+        revoke(gateway)
+        with pytest.raises(WebSocketDisconnect) as closed:
+            _ = socket.receive_text()
+    assert closed.value.code == 1008, closed.value
+    assert provider.closed
+
+
+def test_an_open_connection_survives_rechecks_while_its_authorization_holds(
+    gateway: Gateway, provider: Provider
+) -> None:
+    with client(recheck_seconds=0.01).websocket_connect(PATH, headers={"Authorization": f"Bearer {KEY}"}) as socket:
+        socket.send_text("first")
+        assert socket.receive_text() == "first"
+        deadline: Final = time.monotonic() + 10
+        while gateway.authentications < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert gateway.authentications >= 4, "the open connection was never rechecked"
+        socket.send_text("second")
+        assert socket.receive_text() == "second"
+    assert len(provider.handshakes) == 1
+
+
+def test_a_credential_echoed_by_the_provider_is_redacted_in_frames_and_in_the_logged_frames(
+    monkeypatch: pytest.MonkeyPatch, gateway: Gateway, provider: Provider
+) -> None:
+    logged: Final[list[object]] = []  # mutable-ok: test recorder
+
+    async def record(**kwargs: object) -> None:
+        logged.append(kwargs["response_body"])
+
+    monkeypatch.setattr(module.pass_through_endpoint_logging, "pass_through_async_success_handler", record)
+    with client().websocket_connect(PATH, headers={"Authorization": f"Bearer {KEY}"}) as socket:
+        socket.send_text('{"echo": "Bearer inert-provider-canary", "kept": "inert-provider"}')
+        assert socket.receive_text() == '{"echo": "Bearer [redacted]", "kept": "inert-provider"}'
+        socket.send_bytes(b"\x00inert-provider-canary\xff")
+        assert socket.receive_bytes() == b"\x00[redacted]\xff"
+    assert provider.handshakes == [{"OpenAI-Beta": "realtime=v1", "Authorization": "Bearer inert-provider-canary"}]
+    assert logged == [[{"echo": "Bearer [redacted]", "kept": "inert-provider"}]]

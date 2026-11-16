@@ -6,7 +6,7 @@ import posixpath
 import traceback
 from base64 import b64encode
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import count, groupby
 from types import MappingProxyType
@@ -28,6 +28,7 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.exceptions import WebSocketException
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocketState
 from typing_extensions import ReadOnly
@@ -146,7 +147,7 @@ from .account_ownership import (
     resource_path_match,
 )
 from .account_routes import RoutesMutation, RoutesPlan, mutate_settings_routes
-from .credential_transport import CredentialTransport
+from .credential_transport import CredentialTransport, Redaction
 from .llm_provider_handlers.tinyfish_passthrough_logging_handler import (
     is_tinyfish_agent_url,
 )
@@ -2448,68 +2449,113 @@ _NO_HEADERS: Final[Mapping[str, str]] = MappingProxyType({})
 _ROUTE_HEADERS: Final = TypeAdapter(dict[str, str])
 
 
-def create_account_websocket_route(path: str) -> Callable[[WebSocket], Awaitable[None]]:
-    """WebSocket account route: same key, grant and credential checks as HTTP account routes, at handshake time.
+ACCOUNT_WEBSOCKET_RECHECK_SECONDS: Final = 5.0
+_ACCESS_REVOKED_REASON: Final = "Account route access revoked"
 
-    The definition is read from the registry for every connection, so a deleted route or a revoked grant applies to
-    the next handshake. The client is never sent upstream headers, the credential only goes into the upstream
-    handshake, and the logged headers are masked.
+
+@dataclass(frozen=True, slots=True)
+class WebsocketSessionGuard:
+    """Asked again and again while a relay is open; the relay ends once the answer is no longer True."""
+
+    still_authorized: Callable[[], Awaitable[bool]]
+    interval_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountWebsocketSession:
+    target: str
+    headers: Mapping[str, str] = field(repr=False)
+    credential: ResolvedAccountCredential = field(repr=False)
+    cost_per_request: float | None
+
+
+def _account_websocket_session(path: str, websocket: WebSocket, key: UserAPIKeyAuth) -> _AccountWebsocketSession | None:
+    """What the registered route, its grants and its named credential allow this key right now, or None."""
+    registered: Final = InitPassThroughEndpointHelpers.get_registered_pass_through_route(
+        route=path, method=WEBSOCKET_METHOD
+    )
+    params: Final[Mapping[str, object]] = (
+        registered.get("passthrough_params", _NO_PARAMS) if registered is not None else _NO_PARAMS
+    )
+    raw_policy: Final = params.get("account_credential")
+    if raw_policy is None:
+        return None
+    policy: Final = AccountHeaderCredential.model_validate(raw_policy)
+    application_id: Final = application_id_from_key_metadata(
+        _KeyMetadata.model_validate(key, from_attributes=True).metadata
+    )
+    if not account_application_allowed(policy, application_id, key.token, path, WEBSOCKET_METHOD):
+        return None
+    target: Final = params.get("target")
+    configured: Final = params.get("custom_headers")
+    headers: Final[Mapping[str, str]] = MappingProxyType(
+        _ROUTE_HEADERS.validate_python(configured) if configured is not None else _NO_HEADERS
+    )
+    try:
+        validate_account_request(policy, websocket.headers, tuple(websocket.query_params.keys()))
+        if not isinstance(target, str):
+            raise ValueError("WebSocket account route target is missing")
+        validate_account_route(
+            target, True, params.get("forward_headers") is True, headers, None, policy, (WEBSOCKET_METHOD,)
+        )
+        credential: Final = resolve_account_credential(
+            policy, CredentialAccessor.find_credential(policy.credential_name), target
+        )
+    except ValueError:
+        return None
+    cost: Final = params.get("cost_per_request")
+    return _AccountWebsocketSession(
+        target=target,
+        headers=MappingProxyType({**headers, **credential.headers}),
+        credential=credential,
+        cost_per_request=float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) else None,
+    )
+
+
+def create_account_websocket_route(
+    path: str, recheck_seconds: float = ACCOUNT_WEBSOCKET_RECHECK_SECONDS
+) -> Callable[[WebSocket], Awaitable[None]]:
+    """WebSocket account route: same key, grant and credential checks as HTTP account routes.
+
+    The checks run at the handshake and again every ``recheck_seconds`` while the connection is open, each time
+    against the current registry, key and credential. A deleted route or key, a revoked grant or a rotated
+    credential therefore closes an open connection with a policy violation. The client is never sent upstream
+    headers, the credential only goes into the upstream handshake, the logged headers are masked, and the
+    credential is redacted from provider frames.
     """
 
     async def account_websocket_endpoint(websocket: WebSocket) -> None:
         from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_websocket
 
-        registered: Final = InitPassThroughEndpointHelpers.get_registered_pass_through_route(
-            route=path, method=WEBSOCKET_METHOD
-        )
-        params: Final[Mapping[str, object]] = (
-            registered.get("passthrough_params", _NO_PARAMS) if registered is not None else _NO_PARAMS
-        )
-        raw_policy: Final = params.get("account_credential")
-        if raw_policy is None:
-            await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION)
-            return
         try:
             key: Final = await user_api_key_auth_websocket(websocket)
         except HTTPException:
             return  # user_api_key_auth_websocket already closed the handshake
-        policy: Final = AccountHeaderCredential.model_validate(raw_policy)
-        application_id: Final = application_id_from_key_metadata(
-            _KeyMetadata.model_validate(key, from_attributes=True).metadata
-        )
-        if not account_application_allowed(policy, application_id, key.token, path, WEBSOCKET_METHOD):
+        session: Final = _account_websocket_session(path, websocket, key)
+        if session is None:
             await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION)
             return
-        target: Final = params.get("target")
-        configured: Final = params.get("custom_headers")
-        headers: Final[Mapping[str, str]] = MappingProxyType(
-            _ROUTE_HEADERS.validate_python(configured) if configured is not None else _NO_HEADERS
-        )
-        try:
-            validate_account_request(policy, websocket.headers, tuple(websocket.query_params.keys()))
-            if not isinstance(target, str):
-                raise ValueError("WebSocket account route target is missing")
-            validate_account_route(
-                target, True, params.get("forward_headers") is True, headers, None, policy, (WEBSOCKET_METHOD,)
-            )
-            credential: Final = resolve_account_credential(
-                policy, CredentialAccessor.find_credential(policy.credential_name), target
-            )
-        except ValueError:
-            await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION)
-            return
+
+        async def still_authorized() -> bool:
+            try:
+                current_key: Final = await user_api_key_auth_websocket(websocket)
+            except (HTTPException, WebSocketException):
+                return False
+            return _account_websocket_session(path, websocket, current_key) == session
+
         query: Final = urlencode(tuple(websocket.query_params.multi_items()))
-        cost: Final = params.get("cost_per_request")
         await websocket_passthrough_request(
             websocket=websocket,
-            target=target + ("?" + query if query else ""),
-            custom_headers={**headers, **credential.headers},  # mutable-ok: the relay signature takes a dict
+            target=session.target + ("?" + query if query else ""),
+            custom_headers=dict(session.headers),  # mutable-ok: the relay signature takes a dict
             user_api_key_dict=key,
             forward_headers=False,
             endpoint=path,
-            cost_per_request=float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) else None,
+            cost_per_request=session.cost_per_request,
             accept_websocket=True,
-            account_binding=credential.binding,
+            account_binding=session.credential.binding,
+            frame_redaction=Redaction(session.credential.header_secrets),
+            session_guard=WebsocketSessionGuard(still_authorized, recheck_seconds),
         )
 
     return account_websocket_endpoint
@@ -2608,6 +2654,20 @@ def _upstream_close_to_relay(task_results: Iterable[object]) -> Close | None:
 _WEBSOCKET_FORWARDED_HEADERS: Final = frozenset(("authorization", "x-api-key", "x-goog-user-project"))
 
 
+def _redacted_frame(frame: str | bytes, redaction: Redaction | None) -> str | bytes:
+    if redaction is None:
+        return frame
+    return redaction.redact_bytes(frame) if isinstance(frame, bytes) else redaction.redact(frame)
+
+
+async def _session_revoked(guard: WebsocketSessionGuard) -> None:
+    """Returns once the guard no longer holds; the handshake has just checked, so the first recheck waits."""
+    while True:
+        await asyncio.sleep(guard.interval_seconds)
+        if not await guard.still_authorized():
+            return
+
+
 def _with_trace_context(headers: Mapping[str, str], parent_span: object) -> dict[str, str]:
     try:
         from litellm.integrations.otel.plumbing.context import inject_trace_context
@@ -2627,6 +2687,8 @@ async def websocket_passthrough_request(
     accept_websocket: bool = True,
     setup_model_rewriter: Callable[[str], str] | None = None,
     account_binding: AccountRouteBinding | None = None,
+    frame_redaction: Redaction | None = None,
+    session_guard: WebsocketSessionGuard | None = None,
 ):
     """
     WebSocket passthrough request handler.
@@ -2640,6 +2702,8 @@ async def websocket_passthrough_request(
         endpoint: The endpoint path (for logging purposes)
         cost_per_request: Optional field - cost per request to the target endpoint
         setup_model_rewriter: Optional rewrite of the setup frame's model before it reaches the upstream
+        frame_redaction: Optional secrets removed from every upstream frame before it is relayed or logged
+        session_guard: Optional recurring check that closes the relay with a policy violation once it fails
     """
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.proxy_server import proxy_config, proxy_logging_obj
@@ -2867,7 +2931,8 @@ async def websocket_passthrough_request(
             is_vertex_live: Final = bool(endpoint and "/vertex_ai/live" in endpoint)
             json_frame_ordinal: Final = count()
 
-            async def relay_upstream_frame(upstream_message: str | bytes) -> None:
+            async def relay_upstream_frame(received: str | bytes) -> None:
+                upstream_message: Final = _redacted_frame(received, frame_redaction)
                 if isinstance(upstream_message, bytes):
                     await websocket.send_bytes(upstream_message)
                 else:
@@ -2897,11 +2962,14 @@ async def websocket_passthrough_request(
                     )
                     raise
 
-            # Create tasks for bidirectional message forwarding
-            tasks: Final = [
+            guard_task: Final = (
+                asyncio.create_task(_session_revoked(session_guard)) if session_guard is not None else None
+            )
+            tasks: Final = (
                 asyncio.create_task(forward_client_to_upstream()),
                 asyncio.create_task(forward_upstream_to_client()),
-            ]
+                *((guard_task,) if guard_task is not None else ()),
+            )
 
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
@@ -2918,6 +2986,9 @@ async def websocket_passthrough_request(
                 exception = task.exception()
                 if exception is not None:
                     raise exception
+
+            if guard_task in done and _client_socket_is_open(websocket):
+                await websocket.close(code=_WEBSOCKET_POLICY_VIOLATION, reason=_ACCESS_REVOKED_REASON)
 
             upstream_close: Final = _upstream_close_to_relay(task.result() for task in done)
             if upstream_close is not None and _client_socket_is_open(websocket):
