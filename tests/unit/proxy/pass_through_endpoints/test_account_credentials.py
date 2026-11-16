@@ -128,7 +128,7 @@ def test_native_credential_resolution_is_private_and_has_an_immutable_snapshot()
 
 @pytest.mark.parametrize("item", (None, credential(account_id="another-account"), credential("invalid\r\nheader")))
 def test_missing_mismatched_or_invalid_credentials_fail_without_echoing_values(item: CredentialItem | None) -> None:
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(ValueError, match=r"^Named (account )?credential") as error:
         resolve_account_credential(POLICY, item, "https://vendor.example/check")
     assert "invalid\r\nheader" not in str(error.value)
     assert "inert-provider-canary" not in str(error.value)
@@ -146,18 +146,18 @@ def test_native_environment_references_are_resolved_at_request_time(monkeypatch:
 
 
 @pytest.mark.parametrize(
-    "target",
+    ("target", "message"),
     (
-        "http://vendor.example/check",
-        "http://192.168.1.10/check",
-        "https://user:password@vendor.example/check",
-        "https://@vendor.example/check",
-        "https://vendor.example:invalid/check",
-        "https://vendor.example/check?key=x",
+        ("http://vendor.example/check", "HTTPS outside literal loopback"),
+        ("http://192.168.1.10/check", "HTTPS outside literal loopback"),
+        ("https://user:password@vendor.example/check", "without user information"),
+        ("https://@vendor.example/check", "without user information"),
+        ("https://vendor.example:invalid/check", "Port could not be cast"),
+        ("https://vendor.example/check?key=x", "cannot contain query parameters"),
     ),
 )
-def test_account_route_rejects_insecure_or_ambiguous_targets(target: str) -> None:
-    with pytest.raises(ValueError):
+def test_account_route_rejects_insecure_or_ambiguous_targets(target: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
         validate_account_route(target, True, False, {}, None, POLICY, ("GET",))
 
 
@@ -168,13 +168,13 @@ def test_route_policy_is_checked_before_crud_can_persist_it() -> None:
         PassThroughGenericEndpoint(
             path="/fixture", target="https://vendor.example", auth=False, account_credential=POLICY
         )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="gateway authentication and restricted forwarding"):
         validate_account_route("https://vendor.example", True, True, {}, None, POLICY)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="cannot shadow a named account credential"):
         validate_account_route("https://vendor.example", True, False, {"x-vendor-credential": "shadow"}, None, POLICY)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="do not accept client header overrides"):
         validate_account_request(POLICY, {"x-pass-vendor-account": "forged"}, ())
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="query parameter is not allowed"):
         validate_account_request(POLICY, {}, ("api_key",))
 
 
@@ -203,7 +203,7 @@ def test_spend_account_provenance_rejects_client_scalars_and_json_imitations(sup
     "origin", ("https://other.example", "https://vendor.example:444", "https://vendor.example/path")
 )
 def test_credential_cannot_be_sent_to_an_unapproved_origin(origin: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"not allowed for this origin|must be explicit HTTP origins"):
         resolve_account_credential(POLICY, credential(origin=origin), "https://vendor.example/check")
 
 
@@ -213,7 +213,7 @@ def test_credential_requires_an_explicit_origin_allowlist() -> None:
         credential_values={"access value": "inert-provider-canary"},
         credential_info={"cube_account_id": POLICY.account_id},
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError, match="cube_allowed_origins"):
         resolve_account_credential(POLICY, item, "https://vendor.example/check")
 
 
@@ -231,7 +231,7 @@ def test_origin_normalization_preserves_authority_and_ignores_default_ports() ->
 
 @pytest.mark.parametrize("name", ("Host", "Content-Length", "Transfer-Encoding", "Connection", "Proxy-Authorization"))
 def test_static_headers_cannot_override_the_bound_origin_or_http_framing(name: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="cannot control HTTP routing or framing"):
         validate_account_route("https://vendor.example/check", True, False, {name: "override"}, None, POLICY, ("GET",))
 
 
@@ -256,7 +256,7 @@ def test_provider_identity_comes_from_the_request_credential_snapshot() -> None:
 @pytest.mark.parametrize("provider", ("", "Bad Provider", "UPPER"))
 def test_credential_provider_identity_must_be_a_valid_provider_id(provider: str) -> None:
     item: Final = credential(provider=provider)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError, match="cube_provider_id"):
         resolve_account_credential(POLICY, item, "https://vendor.example/check")
 
 

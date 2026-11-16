@@ -140,7 +140,7 @@ def test_route_with_multiple_operations_per_resource_type_is_accepted_and_resolv
 def test_route_rejects_resource_types_that_could_be_ambiguous_or_escape_the_route(
     include_subpath: bool, resource_types: tuple[AccountResourceType, ...]
 ) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"^Account resource"):
         validate_resource_types(ROUTE, include_subpath, resource_types)
 
 
