@@ -1065,17 +1065,27 @@ same way as other WebSocket routes, requires an application grant for the method
 against the HTTPS form of the target origin (`wss://host` is checked as
 `https://host`). Only header credentials are supported, so no secret is part of the
 upstream URL: they are added to the upstream handshake, client headers are never
-forwarded, and the logged handshake headers are masked. Frames are relayed unchanged in
-both directions. A deleted route or revoked grant applies to the next handshake; open
-connections are not cut. Spend rows carry the account provenance with `unverified`
+forwarded, and the logged handshake headers are masked. Client frames are relayed
+unchanged. Provider frames, text and binary, have the header credential replaced by
+`[redacted]` in its raw, percent-encoded, form-encoded and JSON-escaped forms before
+they reach the client or the logged frames.
+The gateway repeats the handshake checks every 5 seconds while a connection is open:
+the key must still authenticate, and the route, its grant for this application and the
+resolved credential must be the same as at the handshake. Otherwise it closes the
+client with code 1008 and the reason `Account route access revoked` and drops the
+provider connection. Spend rows carry the account provenance with `unverified`
 cost. Mixed methods, subpath forwarding, resources and query, SigV4, OAuth or client
 certificate destinations are refused. The gateway announces
 `passthrough_account_websocket_route: websocket_v1`, and the controller only sends a
 WebSocket route to a gateway that does
 
-Limits: frames are not redacted, so a provider echoing the header credential in a frame
-reaches the client, as with HTTP header routes. Per-message usage and cost are not
-derived
+Limits: the recheck sees what its own worker sees, so the cut follows a revocation by up
+to 5 seconds plus that worker's key cache lifetime or config reload interval (see
+"Revocation and rotation across gateway workers" in `DEVELOPMENT.md`). A rotated
+credential also ends open connections, and clients have to reconnect. A credential that
+a provider splits across two frames, or echoes in another encoding such as Base64, is
+not redacted. HTTP header routes still do not redact an echoed header credential.
+Per-message usage and cost are not derived
 
 ## Account resource ownership
 
