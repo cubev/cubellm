@@ -521,8 +521,9 @@ scope is rejected. Results and validation errors do not print raw credentials
 
 `provisioned` verifies the native credential and its scope. It does not prove
 provider billing-account ownership, request accounting, successful inference,
-application wiring or network publication. Remote application installation,
-rotation and runtime revocation verification remain separate work. This
+application wiring or network publication. Remote application installation
+and runtime revocation verification remain separate work. Rotation is described
+under "Application credential rotation". This
 command does not provide a generic passthrough permission or transfer provider
 credentials to applications. The new native capability endpoint must be deployed
 before provisioning can succeed
@@ -581,8 +582,42 @@ broadcast. It does not acknowledge every worker, and backend or broadcast failur
 can leave stale authentication entries until their TTL. Proving denial across
 all serving workers and handling in-flight requests remain deployment acceptance
 requirements. Previously delivered files remain in place; the controller does
-not silently alter an application's mounted secret. Rotation and controlled
-re-enablement require their own lifecycle implementation
+not silently alter an application's mounted secret. Controlled re-enablement
+requires its own lifecycle implementation
+
+## Application credential rotation
+
+A rotation gives an application a new key without a gap and then blocks the old
+one. It uses a second private state directory, the successor:
+
+```sh
+python -m cube_control prepare-application-rotation --state-directory STATE --successor-directory NEXT
+python -m cube_control provision-application --state-directory NEXT --config ADMIN_ENV
+python -m cube_control deliver-application --state-directory NEXT --destination-directory DEST \
+  --replaces-state-directory STATE --config ADMIN_ENV
+python -m cube_control revoke-application --state-directory STATE --config ADMIN_ENV
+```
+
+`prepare-application-rotation` makes no gateway request. It copies the scope and
+the operation identity of the current state into the successor directory and
+generates a new key there. Repeating it keeps that key. It refuses a missing or
+revoked current state, and a successor directory that already holds another
+application, a separately prepared state or a revoked successor. A revoked
+application is therefore never rotated back into service
+
+Provisioning the successor creates a second gateway key for the same
+application principal with the same metadata and adds its own account grants.
+Both keys work until the old one is revoked, so the application can switch
+without downtime. `--replaces-state-directory` lets the delivery replace the
+`api-key` file atomically, but only when the file holds exactly the key of the
+named state and that state belongs to the same application credential. Without
+the option, or with any other file content, the delivered file is left unchanged.
+`revoke-application` on the old state then blocks only the old key
+
+Limits: the application has to reload the replaced file itself. The account
+grants of the blocked key stay stored, and a blocked key is only denied on other
+gateway workers after their key cache expires (see "Revocation and rotation
+across gateway workers" in `DEVELOPMENT.md`). Nothing schedules a rotation
 
 
 ## Generic pass-through application attribution
