@@ -23999,13 +23999,20 @@ export interface components {
             application_grants: components["schemas"]["AccountApplicationGrant"][];
             /** Credential Name */
             credential_name: string;
-            /** Headers */
+            /**
+             * Headers
+             * @default []
+             */
             headers: components["schemas"]["CredentialHeader"][];
+            mtls?: components["schemas"]["CredentialTLS"] | null;
+            oauth?: components["schemas"]["CredentialOAuth"] | null;
+            query?: components["schemas"]["CredentialQuery"] | null;
             /**
              * Resource Types
              * @default []
              */
             resource_types: components["schemas"]["AccountResourceType"][];
+            sigv4?: components["schemas"]["CredentialSigV4"] | null;
         };
         /** AccountResourceReceipt */
         AccountResourceReceipt: {
@@ -29591,6 +29598,63 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /**
+         * CredentialOAuth
+         * @description OAuth 2.0 client credentials grant; the token endpoint must be an allowed origin of the credential.
+         */
+        CredentialOAuth: {
+            /**
+             * Client Authentication
+             * @default client_secret_basic
+             * @enum {string}
+             */
+            client_authentication: "client_secret_basic" | "client_secret_post";
+            /** Client Id Field */
+            client_id_field: string;
+            /** Client Secret Field */
+            client_secret_field: string;
+            /** Scope */
+            scope?: string | null;
+            /** Token Url */
+            token_url: string;
+        };
+        /** CredentialQuery */
+        CredentialQuery: {
+            /** Field */
+            field: string;
+            /** Name */
+            name: string;
+            /**
+             * Prefix
+             * @default
+             */
+            prefix: string;
+        };
+        /** CredentialSigV4 */
+        CredentialSigV4: {
+            /** Access Key Field */
+            access_key_field: string;
+            /** Region */
+            region: string;
+            /** Secret Key Field */
+            secret_key_field: string;
+            /** Service */
+            service: string;
+            /** Session Token Field */
+            session_token_field?: string | null;
+        };
+        /**
+         * CredentialTLS
+         * @description Client certificate (mTLS) presented on the provider connection; the PEM values come from the credential.
+         */
+        CredentialTLS: {
+            /** Ca Certificate Field */
+            ca_certificate_field?: string | null;
+            /** Certificate Field */
+            certificate_field: string;
+            /** Private Key Field */
+            private_key_field: string;
+        };
         /** CubeControlCapabilities */
         CubeControlCapabilities: {
             /**
@@ -29640,11 +29704,29 @@ export interface components {
              */
             passthrough_account_grants: "application_account_path_method_v1";
             /**
+             * Passthrough Account Mtls Credential
+             * @default client_certificate_v1
+             * @constant
+             */
+            passthrough_account_mtls_credential: "client_certificate_v1";
+            /**
+             * Passthrough Account Oauth Credential
+             * @default oauth_client_credentials_v1
+             * @constant
+             */
+            passthrough_account_oauth_credential: "oauth_client_credentials_v1";
+            /**
              * Passthrough Account Provider
              * @default credential_metadata_v1
              * @constant
              */
             passthrough_account_provider: "credential_metadata_v1";
+            /**
+             * Passthrough Account Query Credential
+             * @default query_parameter_v1
+             * @constant
+             */
+            passthrough_account_query_credential: "query_parameter_v1";
             /**
              * Passthrough Account Resources
              * @default application_ownership_v1
@@ -29657,6 +29739,18 @@ export interface components {
              * @constant
              */
             passthrough_account_route_management: "atomic_create_v1";
+            /**
+             * Passthrough Account Sigv4 Credential
+             * @default aws_sigv4_v1
+             * @constant
+             */
+            passthrough_account_sigv4_credential: "aws_sigv4_v1";
+            /**
+             * Passthrough Account Websocket Route
+             * @default websocket_v1
+             * @constant
+             */
+            passthrough_account_websocket_route: "websocket_v1";
             /**
              * Passthrough Application Identity
              * @default authenticated_object_v1
