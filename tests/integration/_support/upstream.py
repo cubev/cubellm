@@ -487,7 +487,9 @@ async def _serve(port: int) -> None:
         return JSONResponse(tls.material())
 
     application.router.routes.insert(0, Route("/__tls", material, methods=["GET"]))
-    server: Final = uvicorn.Server(uvicorn.Config(application, host="127.0.0.1", port=port, access_log=False))
+    server: Final = uvicorn.Server(
+        uvicorn.Config(application, host="127.0.0.1", port=port, access_log=False, timeout_keep_alive=120)
+    )
     _ = await asyncio.gather(server.serve(), tls.serve())
 
 

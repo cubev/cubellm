@@ -1373,7 +1373,7 @@ def test_controller_rotates_an_application_key_and_only_the_successor_keeps_acce
         def call(key: str) -> httpx.Response:
             return gateway.request("POST", path, {"marker": marker}, key=key)
 
-        first: Final = eventually(lambda: call(old_key), lambda response: response.status_code != 404, seconds=60)
+        first: Final = eventually(lambda: call(old_key), lambda response: response.status_code == 200, seconds=60)
         assert (first.status_code, first.json()) == (200, {"quota": 42}), first.text
 
         rotation: Final = (
