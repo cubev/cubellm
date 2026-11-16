@@ -2,10 +2,12 @@ import os
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Final
 from uuid import uuid4
 
@@ -205,6 +207,40 @@ class MediaTests(unittest.TestCase):
         )
         self.assertEqual(invalid.returncode, 2)
         self.assertNotIn("private-canary", invalid.stdout + invalid.stderr)
+
+    def test_cli_heygen_check_reports_without_a_provider_request_when_nothing_can_be_checked(self) -> None:
+        submitted: Final = self.job.model_copy(update={"state": "submitted"})
+        self.assertEqual(self.manager.manage(self.command(submitted), "fixture", self.now).status, "applied")
+        directory: Final = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config: Final = Path(directory.name) / "heygen.env"
+        _ = config.write_text("HEYGEN_API_KEY=fixture-heygen-key\n")
+        os.chmod(config, 0o644)
+        command: Final = (sys.executable, "-m", "cube_control", "check-heygen-jobs")
+        other: Final = Account(id="media-" + uuid4().hex, provider="heygen", name="No jobs", kind="api")
+        self.assertTrue(self.repository.import_batch(ImportBatch(accounts=(other,))).ok)
+
+        def check(account_id: str, dsn: str = DSN) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [*command, "--config", config, "--account-id", account_id],
+                text=True,
+                capture_output=True,
+                env=dict(os.environ) | {"CUBE_CONTROL_DATABASE_URL": dsn},
+            )
+
+        public_key_file: Final = check(self.account.id)
+        self.assertEqual(public_key_file.returncode, 0, public_key_file.stderr)
+        refused: Final = json.loads(public_key_file.stdout)
+        self.assertEqual((refused["account_id"], refused["checks"]), (self.account.id, []))
+        self.assertIn("privat", refused["message"])
+        os.chmod(config, 0o600)
+        nothing_submitted: Final = check(other.id)
+        self.assertEqual(nothing_submitted.returncode, 0, nothing_submitted.stderr)
+        empty: Final = json.loads(nothing_submitted.stdout)
+        self.assertEqual((empty["account_id"], empty["checks"], empty["message"]), (other.id, [], ""))
+        unreachable: Final = check(self.account.id, "dbname=cubecontrol_test host=/nonexistent-socket-directory")
+        self.assertEqual((unreachable.returncode, unreachable.stdout), (1, ""))
+        self.assertNotIn("fixture-heygen-key", public_key_file.stdout + nothing_submitted.stdout + unreachable.stderr)
 
 
 if __name__ == "__main__":

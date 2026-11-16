@@ -59,7 +59,15 @@ class HeyGenJobTests(unittest.TestCase):
         os.chmod(self.config, 0o600)
 
     def test_only_submitted_jobs_are_checked_and_mapped_to_suggestions(self) -> None:
-        jobs: Final = Jobs(job("v_done"), job("v_failed"), job("v_busy"), job("v_old", "finalized"), job("v_gone"))
+        jobs: Final = Jobs(
+            job("v_done"),
+            job("v_failed"),
+            job("v_busy"),
+            job("v_old", "finalized"),
+            job("v_unsent", "reserved"),
+            job("v_expired", "expired"),
+            job("v_gone"),
+        )
         answers: Final[dict[str, VideoResult]] = {
             "v_done": fetch_video(
                 SecretStr("k"),
