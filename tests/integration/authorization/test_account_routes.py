@@ -1305,6 +1305,114 @@ def test_controller_provisions_resource_access_adopts_resources_and_revokes_keys
         ]
 
 
+def test_controller_rotates_an_application_key_and_only_the_successor_keeps_access(
+    gateway: Gateway, tmp_path: Path
+) -> None:
+    origin: Final = _admin_origin(gateway)
+    if origin is None:
+        pytest.skip("The controller only administers a gateway reached over a loopback HTTP origin with a port")
+    marker: Final = uuid.uuid4().hex
+    account: Final = f"integration-account-{marker}"
+    application: Final = f"integration-rotating-{marker}"
+    path: Final = f"/cube_api/integration-{marker}/quota"
+    route_id: Final = f"integration-rotation-{marker}"
+    provider_value: Final = f"synthetic-provider-{marker}"
+    handle: Final = register_scenario(marker, JsonResponse(content_type="application/json", body={"quota": 42}))
+    with gateway.scenario() as scenario:
+        scenario.cleanups.callback(delete_scenario, handle)
+        admin: Final = tmp_path / "admin.env"
+        _ = admin.write_text(f"LITELLM_MASTER_KEY={gateway.key}\n")
+        admin.chmod(0o600)
+        config: Final = ["--config", str(admin)]
+        secrets: Final = (gateway.key, provider_value)
+        route: Final = _control(
+            ["provision-account-route", *config],
+            json.dumps(
+                {
+                    "gateway_origin": origin,
+                    "route_id": route_id,
+                    "account_id": account,
+                    "credential_name": _credential(gateway, scenario, account, provider_value),
+                    "headers": [{"name": "Authorization", "field": "api_key", "prefix": "Bearer "}],
+                    "target": f"{handle.api_base()}/v1/quota",
+                    "path": path,
+                    "methods": ["POST"],
+                }
+            ),
+            secrets,
+        )
+        scenario.cleanups.callback(_delete_route, gateway, route_id)
+        assert route["status"] == "created", route
+        scope: Final[dict[str, JsonValue]] = {
+            "route_id": route_id,
+            "account_id": account,
+            "expected_fingerprint": route["fingerprint"],
+            "path": path,
+            "methods": ["POST"],
+        }
+        spec: Final = json.dumps(
+            {
+                "application_id": application,
+                "team_id": scenario.team(),
+                "gateway_origin": origin,
+                "account_routes": [scope],
+            }
+        )
+        old_state, new_state, consumer = (tmp_path / name for name in ("state", "state-next", "consumer"))
+        delivery: Final = ["--destination-directory", str(consumer), *config]
+        scenario.cleanups.callback(_delete_application_access, gateway, application)
+        steps: Final = (
+            (["prepare-application", "--state-directory", str(old_state)], spec, "prepared"),
+            (["provision-application", "--state-directory", str(old_state), *config], None, "provisioned"),
+            (["deliver-application", "--state-directory", str(old_state), *delivery], None, "delivered"),
+        )
+        for arguments, payload, expected in steps:
+            assert _control(arguments, payload, secrets)["status"] == expected, arguments
+        old_key: Final = (consumer / "api-key").read_text().strip()
+
+        def call(key: str) -> httpx.Response:
+            return gateway.request("POST", path, {"marker": marker}, key=key)
+
+        first: Final = eventually(lambda: call(old_key), lambda response: response.status_code != 404, seconds=60)
+        assert (first.status_code, first.json()) == (200, {"quota": 42}), first.text
+
+        rotation: Final = (
+            (["prepare-application-rotation", "--state-directory", str(old_state)], "prepared"),
+            (["provision-application", "--state-directory", str(new_state), *config], "provisioned"),
+            (["deliver-application", "--state-directory", str(new_state), *delivery], "delivered"),
+        )
+        extra: Final = (["--successor-directory", str(new_state)], [], ["--replaces-state-directory", str(old_state)])
+        for (arguments, expected), more in zip(rotation, extra, strict=True):
+            assert _control([*arguments, *more], None, (*secrets, old_key))["status"] == expected, arguments
+        new_key: Final = (consumer / "api-key").read_text().strip()
+        assert new_key != old_key
+        all_secrets: Final = (*secrets, old_key, new_key)
+        rotated: Final = eventually(lambda: call(new_key), lambda response: response.status_code == 200, seconds=60)
+        assert (rotated.status_code, rotated.json()) == (200, {"quota": 42}), rotated.text
+        assert call(old_key).status_code == 200, "the predecessor must keep working until it is revoked"
+
+        revoked: Final = _control(
+            ["revoke-application", "--state-directory", str(old_state), *config], None, all_secrets
+        )
+        assert revoked["status"] == "blocked", revoked
+        denied: Final = eventually(
+            lambda: call(old_key), lambda response: response.status_code in (401, 403), seconds=90
+        )
+        assert denied.status_code in (401, 403), denied.text
+        assert call(new_key).status_code == 200
+        hashes: Final = {sha256(key.encode()).hexdigest(): name for key, name in ((old_key, "old"), (new_key, "new"))}
+        stored: Final = read_rows(
+            "SELECT token, blocked, metadata->>'cube_access_operation' AS operation"
+            " FROM \"LiteLLM_VerificationToken\" WHERE metadata->>'cube_application_id' = %s",
+            (application,),
+        )
+        assert sorted((hashes[string_value(row["token"])], row["blocked"]) for row in stored) == [
+            ("new", None),
+            ("old", True),
+        ], stored
+        assert len({row["operation"] for row in stored}) == 1, stored
+
+
 def _delete_route_if_present(gateway: Gateway, route_id: str) -> None:
     if gateway.request("GET", f"/cube_control/account_routes/{route_id}").status_code != 404:
         _delete_route(gateway, route_id)
