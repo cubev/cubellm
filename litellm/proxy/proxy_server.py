@@ -565,7 +565,6 @@ from litellm.proxy.management_endpoints.auto_router_endpoints import (
 from litellm.proxy.management_endpoints.budget_management_endpoints import (
     router as budget_management_router,
 )
-from litellm.proxy.management_endpoints.cube_control_endpoints import router as cube_control_router
 from litellm.proxy.management_endpoints.cache_settings_endpoints import (
     router as cache_settings_router,
 )
@@ -586,6 +585,7 @@ from litellm.proxy.management_endpoints.coordination_redis_endpoints import (
 from litellm.proxy.management_endpoints.cost_tracking_settings import (
     router as cost_tracking_settings_router,
 )
+from litellm.proxy.management_endpoints.cube_control_endpoints import router as cube_control_router
 from litellm.proxy.management_endpoints.customer_endpoints import (
     router as customer_router,
 )
